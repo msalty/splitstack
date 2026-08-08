@@ -491,11 +491,12 @@ async function derive(password, saltHex, iterations) {
 /* ─────────────────────────────────────────────────────────────────── state */
 const LS = {
   get api() { return localStorage.getItem('ss.api') || ''; }, set api(v) { localStorage.setItem('ss.api', v); },
-  get token() { return localStorage.getItem('ss.token') || ''; }, set token(v) { v ? localStorage.setItem('ss.token', v) : localStorage.removeItem('ss.token'); }
+  get token() { return localStorage.getItem('ss.token') || ''; }, set token(v) { v ? localStorage.setItem('ss.token', v) : localStorage.removeItem('ss.token'); },
+  get gate() { return localStorage.getItem('ss.gate') || ''; }, set gate(v) { v ? localStorage.setItem('ss.gate', v) : localStorage.removeItem('ss.gate'); }
 };
 
 const S = {
-  api: LS.api, token: LS.token,
+  api: LS.api, token: LS.token, gate: LS.gate,
   me: null, users: [], ledgers: [], members: [], config: { symbol: '$', currency: 'USD', appName: 'SplitStack' },
   cursors: {}, txns: {}, pending: {}, online: navigator.onLine,
   view: 'boot', params: {}, tab: 'feed', syncing: false, lastError: ''
@@ -518,7 +519,7 @@ async function api(action, payload = {}, opts = {}) {
     res = await fetch(S.api, {
       method: 'POST', redirect: 'follow', signal: ctl.signal,
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ action, token: S.token, payload })
+      body: JSON.stringify({ action, token: S.token, gate: S.gate, payload })
     });
   } catch (e) {
     clearTimeout(timer);
@@ -531,6 +532,12 @@ async function api(action, payload = {}, opts = {}) {
   try { j = await res.json(); } catch (e) { throw new ApiError('BAD_RESPONSE'); }
   if (!j.ok) {
     if (/^AUTH_/.test(j.error)) { await signOut(true); throw new ApiError(j.error); }
+    // The admin turned the gate on (or changed it) since this device last spoke.
+    if (/^GATE_/.test(j.error) && !opts.noGateRedirect) {
+      S.gate = ''; LS.gate = '';
+      if (S.view !== 'gate') { S.view = 'gate'; S.params = { reason: j.error }; render(); }
+      throw new ApiError(j.error);
+    }
     throw new ApiError(j.error);
   }
   return j.data;
@@ -552,6 +559,10 @@ const ERRORS = {
   BAD_INVITE: 'That invite link is no longer valid.',
   SEAT_TAKEN: 'That person already set up their password.',
   AVATAR_TOO_BIG: 'That picture is too large.',
+  TOO_MANY_ATTEMPTS: 'Too many wrong tries. This account is locked for 15 minutes.',
+  GATE_REQUIRED: 'This server needs an access phrase.',
+  GATE_INVALID: 'That access phrase is not right.',
+  GATE_TOO_SHORT: 'Use at least 6 characters.',
   BAD_RESPONSE: 'The server sent something unexpected. Is the deployment URL right?'
 };
 const errMsg = e => ERRORS[e && e.code] || (e && e.message) || 'Something went wrong.';
@@ -874,6 +885,7 @@ function render() {
   let html = '';
   switch (S.view) {
     case 'connect': html = viewConnect(); break;
+    case 'gate': html = viewGate(); break;
     case 'setupAdmin': html = viewSetupAdmin(); break;
     case 'login': html = viewLogin(); break;
     case 'invite': html = viewInvite(); break;
@@ -925,6 +937,25 @@ function viewConnect() {
       <button class="btn block mt" data-act="connect">Connect →</button>
       <p class="hint">It ends in <b>/exec</b>. Open SETUP.md if you haven't deployed the script yet — it takes about four minutes.</p>
     </div></div>`;
+}
+
+/* ──────────────────────────────────────────────────────────── gate screen */
+function viewGate() {
+  const changed = S.params.reason === 'GATE_INVALID';
+  return `<div class="screen wrap">
+    <div class="hero"><span class="mark">🔐</span><h1>Access phrase</h1>
+      <p>${changed ? 'The phrase for this server has changed.' : 'This server is locked behind a shared phrase.'}</p></div>
+    <div class="card">
+      <div class="field"><label>Phrase</label>
+        <input class="input" id="g-phrase" type="password" placeholder="Ask whoever set this up"
+               autocapitalize="off" autocorrect="off" spellcheck="false"></div>
+      <div id="g-err"></div>
+      <button class="btn block mt" data-act="submit-gate">Unlock →</button>
+      <p class="hint">You only enter this once on this device. It sits in front of the login
+        screen — you'll still need your own username and password after it.</p>
+    </div>
+    <p class="hint center mt2"><a href="#" data-act="change-api">Change server</a></p>
+  </div>`;
 }
 
 /* ───────────────────────────────────────────────────────── admin claim */
@@ -1273,6 +1304,9 @@ function viewProfile() {
     <div class="card">
       <div class="row-item tap" data-act="change-password"><div class="av m" style="background:var(--sky)">🔑</div>
         <div class="grow"><div class="ttl">Change password</div><div class="sub">Sets a new one for this account</div></div><div>›</div></div>
+      <div class="row-item tap" data-act="signout-everywhere"><div class="av m" style="background:var(--warn)">📵</div>
+        <div class="grow"><div class="ttl">Sign out other devices</div>
+          <div class="sub">Kicks out every session except this one</div></div><div>›</div></div>
       <div class="row-item tap" data-act="full-resync"><div class="av m" style="background:var(--teal)">♻️</div>
         <div class="grow"><div class="ttl">Rebuild local data</div><div class="sub">Re-download everything from the sheet</div></div><div>›</div></div>
       <div class="row-item tap" data-act="signout"><div class="av m" style="background:var(--bad)">👋</div>
@@ -1306,6 +1340,21 @@ function viewAdmin() {
           <div class="sub">${memberIdsOf(l.id).length} people · ${(S.txns[l.id] || []).filter(t => !t.deleted).length} entries</div></div>
         ${l.archived ? '<span class="pill">archived</span>' : ''}<div>›</div></div>`).join('') || '<p class="hint">None yet.</p>'}
       <button class="btn ghost block mt" data-act="new-ledger">+ Create a ledger</button>
+    </div>
+
+    <div class="section-title">Security</div>
+    <div class="card">
+      <div class="row-item tap" data-act="set-gate">
+        <div class="av m" style="background:${S.config.gated ? 'var(--good)' : 'var(--ink-3)'}">🔐</div>
+        <div class="grow"><div class="ttl">Shared access phrase</div>
+          <div class="sub">${S.config.gated
+            ? 'On — required before the login screen appears'
+            : 'Off — anyone with the server URL sees the login screen'}</div></div>
+        <span class="pill ${S.config.gated ? 'ok' : ''}">${S.config.gated ? 'ON' : 'OFF'}</span></div>
+      <div class="row-item"><div class="av m" style="background:var(--sun)">🛡️</div>
+        <div class="grow"><div class="ttl">Brute-force protection</div>
+          <div class="sub">8 wrong passwords locks an account for 15 minutes</div></div>
+        <span class="pill ok">ON</span></div>
     </div>
 
     <div class="section-title">App</div>
@@ -1996,6 +2045,7 @@ function wire() {
     if (e.key !== 'Enter') return;
     if (['l-user', 'l-pw'].includes(e.target.id)) handle('login');
     if (['c-url'].includes(e.target.id)) handle('connect');
+    if (e.target.id === 'g-phrase') handle('submit-gate');
   };
 }
 
@@ -2014,14 +2064,29 @@ async function handle(act, el) {
     case 'to-login': return go('login', {}, true);
     case 'change-api': {
       if (await confirmSheet('Change server?', 'You will be signed out of this device.', 'Change', false)) {
-        await signOut(true); localStorage.removeItem('ss.api'); S.api = '';
+        await signOut(true);
+        localStorage.removeItem('ss.api'); S.api = '';
+        LS.gate = ''; S.gate = '';
         go('connect', {}, true);
       }
       return;
     }
     case 'connect': return doConnect();
+    case 'submit-gate': return doGate();
     case 'claim-admin': return doClaimAdmin();
     case 'login': return doLogin();
+    case 'signout-everywhere': {
+      if (!await confirmSheet('Sign out everywhere else?',
+        'Every other phone, tablet and browser signed in as you is kicked out immediately. This device stays.',
+        'Sign out other devices', false)) return;
+      try {
+        const r = await api('signOutEverywhere', {});
+        S.token = r.token; LS.token = r.token;
+        toast('Other devices signed out ✓');
+      } catch (err) { toast(errMsg(err)); }
+      return;
+    }
+    case 'set-gate': return gateSheet();
     case 'invite-login': { S.params.pendingInvite = S.params.token; return go('login', { joinAfter: S.params.token }, true); }
     case 'new-ledger': return ledgerSheet(null);
     case 'edit-ledger': return ledgerSheet(ledgerById(S.params.id));
@@ -2082,6 +2147,7 @@ async function doConnect() {
     syncBadge('');
     LS.api = url;
     S.config.appName = info.appName || 'SplitStack';
+    if (info.gated && !S.gate) return go('gate', {}, true);
     go(info.ready ? 'login' : 'setupAdmin', {}, true);
   } catch (err) {
     syncBadge('');
@@ -2090,6 +2156,74 @@ async function doConnect() {
       ? "Couldn't reach it. Check the URL, and that the deployment is set to “Anyone”."
       : errMsg(err));
   }
+}
+
+async function doGate() {
+  const phrase = $('#g-phrase').value.trim();
+  if (!phrase) return fieldErr('#g-err', 'Enter the phrase.');
+  S.gate = phrase;
+  try {
+    syncBadge('<span class="spinner"></span>Unlocking…');
+    // authSalt is gated, cheap, and reveals nothing — a perfect probe.
+    await api('authSalt', { username: '' }, { noGateRedirect: true });
+    LS.gate = phrase;
+    syncBadge('');
+    const info = await api('ping', {}, { timeout: 20000 });
+    go(S.token ? 'home' : (info.ready ? 'login' : 'setupAdmin'), {}, true);
+    if (S.token) sync({ silent: true });
+  } catch (err) {
+    syncBadge('');
+    S.gate = ''; LS.gate = '';
+    fieldErr('#g-err', errMsg(err));
+  }
+}
+
+/** Admin: turn the shared gate on, change it, or switch it off. */
+function gateSheet() {
+  const on = !!(S.config && S.config.gated);
+  const sheet = openSheet(`
+    <h2>Access phrase 🔐</h2>
+    <p class="sheet-sub">${on ? 'Currently <b>on</b>. Everyone needs this phrase before they can even see the login screen.'
+                             : 'Currently <b>off</b>. Anyone who has your server URL can reach the login screen.'}</p>
+    <div class="card mb" style="background:var(--card-2)">
+      <p style="font-weight:650;font-size:13.5px;line-height:1.5;margin:0">
+        This is one shared phrase for the whole app, entered once per device, on top of everyone's
+        personal password. It's useful if your server URL ever leaks — but because everybody knows
+        the same phrase, it doesn't rotate when someone moves out. Change it when that happens.</p>
+    </div>
+    <div class="field"><label>${on ? 'New phrase' : 'Phrase'}</label>
+      <input class="input" id="gs-p" type="text" placeholder="six characters or more"
+             autocapitalize="off" autocorrect="off" spellcheck="false"></div>
+    <p class="hint mb">⚠️ Everyone, including you, has to enter this again on every device.</p>
+    <div class="flex mt">
+      <button class="btn ghost grow" data-x="cancel">Cancel</button>
+      ${on ? `<button class="btn danger" data-x="off">Turn off</button>` : ''}
+      <button class="btn grow" data-x="save">${on ? 'Change it' : 'Turn it on'}</button>
+    </div>`);
+  sheet.addEventListener('click', async e => {
+    const b = e.target.closest('[data-x]'); if (!b) return;
+    if (b.dataset.x === 'cancel') return sheet.close();
+    if (b.dataset.x === 'off') {
+      sheet.close();
+      if (!await confirmSheet('Turn the access phrase off?',
+        'Anyone with your server URL will be able to reach the login screen again.', 'Turn it off')) return;
+      try { await api('adminSetGate', { phrase: '' }); S.gate = ''; LS.gate = '';
+        await sync({ silent: true }); toast('Access phrase off'); render(); }
+      catch (err) { toast(errMsg(err)); }
+      return;
+    }
+    const phrase = $('#gs-p', sheet).value.trim();
+    if (phrase.length < 6) return toast('Use at least 6 characters');
+    sheet.close();
+    try {
+      await api('adminSetGate', { phrase });
+      S.gate = phrase; LS.gate = phrase;      // keep this device working
+      await sync({ silent: true });
+      confetti(60);
+      toast('Access phrase set ✓');
+      render();
+    } catch (err) { toast(errMsg(err)); }
+  });
 }
 
 async function doClaimAdmin() {
@@ -2153,6 +2287,15 @@ async function boot() {
   const inviteToken = hash[0] === 'join' ? hash[1] : null;
 
   if (!S.api) { S.view = 'connect'; return render(); }
+
+  // If a gate is configured and this device hasn't got the phrase, stop here.
+  // Offline devices skip the check and run from cache — the queue syncs later.
+  if (!S.gate && navigator.onLine) {
+    try {
+      const info = await api('ping', {}, { timeout: 20000 });
+      if (info.gated) { S.view = 'gate'; S.params = {}; return render(); }
+    } catch (e) { /* offline or unreachable — fall through to the cache */ }
+  }
 
   if (inviteToken && !S.token) {
     S.view = 'invite'; S.params = { token: inviteToken }; render();

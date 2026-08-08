@@ -35,7 +35,13 @@ var TXN_COLS    = ['TxnId','Type','Date','Name','Category','Amount','PaidBy','Pa
 
 var PBKDF2_ITERATIONS = 210000;
 var SESSION_DAYS      = 60;
-var API_VERSION       = 1;
+var API_VERSION       = 2;
+
+/* Brute-force protection. Failures are counted per username in the script
+   cache, so the window expires on its own and nothing accumulates forever. */
+var LOCK_AFTER      = 8;    // wrong passwords before that username is frozen
+var LOCK_WINDOW_SEC = 900;  // …for this long (15 minutes)
+var SPRAY_AFTER     = 100;  // total failures across all accounts before everyone slows down
 
 /* ------------------------------------------------------------- entry points */
 
@@ -61,10 +67,20 @@ function route(req) {
   var action = req.action;
   var p      = req.payload || {};
 
+  // 'ping' is the only thing reachable without the gate — the client needs it
+  // to discover whether a gate is even configured. It reveals nothing useful.
+  if (action === 'ping') {
+    return {
+      version: API_VERSION, ready: isReady(), gated: gateEnabled(),
+      appName: cfg('appName', 'SplitStack'), currency: cfg('currency', 'USD'),
+      iterations: PBKDF2_ITERATIONS
+    };
+  }
+
+  requireGate(req);
+
   // --- unauthenticated -----------------------------------------------------
   switch (action) {
-    case 'ping':        return { version: API_VERSION, ready: isReady(), appName: cfg('appName', 'SplitStack'),
-                                 currency: cfg('currency', 'USD'), iterations: PBKDF2_ITERATIONS };
     case 'claimAdmin':  return claimAdmin(p);
     case 'authSalt':    return authSalt(p);
     case 'login':       return login(p);
@@ -82,6 +98,7 @@ function route(req) {
     case 'joinLedger':     return joinLedger(me, p);
     case 'setAvatar':      return setAvatar(me, p);
     case 'changePassword': return changePassword(me, p);
+    case 'signOutEverywhere': return signOutEverywhere(me);
     case 'putReceipt':     return putReceipt(me, p);
     case 'getReceipt':     return getReceipt(me, p);
 
@@ -95,6 +112,8 @@ function route(req) {
     case 'adminSetMembers':  return requireAdmin(me), setMembers(p);
     case 'adminRotateInvite':return requireAdmin(me), rotateInvite(p);
     case 'adminSetConfig':   return requireAdmin(me), setConfig(p);
+    case 'adminSetGate':     return requireAdmin(me), setGate(me, p);
+    case 'adminUnlock':      return requireAdmin(me), adminUnlock(p);
   }
   throw new Error('UNKNOWN_ACTION:' + action);
 }
@@ -293,6 +312,80 @@ function resetAdminClaim() {
 
 /* --------------------------------------------------------------------- auth */
 
+/* ═══════════════════════════════════════════════════ shared gate passphrase */
+/**
+ * OPTIONAL second factor for the whole instance. When set, no endpoint except
+ * 'ping' will answer without it — so an attacker who somehow learns your /exec
+ * URL cannot even reach the login form, let alone guess passwords.
+ *
+ * It is one shared value that everybody types once per device. That means it
+ * does NOT rotate when someone leaves, and it is not a substitute for good
+ * per-user passwords. It raises the wall around the building; the per-user
+ * passwords still lock the individual doors.
+ *
+ * Only a verifier is stored, never the phrase itself.
+ */
+function gateEnabled() { return !!cfg('gateVerifier', ''); }
+
+function requireGate(req) {
+  var want = cfg('gateVerifier', '');
+  if (!want) return true;                                  // disabled
+  var got = req.gate === undefined ? '' : String(req.gate);
+  if (!got) throw new Error('GATE_REQUIRED');
+  if (hmac(pepper(), 'gate:' + got) !== want) {
+    var c = CacheService.getScriptCache();
+    var n = Number(c.get('gatefail') || 0);
+    c.put('gatefail', String(n + 1), LOCK_WINDOW_SEC);
+    Utilities.sleep(Math.min(3000, 300 * (n + 1)));         // slow down guessing
+    throw new Error('GATE_INVALID');
+  }
+  return true;
+}
+
+function setGate(me, p) {
+  var phrase = String(p.phrase === undefined ? '' : p.phrase).trim();
+  if (!phrase) { setCfg('gateVerifier', ''); return { gated: false }; }
+  if (phrase.length < 6) throw new Error('GATE_TOO_SHORT');
+  setCfg('gateVerifier', hmac(pepper(), 'gate:' + phrase));
+  return { gated: true };
+}
+
+/* ══════════════════════════════════════════════ brute-force / rate limiting */
+/**
+ * Counts consecutive failures per username in the script cache. Entries expire
+ * on their own, so a locked account frees itself after the window without any
+ * cleanup job. An admin can also clear it immediately.
+ */
+function guardKey(username) { return 'fail:' + String(username || '').toLowerCase(); }
+
+function guardCheck(username) {
+  var c = CacheService.getScriptCache();
+  var key = guardKey(username);
+  var n = Number(c.get(key) || 0);
+  if (n >= LOCK_AFTER) throw new Error('TOO_MANY_ATTEMPTS');
+  // Password spraying: many accounts, few guesses each. Slow everyone if it spikes.
+  var spray = Number(c.get('fail:*') || 0);
+  if (spray > SPRAY_AFTER) Utilities.sleep(2000);
+  return { cache: c, key: key, n: n };
+}
+
+function guardFail(g) {
+  g.cache.put(g.key, String(g.n + 1), LOCK_WINDOW_SEC);
+  var spray = Number(g.cache.get('fail:*') || 0);
+  g.cache.put('fail:*', String(spray + 1), LOCK_WINDOW_SEC);
+  Utilities.sleep(Math.min(2500, 250 * (g.n + 1)));   // 250ms, 500ms, 750ms …
+}
+
+function guardPass(g) { g.cache.remove(g.key); }
+
+/** Admin escape hatch: clear a lockout without waiting it out. */
+function adminUnlock(p) {
+  CacheService.getScriptCache().remove(guardKey(p.username || ''));
+  return { ok: true };
+}
+
+/* ------------------------------------------------------------------ crypto */
+
 function randomHex(bytes) {
   var out = '';
   for (var i = 0; i < bytes; i++) out += ('0' + Math.floor(Math.random() * 256).toString(16)).slice(-2);
@@ -306,6 +399,19 @@ function uid(prefix) {
 function hmac(keyStr, msgStr) {
   var sig = Utilities.computeHmacSha256Signature(msgStr, keyStr);
   return Utilities.base64Encode(sig);
+}
+
+function bytesToHex(bytes) {
+  var s = '';
+  for (var i = 0; i < bytes.length; i++) {
+    var b = bytes[i] < 0 ? bytes[i] + 256 : bytes[i];
+    s += ('0' + b.toString(16)).slice(-2);
+  }
+  return s;
+}
+
+function hmacHex(keyStr, msgStr) {
+  return bytesToHex(Utilities.computeHmacSha256Signature(msgStr, keyStr));
 }
 
 /**
@@ -353,23 +459,31 @@ function findUser(field, value) {
   return null;
 }
 
-/** Return the salt for a username. Unknown users get a stable fake salt. */
+/**
+ * Return the salt for a username. Unknown users get a stable decoy salt so the
+ * response is indistinguishable from a real one.
+ *
+ * Deliberately does NOT say whether the account exists — that would hand an
+ * attacker a free username-enumeration oracle and undo the point of the decoy.
+ */
 function authSalt(p) {
   var u = findUser('Username', p.username || '');
-  if (u && u.Salt) return { salt: u.Salt, iterations: Number(u.Iterations) || PBKDF2_ITERATIONS, exists: true };
-  // Deterministic decoy so attackers can't enumerate accounts.
+  if (u && u.Salt) return { salt: u.Salt, iterations: Number(u.Iterations) || PBKDF2_ITERATIONS };
+  // Same length and alphabet as a real 16-byte salt, and stable per username,
+  // so a decoy is indistinguishable from the genuine article.
   return {
-    salt: hmac(pepper(), 'decoy:' + String(p.username || '').toLowerCase()).replace(/[^a-f0-9]/gi, '').slice(0, 32) || randomHex(16),
-    iterations: PBKDF2_ITERATIONS,
-    exists: false
+    salt: hmacHex(pepper(), 'decoy:' + String(p.username || '').toLowerCase()).slice(0, 32),
+    iterations: PBKDF2_ITERATIONS
   };
 }
 
 function login(p) {
+  var g = guardCheck(p.username);
   var u = findUser('Username', p.username || '');
-  if (!u || !u.Verifier) { Utilities.sleep(400); throw new Error('BAD_CREDENTIALS'); }
+  if (!u || !u.Verifier)                       { guardFail(g); throw new Error('BAD_CREDENTIALS'); }
   if (u.Active === false || u.Active === 'FALSE') throw new Error('ACCOUNT_DISABLED');
-  if (verifierFor(p.dk) !== u.Verifier) { Utilities.sleep(400); throw new Error('BAD_CREDENTIALS'); }
+  if (verifierFor(p.dk) !== u.Verifier)        { guardFail(g); throw new Error('BAD_CREDENTIALS'); }
+  guardPass(g);
   return { token: makeToken(u), me: publicUser(u), state: bootstrap(u) };
 }
 
@@ -377,10 +491,12 @@ function claimAdmin(p) {
   return lock(function () {
     setup();
     if (isReady()) throw new Error('ADMIN_EXISTS');
+    var g = guardCheck('*setupkey*');
     if (String(p.setupKey || '').toUpperCase().trim() !== String(cfg('setupKey')).toUpperCase().trim()) {
-      Utilities.sleep(800);
+      guardFail(g);
       throw new Error('BAD_SETUP_KEY');
     }
+    guardPass(g);
     validateUsername(p.username);
     var now = new Date();
     var u = {
@@ -398,13 +514,25 @@ function claimAdmin(p) {
 
 function changePassword(me, p) {
   return lock(function () {
-    if (verifierFor(p.oldDk) !== me.Verifier) throw new Error('BAD_CREDENTIALS');
+    var g = guardCheck(me.Username);
+    if (verifierFor(p.oldDk) !== me.Verifier) { guardFail(g); throw new Error('BAD_CREDENTIALS'); }
+    guardPass(g);
     updateRow(TAB_USERS, USER_COLS, me.__row, {
       Salt: p.salt, Iterations: PBKDF2_ITERATIONS, Verifier: verifierFor(p.dk),
       TokenVer: (Number(me.TokenVer) || 0) + 1, UpdatedAt: new Date()
     });
     var fresh = findUser('UserId', me.UserId);
     return { token: makeToken(fresh) };
+  });
+}
+
+/** Invalidate every other device for this person, keeping the current one. */
+function signOutEverywhere(me) {
+  return lock(function () {
+    updateRow(TAB_USERS, USER_COLS, me.__row, {
+      TokenVer: (Number(me.TokenVer) || 0) + 1, UpdatedAt: new Date()
+    });
+    return { token: makeToken(findUser('UserId', me.UserId)) };
   });
 }
 
@@ -726,7 +854,8 @@ function bootstrap(me) {
     users:    visible.map(publicUser),
     ledgers:  ledgers.map(publicLedger),
     members:  members.map(function (m) { return { ledgerId: m.LedgerId, userId: m.UserId }; }),
-    config:   { currency: cfg('currency', 'USD'), symbol: cfg('currencySymbol', '$'), appName: cfg('appName', 'SplitStack') },
+    config:   { currency: cfg('currency', 'USD'), symbol: cfg('currencySymbol', '$'),
+                appName: cfg('appName', 'SplitStack'), gated: gateEnabled() },
     serverTime: new Date().toISOString()
   };
 }

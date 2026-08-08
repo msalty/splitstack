@@ -239,11 +239,48 @@ So the sheet holds a verifier that is useless on its own. Someone who steals the
 still can't log in as anyone or recover a password, because the pepper isn't in there. Even *you*
 as the admin can't read anyone's password — you can only reset it.
 
-Sessions are stateless signed tokens with a 60-day expiry. Changing or resetting a password, or
-disabling an account, invalidates every existing session for that person immediately.
+Sessions are stateless signed tokens with a 60-day expiry. Changing or resetting a password,
+disabling an account, or using **Sign out other devices** invalidates every existing session for
+that person immediately.
 
-Unknown usernames still get a plausible-looking salt back, so the login screen can't be used to
-discover who has an account.
+### Brute-force protection
+
+Eight wrong passwords freezes that username for fifteen minutes, and each wrong attempt before
+that gets progressively slower (¼ second, then ½, and so on). A correct login resets the counter.
+Lockouts are per-username, so one person getting locked out doesn't affect anyone else, and they
+expire on their own — no cleanup needed.
+
+The same protection covers the setup key and the password-change form. If someone needs back in
+sooner, an admin doesn't have to wait it out — that's what `adminUnlock` is for.
+
+There's also a spray guard: if failures spike across *many* accounts at once, every login slows
+down until the wave passes.
+
+### Username enumeration
+
+Ask for the salt of an account that doesn't exist and you get a decoy — same length, same
+alphabet, same iteration count, and stable for that name so it doesn't change between tries. Wrong
+password and no-such-user return the identical error. There is no way to use the login screen to
+work out who has an account.
+
+### The shared access phrase (optional, off by default)
+
+**Settings ▸ Security ▸ Shared access phrase.**
+
+When it's on, the server won't answer *anything* except a bare version check until the phrase is
+supplied — the login screen isn't even reachable. Each person types it once per device, on top of
+their own password.
+
+Worth turning on if your `/exec` URL ever leaks, or if you just want a second wall. Only a
+verifier is stored, so the phrase itself isn't in your spreadsheet either.
+
+Be clear-eyed about what it is, though: **one shared value that everyone knows.** It does not
+rotate when someone moves out — you have to change it, and then everybody re-enters it. It raises
+the wall around the building; your per-user passwords are still what lock the individual doors.
+It's a supplement, never a replacement.
+
+> Turning it on or changing it signs nobody out, but every device will ask for the new phrase the
+> next time it syncs. Have it ready before you change it.
 
 ---
 
@@ -275,6 +312,14 @@ The URL stays the same.
 **I lost the setup key / need to start the admin account over.**
 Run `resetAdminClaim()` in the Apps Script editor. It clears the admin's password and prints a
 fresh setup key in the execution log.
+
+**Someone locked themselves out.**
+It clears itself after fifteen minutes. To do it now, run `adminUnlock({username:'sam'})` in the
+Apps Script editor, or call it from an admin account in the app.
+
+**I turned the access phrase on and forgot it.**
+In the Apps Script editor, open the `Config` tab of your spreadsheet and delete the value in the
+`gateVerifier` row. That switches the gate off. You can set a new one from Settings afterwards.
 
 **Login says my password is wrong and I'm certain it isn't.**
 Check the page is on `https://`. Password hashing needs a secure context, and it silently has
