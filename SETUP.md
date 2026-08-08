@@ -334,8 +334,46 @@ Use **Profile ▸ Rebuild local data**. If you deleted rows directly, that's exp
 inside the app instead.
 
 **The app won't update after I re-upload the files.**
-Bump `CACHE = 'splitstack-v1'` to `v2` in `sw.js` and re-upload. That forces every installed copy
-to pick up the new version.
+See *Updating the app* below — there's a button for this now.
+
+---
+
+## Updating the app
+
+Installed PWAs are cached aggressively — that's what makes them work offline, and it's also what
+makes them feel stuck on an old version. Three things now handle it.
+
+**1. Code is fetched network-first.** `index.html` and `app.js` go to the network first every
+time, falling back to cache only if the network is slow or absent. So when you're online, simply
+reopening the app gets the newest code. This is the main fix; previously the code was served
+cache-first, which meant a new build only appeared a launch or two later.
+
+**2. The app tells you.** When a new version is detected, a purple *"A new version is ready"*
+banner appears at the top of every screen. Tap it and the app restarts on the new build. It checks
+on launch and whenever you bring the app back to the foreground (at most every 30 minutes).
+
+**3. There are buttons.** **Profile ▸ App & updates**:
+
+| Button | What it does |
+|---|---|
+| **Check for updates** | Re-fetches the service worker *and* compares the deployed `app.js` build against the running one. Catches the case where you re-uploaded files but didn't bump a version. |
+| **Restart to update** | Appears when an update is waiting. Activates it and reloads. |
+| **Clear cache & reload** | The nuclear option. Deletes every cache, unregisters the service worker, reloads from scratch. Use if it's still somehow stuck. |
+
+None of these touch your ledgers, your login, or anything queued offline — that all lives in
+IndexedDB, separately from the app cache. If you have unsynced changes, *Clear cache & reload*
+warns you first.
+
+### When you re-upload a new build
+
+Bump both version constants so the app can name what it's running:
+
+- `APP_BUILD` at the top of `app.js`
+- `SW_BUILD` at the top of `sw.js`
+
+Keep them identical. Strictly speaking this is optional — network-first means fresh code arrives
+either way — but bumping `SW_BUILD` is what makes the service worker itself update, and it's what
+Settings displays.
 
 ---
 

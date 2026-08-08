@@ -4,6 +4,10 @@
    ========================================================================== */
 'use strict';
 
+/* Shown in Settings ▸ App & updates. Bump this and SW_BUILD in sw.js together
+   whenever you re-upload the app. */
+const APP_BUILD = '2026-08-08.1';
+
 /* ────────────────────────────────────────────────────────────────  helpers */
 const $  = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
@@ -158,7 +162,7 @@ const S = {
   api: LS.api, token: LS.token, gate: LS.gate,
   me: null, users: [], ledgers: [], members: [], config: { symbol: '$', currency: 'USD', appName: 'SplitStack' },
   cursors: {}, txns: {}, pending: {}, online: navigator.onLine,
-  view: 'boot', params: {}, tab: 'feed', syncing: false, lastError: ''
+  view: 'boot', params: {}, tab: 'feed', syncing: false, lastError: '', updateReady: false
 };
 
 const userById = id => S.users.find(u => u.id === id) || { id, name: 'Unknown', color: '#8A84A6', emoji: '👤', avatar: '' };
@@ -349,7 +353,122 @@ async function queueTxn(ledgerId, txn) {
 
 addEventListener('online', () => { S.online = true; sync({ silent: true }); render(); });
 addEventListener('offline', () => { S.online = false; render(); });
-document.addEventListener('visibilitychange', () => { if (!document.hidden && S.token) sync({ silent: true }); });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  if (S.token) sync({ silent: true });
+  Updater.check(false);        // throttled to once every 30 minutes
+});
+
+/* ══════════════════════════════════════════════════════════ app updates */
+/**
+ * Keeping a PWA current is fiddly: the browser caches the code, the service
+ * worker caches it again, and a newly installed worker sits in "waiting" until
+ * every tab closes. This handles all three so the user just taps a button.
+ */
+const Updater = {
+  reg: null,
+  swBuild: null,
+  lastCheck: 0,
+  checking: false,
+
+  /* Single funnel for page reloads — one place to reason about, and a seam
+     that tests can stand in front of. */
+  reload() { location.reload(); },
+
+  async init() {
+    if (!navigator.serviceWorker || location.protocol === 'file:') return;
+    try {
+      this.reg = await navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' });
+    } catch (e) { return; }
+
+    // Somebody else's tab activated a new worker — reload to match it.
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (this._applying) this.reload();
+    });
+
+    navigator.serviceWorker.addEventListener('message', e => {
+      if (e.data && e.data.type === 'version') { this.swBuild = e.data.build; render(); }
+    });
+
+    if (this.reg.waiting && navigator.serviceWorker.controller) this.flagReady();
+    this.reg.addEventListener('updatefound', () => this.watch());
+    this.watch();
+    this.askVersion();
+    this.check(false);
+  },
+
+  askVersion() {
+    const c = navigator.serviceWorker.controller;
+    if (c) c.postMessage('version');
+  },
+
+  watch() {
+    const w = this.reg && this.reg.installing;
+    if (!w) return;
+    w.addEventListener('statechange', () => {
+      if (w.state === 'installed' && navigator.serviceWorker.controller) this.flagReady();
+    });
+  },
+
+  flagReady() {
+    if (S.updateReady) return;
+    S.updateReady = true;
+    render();
+    toast('A new version is ready 🎉', 4000);
+  },
+
+  /** Ask the browser to re-fetch sw.js and see if the bytes changed. */
+  async check(manual) {
+    if (!this.reg) return { ok: false, reason: 'no-sw' };
+    if (this.checking) return { ok: false, reason: 'busy' };
+    if (!manual && Date.now() - this.lastCheck < 1800000) return { ok: false, reason: 'throttled' };
+    this.checking = true;
+    this.lastCheck = Date.now();
+    try {
+      await this.reg.update();
+      // Also compare the deployed app.js against what's running, which catches
+      // a re-upload where sw.js itself didn't change.
+      let remoteChanged = false;
+      try {
+        const r = await fetch('app.js?probe=' + Date.now(), { cache: 'no-store' });
+        if (r.ok) {
+          const txt = await r.text();
+          const m = txt.match(/APP_BUILD\s*=\s*'([^']+)'/);
+          if (m && m[1] !== APP_BUILD) remoteChanged = true;
+        }
+      } catch (e) { /* offline — nothing to compare against */ }
+      if (this.reg.waiting || remoteChanged) this.flagReady();
+      return { ok: true, updateReady: !!(this.reg.waiting || remoteChanged) };
+    } catch (e) {
+      return { ok: false, reason: 'failed' };
+    } finally { this.checking = false; }
+  },
+
+  /** Activate the waiting worker and reload onto the new code. */
+  async apply() {
+    this._applying = true;
+    if (this.reg && this.reg.waiting) {
+      this.reg.waiting.postMessage('skipWaiting');
+      setTimeout(() => this.reload(), 1200);   // belt and braces
+    } else {
+      this.reload();
+    }
+  },
+
+  /** Nuclear option: drop every cache and re-register from scratch. */
+  async hardReset() {
+    try {
+      if (navigator.serviceWorker.controller) navigator.serviceWorker.controller.postMessage('clearCaches');
+      if (window.caches) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map(k => caches.delete(k)));
+      }
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map(r => r.unregister()));
+    } catch (e) { /* keep going — the reload is what matters */ }
+    this.reload();
+  }
+};
 
 /* ───────────────────────────────────────────────────────────────── balances */
 /**
@@ -564,8 +683,19 @@ const shell = (title, body, opts = {}) => `
     <h1>${esc(title)}</h1>
     ${opts.actions || ''}
   </div></div>
-  <div class="screen"><div class="wrap page">${body}</div></div>
+  <div class="screen"><div class="wrap page">${updateBanner()}${body}</div></div>
   ${opts.fab ? `<button class="fab" data-act="${opts.fab}">+</button>` : ''}`;
+
+function updateBanner() {
+  if (!S.updateReady) return '';
+  return `<button class="card mb" data-act="apply-update" style="display:block;width:100%;text-align:left;
+      background:linear-gradient(135deg,var(--violet),var(--pink));border:0;color:#fff;cursor:pointer">
+    <div class="flex"><span style="font-size:26px">✨</span>
+      <div class="grow"><div class="ttl" style="color:#fff">A new version is ready</div>
+        <div class="sub" style="color:rgba(255,255,255,.85)">Tap to restart — nothing unsaved is lost.</div></div>
+      <span class="pill" style="background:rgba(255,255,255,.25);color:#fff">RESTART</span></div>
+  </button>`;
+}
 
 function offlineChip() {
   if (S.online) return '';
@@ -971,6 +1101,30 @@ function viewProfile() {
       <div class="row-item tap" data-act="signout"><div class="av m" style="background:var(--bad)">👋</div>
         <div class="grow"><div class="ttl">Sign out</div><div class="sub">Clears this device</div></div><div>›</div></div>
     </div>
+
+    <div class="section-title">App &amp; updates</div>
+    <div class="card">
+      <div class="row-item">
+        <div class="av m" style="background:var(--violet)">📦</div>
+        <div class="grow"><div class="ttl">Version</div>
+          <div class="sub mono">${esc(APP_BUILD)}${Updater.swBuild && Updater.swBuild !== APP_BUILD
+            ? ' · worker ' + esc(Updater.swBuild) : ''}</div></div>
+        ${S.updateReady ? '<span class="pill pend">UPDATE READY</span>' : '<span class="pill ok">CURRENT</span>'}
+      </div>
+      ${S.updateReady ? `
+      <div class="row-item tap" data-act="apply-update"><div class="av m" style="background:var(--good)">✨</div>
+        <div class="grow"><div class="ttl">Restart to update</div>
+          <div class="sub">Takes a second. Queued changes are kept.</div></div><div>›</div></div>` : `
+      <div class="row-item tap" data-act="check-update"><div class="av m" style="background:var(--sky)">🔄</div>
+        <div class="grow"><div class="ttl">Check for updates</div>
+          <div class="sub">Looks for a newer build right now</div></div><div>›</div></div>`}
+      <div class="row-item tap" data-act="hard-reset"><div class="av m" style="background:var(--warn)">🧹</div>
+        <div class="grow"><div class="ttl">Clear cache &amp; reload</div>
+          <div class="sub">If it's still stuck on an old version</div></div><div>›</div></div>
+      <p class="hint">Your ledgers and anything waiting to sync are stored separately — none of
+        these touch them.</p>
+    </div>
+
     <p class="hint center mt2">Server: ${esc((S.api || '').slice(0, 46))}…<br>
       <a href="#" data-act="change-api">Change server</a></p>`, { back: true });
 }
@@ -1715,6 +1869,31 @@ async function handle(act, el) {
     case 'profile': return go('profile');
     case 'admin': return go('admin');
     case 'sync': haptic(); return sync({ full: false });
+    case 'check-update': {
+      if (!Updater.reg)
+        return toast('Updates need the app served over https');
+      syncBadge('<span class="spinner"></span>Checking…');
+      const r = await Updater.check(true);
+      syncBadge('');
+      if (r.updateReady) { toast('Update found 🎉'); render(); }
+      else if (r.ok) toast("You're on the latest version ✓");
+      else if (!navigator.onLine) toast("Can't check while offline");
+      else toast("Couldn't check just now");
+      return;
+    }
+    case 'apply-update': {
+      toast('Updating…');
+      return Updater.apply();
+    }
+    case 'hard-reset': {
+      const queued = (await DB.outbox()).length;
+      const warn = queued
+        ? `You have ${queued} change${queued > 1 ? 's' : ''} waiting to sync. They're kept, but sync first if you can.`
+        : 'Re-downloads the app from scratch. Your ledgers and login stay put.';
+      if (!await confirmSheet('Clear cache and reload?', warn, 'Clear and reload', false)) return;
+      toast('Clearing…');
+      return Updater.hardReset();
+    }
     case 'full-resync': {
       S.cursors = {}; await DB.set('cursors', {});
       for (const l of S.ledgers) { await DB.dropLedger(l.id); S.txns[l.id] = []; }
@@ -1936,9 +2115,7 @@ async function signOut(silent) {
 
 /* ───────────────────────────────────────────────────────────────── boot */
 async function boot() {
-  if ('serviceWorker' in navigator) {
-    try { await navigator.serviceWorker.register('sw.js'); } catch (e) {}
-  }
+  Updater.init();
 
   await loadCache();
 
