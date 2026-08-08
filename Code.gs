@@ -45,8 +45,76 @@ var SPRAY_AFTER     = 100;  // total failures across all accounts before everyon
 
 /* ------------------------------------------------------------- entry points */
 
+/**
+ * Opening the /exec URL in a browser is the natural way to check "did my
+ * deployment work?", so answer that question in plain English instead of
+ * raw JSON.
+ *
+ * Deliberately does NOT print the setup key. This page is reachable by anyone
+ * who has the URL, and before an admin is claimed the key is the only thing
+ * standing between them and squatting the instance. The key lives behind the
+ * spreadsheet menu, which requires access to the sheet itself.
+ */
 function doGet(e) {
-  return json({ ok: true, service: 'splitstack', version: API_VERSION, ready: isReady() });
+  var ready = isReady();
+  var home  = cfg('appHomeUrl', '');
+  var link  = home ? home + '#/connect/' + deploymentId() : '';
+
+  var html =
+    '<!DOCTYPE html><html><head><meta charset="utf-8">' +
+    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+    '<title>SplitStack backend</title><style>' +
+    'body{margin:0;min-height:100vh;display:grid;place-items:center;background:#EFEBFF;' +
+    'font-family:ui-rounded,-apple-system,"Segoe UI",Roboto,sans-serif;color:#1B1435;padding:24px}' +
+    '.c{background:#fff;border-radius:26px;padding:30px;max-width:460px;width:100%;' +
+    'box-shadow:0 20px 50px -20px rgba(46,25,110,.4);text-align:center}' +
+    'h1{margin:14px 0 6px;font-size:25px}p{color:#4A4368;line-height:1.55;font-size:15px}' +
+    '.e{font-size:52px}.ok{color:#00B894;font-weight:800}.warn{color:#F79F1F;font-weight:800}' +
+    'a.btn{display:block;margin-top:18px;background:#6C5CE7;color:#fff;text-decoration:none;' +
+    'padding:15px;border-radius:16px;font-weight:800}' +
+    'code{background:#F6F4FF;padding:3px 7px;border-radius:7px;font-size:12.5px;word-break:break-all}' +
+    '.s{margin-top:20px;padding-top:18px;border-top:1px solid #EAE6F8;font-size:13.5px;color:#8A84A6}' +
+    '</style></head><body><div class="c">' +
+    '<div class="e">' + (ready ? '✅' : '🔌') + '</div>' +
+    '<h1>Backend is live</h1>' +
+    (ready
+      ? '<p>This SplitStack instance is <span class="ok">set up and running</span>.</p>'
+      : '<p><span class="warn">No admin account yet.</span> Open your spreadsheet and choose ' +
+        '<b>SplitStack ▸ Show setup key</b>, then use it in the app.</p>') +
+    (link
+      ? '<a class="btn" href="' + escapeHtml(link) + '">Open the app →</a>' +
+        '<div class="s">Share that link with anyone who needs to connect a new device.</div>'
+      : '<div class="s">Once you have opened the app once and signed in as admin, ' +
+        'this page will show a one-tap link you can share.<br><br>' +
+        'Your backend URL is:<br><code>' + escapeHtml(deploymentUrl()) + '</code></div>') +
+    '</div></body></html>';
+
+  return HtmlService.createHtmlOutput(html)
+    .setTitle('SplitStack')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+function escapeHtml(s) {
+  return String(s === undefined || s === null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+/** The live web-app URL, as the script sees itself. */
+function deploymentUrl() {
+  try { return ScriptApp.getService().getUrl() || ''; } catch (e) { return ''; }
+}
+
+/**
+ * The bit of the URL worth putting in a link. Every deployment looks like
+ * https://script.google.com/macros/s/<ID>/exec, so the ID alone rebuilds it.
+ * Anything unusual (Workspace domain deployments) falls back to the full URL.
+ */
+function deploymentId() {
+  var url = deploymentUrl();
+  var m = /^https:\/\/script\.google\.com\/macros\/s\/([A-Za-z0-9_\-]+)\/exec$/.exec(url);
+  if (m) return m[1];
+  return url ? 'u.' + Utilities.base64EncodeWebSafe(url).replace(/=+$/, '') : '';
 }
 
 function doPost(e) {
@@ -92,7 +160,7 @@ function route(req) {
   var me = requireAuth(req.token);
 
   switch (action) {
-    case 'bootstrap':      return bootstrap(me);
+    case 'bootstrap':      return noteHome(me, p), bootstrap(me);
     case 'pull':           return pull(me, p);
     case 'push':           return push(me, p);
     case 'joinLedger':     return joinLedger(me, p);
@@ -270,10 +338,93 @@ function isReady() {
   return users.some(function (u) { return u.Role === 'admin' && u.Verifier; });
 }
 
+/* ══════════════════════════════════════════════ spreadsheet menu (onOpen) */
+/**
+ * Puts a SplitStack menu in the spreadsheet's own menu bar, so routine admin
+ * never requires the Apps Script editor. Appears after you reload the sheet.
+ */
+function onOpen() {
+  try {
+    SpreadsheetApp.getUi().createMenu('SplitStack')
+      .addItem('🔗  Show app links', 'menuLinks')
+      .addItem('🔑  Show setup key', 'menuKey')
+      .addSeparator()
+      .addItem('🛠  Run setup / repair', 'menuSetup')
+      .addItem('🔓  Unlock a locked account', 'menuUnlock')
+      .addItem('♻️  Reset the admin account', 'menuResetAdmin')
+      .addToUi();
+  } catch (e) {}
+}
+
+function menuSetup() {
+  setup(true);
+  ui().alert('SplitStack', 'Tabs checked and repaired. Everything is in place.', ui().ButtonSet.OK);
+}
+
+function ui() { return SpreadsheetApp.getUi(); }
+
+function menuKey() {
+  if (isReady()) {
+    ui().alert('Already set up',
+      'This instance already has an admin account, so the setup key is spent.\n\n' +
+      'If you need to start the admin account over, use SplitStack ▸ Reset the admin account.',
+      ui().ButtonSet.OK);
+    return;
+  }
+  ui().alert('Your setup key',
+    cfg('setupKey', '(run setup first)') +
+    '\n\nEnter this in the app once, when you create your admin account. ' +
+    'It stops working the moment that account exists.',
+    ui().ButtonSet.OK);
+}
+
+function menuLinks() {
+  var url  = deploymentUrl();
+  var home = cfg('appHomeUrl', '');
+  if (!url) {
+    ui().alert('Not deployed yet',
+      'Deploy ▸ New deployment ▸ Web app, with "Execute as: Me" and "Who has access: Anyone". ' +
+      'Then come back here.', ui().ButtonSet.OK);
+    return;
+  }
+  var msg = 'BACKEND URL (paste into the app the first time):\n' + url + '\n\n';
+  msg += home
+    ? 'ONE-TAP LINK (share this — it configures a device by itself):\n' +
+      home + '#/connect/' + deploymentId() + '\n\n' +
+      'To invite someone to a specific ledger, use the ✉️ button inside that ledger instead — ' +
+      'those links carry the backend too.'
+    : 'Open the app and sign in as admin once, and a shareable one-tap link will appear here.';
+  ui().alert('SplitStack links', msg, ui().ButtonSet.OK);
+}
+
+function menuUnlock() {
+  var res = ui().prompt('Unlock an account',
+    'Username to unlock (clears the 15-minute lockout):', ui().ButtonSet.OK_CANCEL);
+  if (res.getSelectedButton() !== ui().Button.OK) return;
+  var name = res.getResponseText().trim();
+  if (!name) return;
+  adminUnlock({ username: name });
+  ui().alert('Unlocked', '"' + name + '" can try signing in again straight away.', ui().ButtonSet.OK);
+}
+
+function menuResetAdmin() {
+  var res = ui().alert('Reset the admin account?',
+    "The admin's password is cleared and a new setup key is issued. Ledgers and expenses are " +
+    'untouched. You will create the admin account again in the app.',
+    ui().ButtonSet.YES_NO);
+  if (res !== ui().Button.YES) return;
+  resetAdminClaim();
+  ui().alert('Done', 'New setup key: ' + cfg('setupKey') +
+    '\n\nOpen the app and create the admin account again.', ui().ButtonSet.OK);
+}
+
 /* -------------------------------------------------------------------- setup */
 
-/** Run this once from the Apps Script editor. */
-function setup() {
+/**
+ * Creates or repairs every tab. Safe to run any number of times.
+ * Pass true to skip the dialog (the spreadsheet menu shows its own).
+ */
+function setup(silent) {
   tab(TAB_USERS,   USER_COLS);
   tab(TAB_LEDGERS, LEDGER_COLS);
   tab(TAB_MEMBERS, MEMBER_COLS);
@@ -287,13 +438,19 @@ function setup() {
   if (!key) { key = randomHex(6).toUpperCase(); setCfg('setupKey', key); }
   pepper();
 
-  var msg = '\n=================================================\n' +
-            '  SplitStack is ready.\n' +
-            '  SETUP KEY:  ' + key + '\n' +
-            '  Use it once in the app to create your admin account.\n' +
-            '=================================================\n';
+  var claimed = isReady();
+  var msg = claimed
+    ? 'Tabs checked. This instance already has an admin account.\n\n' +
+      'Use the SplitStack menu in your spreadsheet for links and day-to-day admin.'
+    : '\n=================================================\n' +
+      '  SplitStack is ready.\n' +
+      '  SETUP KEY:  ' + key + '\n' +
+      '  Use it once in the app to create your admin account.\n' +
+      '=================================================\n';
   Logger.log(msg);
-  try { SpreadsheetApp.getUi().alert('SplitStack setup complete', msg, SpreadsheetApp.getUi().ButtonSet.OK); } catch (e) {}
+  if (!silent) {
+    try { SpreadsheetApp.getUi().alert('SplitStack', msg, SpreadsheetApp.getUi().ButtonSet.OK); } catch (e) {}
+  }
   return key;
 }
 
@@ -489,7 +646,7 @@ function login(p) {
 
 function claimAdmin(p) {
   return lock(function () {
-    setup();
+    setup(true);
     if (isReady()) throw new Error('ADMIN_EXISTS');
     var g = guardCheck('*setupkey*');
     if (String(p.setupKey || '').toUpperCase().trim() !== String(cfg('setupKey')).toUpperCase().trim()) {
@@ -832,6 +989,21 @@ function myLedgers(me) {
   if (me.Role === 'admin') return all;
   var mine = mem.filter(function (m) { return m.UserId === me.UserId; }).map(function (m) { return m.LedgerId; });
   return all.filter(function (l) { return mine.indexOf(l.LedgerId) !== -1; });
+}
+
+/**
+ * Remember where the app is hosted, reported by the admin's own client. This
+ * is what lets the /exec page and the spreadsheet menu produce working links
+ * without anyone configuring anything.
+ *
+ * Admin only — otherwise any member could repoint those links elsewhere.
+ */
+function noteHome(me, p) {
+  if (me.Role !== 'admin') return;
+  var home = String((p && p.home) || '').trim();
+  if (!/^https:\/\/[^\s"'<>]{4,300}$/.test(home)) return;
+  if (cfg('appHomeUrl', '') === home) return;
+  setCfg('appHomeUrl', home);
 }
 
 function bootstrap(me) {

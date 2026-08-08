@@ -56,8 +56,12 @@ Google will ask for permission the first time:
 This is normal. You're authorising *your own* script to edit *your own* sheet.
 
 When it finishes, a dialog shows your **SETUP KEY** — six characters like `A3F91C`.
-Write it down. If you miss it, run the `showSetupKey` function to print it again
-(look in **Execution log** at the bottom).
+
+Now go back to your spreadsheet tab and **reload the page**. A new **SplitStack** menu appears in
+the menu bar, next to Help. That's where everything lives from now on — you shouldn't need the
+Apps Script editor again.
+
+> Lost the key? **SplitStack ▸ Show setup key**.
 
 ### 4. Deploy it as a web app
 
@@ -79,7 +83,12 @@ Copy the **Web app URL**. It looks like:
 https://script.google.com/macros/s/AKfycb.....................lQ/exec
 ```
 
-Keep it handy — you'll paste it into the app in a moment.
+Keep it handy — you'll paste it into the app in a moment. (This is the only time you'll ever paste
+it by hand. After your first sign-in, the app hands out self-configuring links instead.)
+
+**Want to check it worked?** Open that URL in a browser tab. You should get a friendly
+*"Backend is live"* page rather than an error or a wall of JSON. If you see that page, the hard
+part is done.
 
 ---
 
@@ -159,6 +168,11 @@ A new tab appears in your spreadsheet immediately.
 3. Open the ledger and tap ✉️ → **Copy link**. Text it to them.
 4. They open it, tap their own face under *Claim your seat*, choose a password, and they're in.
 
+That's genuinely all they do. **The link carries your backend address with it**, so a brand-new
+phone that has never heard of SplitStack goes straight from the text message to "choose a
+password" — no URLs to paste, no setup key, nothing to explain. Tell them to *Add to Home Screen*
+afterwards and they're done.
+
 **The set-it-yourself way** — you pick a password and tell them what it is.
 Same as above, but fill in the password fields. They can change it later from their profile.
 
@@ -166,9 +180,17 @@ Same as above, but fill in the password fields. They can change it later from th
 
 Send them the same invite link. They tap **Log in and join** and the ledger is added to their list.
 
+### Adding a device for yourself
+
+**SplitStack ▸ Show app links** in your spreadsheet gives you a one-tap link that configures any
+device by itself. The same link appears on the *"Backend is live"* page at your `/exec` URL. Handy
+for setting up your own tablet, or for someone who needs the app but isn't on a ledger yet.
+
 ### Regenerating a link
 
-✉️ → **Generate a new link** kills the old one instantly. Do this if a link leaks.
+✉️ → **Generate a new link** kills the old one instantly. Do this if a link leaks — and note that
+because invite links now carry your backend address, a leaked link exposes that too. Regenerating
+is the fix, and it takes one tap.
 
 ---
 
@@ -374,6 +396,40 @@ Bump both version constants so the app can name what it's running:
 Keep them identical. Strictly speaking this is optional — network-first means fresh code arrives
 either way — but bumping `SW_BUILD` is what makes the service worker itself update, and it's what
 Settings displays.
+
+---
+
+## The SplitStack menu in your spreadsheet
+
+After you reload the sheet, a **SplitStack** menu sits in the menu bar. It exists so you never have
+to go back into the Apps Script editor.
+
+| Item | What it's for |
+|---|---|
+| **🔗 Show app links** | Your backend URL, plus a one-tap link that configures any new device |
+| **🔑 Show setup key** | The key for creating the admin account (refuses once one exists) |
+| **🛠 Run setup / repair** | Rebuilds any missing tab or column. Safe to run any time; never touches data |
+| **🔓 Unlock a locked account** | Clears someone's 15-minute lockout immediately |
+| **♻️ Reset the admin account** | Clears the admin password and issues a fresh setup key. Ledgers untouched |
+
+---
+
+## Giving someone their own copy
+
+If a friend wants their own instance rather than joining yours, they don't have to repeat the
+copy-paste. Once yours is working:
+
+1. In your spreadsheet: **File ▸ Make a copy**
+2. Delete the data rows from the copy (keep the header rows), or just delete every ledger tab and
+   clear `Users`, `Ledgers` and `Members`
+3. In the copy: **Extensions ▸ Apps Script ▸ Project Settings**, and delete the `PEPPER` script
+   property if one exists, so they get their own secret
+4. Share that copy with them
+
+A bound Apps Script travels with the spreadsheet, so the code comes along. They deploy it as their
+own web app and run through Part 3 — no pasting code, and roughly three minutes of work.
+
+> Make sure you're copying a *cleared* sheet, not one with your household's expenses in it.
 
 ---
 
