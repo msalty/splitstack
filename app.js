@@ -6,7 +6,7 @@
 
 /* Shown in Settings ▸ App & updates. Bump this and SW_BUILD in sw.js together
    whenever you re-upload the app. */
-const APP_BUILD = '2026-08-08.2';
+const APP_BUILD = '2026-08-08.3';
 
 /* ────────────────────────────────────────────────────────────────  helpers */
 const $  = (s, r = document) => r.querySelector(s);
@@ -1021,7 +1021,7 @@ function txnHaystack(t) {
 const txnMatches = (t, toks) => { const h = txnHaystack(t); return toks.every(k => h.includes(k)); };
 
 function searchBar() {
-  return `<div class="searchbar mb${S.search ? '' : ' empty'}">
+  return `<div class="searchbar mb${S.search ? '' : ' blank'}">
     <span class="ico" aria-hidden="true">🔍</span>
     <input id="q-search" type="search" autocomplete="off" spellcheck="false" enterkeyhint="search"
       placeholder="Name or amount…" aria-label="Search expenses" value="${esc(S.search)}">
@@ -1061,7 +1061,7 @@ function applySearch() {
   if (!l || !box) return;
   box.innerHTML = feedList(l);
   const bar = $('.searchbar');
-  if (bar) bar.classList.toggle('empty', !S.search);
+  if (bar) bar.classList.toggle('blank', !S.search);
 }
 
 function txnRow(t, l) {
