@@ -18,6 +18,10 @@
   --ink:#1B1435; --ink-2:#4A4368; --ink-3:#8A84A6;
   --card:#FFFFFF; --card-2:#F6F4FF; --line:#EAE6F8;
   --good:#00B894; --bad:#FF5A6E; --warn:#F79F1F;
+  /* Floating pills (sync badge, toast) sit on their own surface rather than on
+     --ink: --ink inverts between schemes, which would leave white-on-white. */
+  --pill:#1B1435; --on-pill:#FFFFFF;
+  --on-good:#04231B; --on-bad:#3D0009; --on-warn:#3A2600;
   --r-lg:26px; --r-md:18px; --r-sm:12px;
   --shadow:0 10px 30px -12px rgba(46,25,110,.35);
   --shadow-lg:0 24px 60px -20px rgba(46,25,110,.45);
@@ -29,6 +33,7 @@
   :root{
     --ink:#F4F1FF; --ink-2:#C3BDE4; --ink-3:#8880AC;
     --card:#241E42; --card-2:#2E2752; --line:#3A3266;
+    --pill:#453C7D; --on-pill:#F4F1FF;
     --shadow:0 10px 30px -12px rgba(0,0,0,.6);
     --shadow-lg:0 24px 60px -20px rgba(0,0,0,.7);
   }
@@ -224,20 +229,25 @@ select.input{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xml
 /* ════════════════════════════════════════════════════════════════ statusbar */
 #sync{position:fixed;left:50%;top:calc(var(--sat) + 8px);z-index:80;
   transform:translateX(-50%) translateY(-24px) scale(.94);opacity:0;visibility:hidden;
-  padding:9px 17px;border-radius:999px;font-size:13.5px;font-weight:800;color:#fff;
-  background:var(--ink);box-shadow:var(--shadow-lg);white-space:nowrap;pointer-events:none;
+  padding:9px 17px;border-radius:999px;font-size:13.5px;font-weight:800;color:var(--on-pill);
+  background:var(--pill);box-shadow:var(--shadow-lg);white-space:nowrap;pointer-events:none;
   transition:transform .3s var(--spring),opacity .22s ease,visibility 0s linear .3s}
 #sync.on{transform:translateX(-50%) translateY(0) scale(1);opacity:1;visibility:visible;
   transition:transform .35s var(--spring),opacity .18s ease,visibility 0s}
-#sync.offline{background:var(--warn)} #sync.err{background:var(--bad)} #sync.ok{background:var(--good)}
-.spinner{width:15px;height:15px;border-radius:50%;border:2.5px solid rgba(255,255,255,.3);
-  border-top-color:#fff;animation:spin .7s linear infinite;display:inline-block;vertical-align:-2px;margin-right:7px}
+/* The status colours are bright in both schemes, so they take a dark ink —
+   white on --warn/--good only clears ~2.5:1. */
+#sync.offline{background:var(--warn);color:var(--on-warn)}
+#sync.err{background:var(--bad);color:var(--on-bad)}
+#sync.ok{background:var(--good);color:var(--on-good)}
+/* currentColor so the spinner follows whichever ink the badge is wearing. */
+.spinner{width:15px;height:15px;border-radius:50%;border:2.5px solid color-mix(in srgb,currentColor 30%,transparent);
+  border-top-color:currentColor;animation:spin .7s linear infinite;display:inline-block;vertical-align:-2px;margin-right:7px}
 /* Hidden state must actually leave the screen: a percentage translate is
    relative to the toast's own height, which is far less than the gap to the
    bottom edge — so it also fades and goes visibility:hidden. */
 #toast{position:fixed;left:50%;bottom:calc(96px + var(--sab));
   transform:translateX(-50%) translateY(18px) scale(.94);opacity:0;visibility:hidden;
-  z-index:90;background:var(--ink);color:#fff;padding:13px 20px;border-radius:16px;font-weight:800;
+  z-index:90;background:var(--pill);color:var(--on-pill);padding:13px 20px;border-radius:16px;font-weight:800;
   font-size:14.5px;box-shadow:var(--shadow-lg);max-width:88vw;text-align:center;pointer-events:none;
   transition:transform .3s var(--spring),opacity .22s ease,visibility 0s linear .3s}
 #toast.on{transform:translateX(-50%) translateY(0) scale(1);opacity:1;visibility:visible;
