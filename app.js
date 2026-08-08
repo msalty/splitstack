@@ -1,0 +1,1845 @@
+/* ==========================================================================
+   SplitStack — offline-first shared expense PWA
+   Backend: your own Google Apps Script web app over your own Google Sheet.
+   ========================================================================== */
+'use strict';
+
+/* ────────────────────────────────────────────────────────────────  helpers */
+const $  = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const clamp = (n, a, b) => Math.min(b, Math.max(a, n));
+const round2 = n => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+const todayISO = () => { const d = new Date(); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 10); };
+const uuid = () => 'txn_' + Date.now().toString(36) + '_' +
+  ([...crypto.getRandomValues(new Uint8Array(6))].map(b => b.toString(16).padStart(2, '0')).join(''));
+const hexBytes = n => [...crypto.getRandomValues(new Uint8Array(n))].map(b => b.toString(16).padStart(2, '0')).join('');
+
+function money(n, withSign = false) {
+  const sym = (S.config && S.config.symbol) || '$';
+  const v = Math.abs(round2(n));
+  const s = sym + v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (withSign && round2(n) < 0) return '−' + s;
+  return s;
+}
+function niceDate(iso) {
+  if (!iso) return '';
+  const d = new Date(iso + 'T12:00:00'), now = new Date();
+  const t = todayISO();
+  if (iso === t) return 'Today';
+  const y = new Date(); y.setDate(y.getDate() - 1);
+  if (iso === y.toISOString().slice(0, 10)) return 'Yesterday';
+  const opt = { month: 'short', day: 'numeric' };
+  if (d.getFullYear() !== now.getFullYear()) opt.year = 'numeric';
+  return d.toLocaleDateString(undefined, opt);
+}
+function initials(name) {
+  return String(name || '?').trim().split(/\s+/).slice(0, 2).map(w => w[0]).join('').toUpperCase();
+}
+function haptic(ms = 12) { try { navigator.vibrate && navigator.vibrate(ms); } catch (e) {} }
+
+let toastTimer;
+function toast(msg, ms = 2400) {
+  const t = $('#toast'); t.textContent = msg; t.classList.add('on');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('on'), ms);
+}
+
+/* ─────────────────────────────────────────────────────────────── confetti */
+function confetti(n = 90) {
+  const c = $('#confetti'), ctx = c.getContext('2d');
+  c.width = innerWidth; c.height = innerHeight; c.style.display = 'block';
+  const cols = ['#6C5CE7', '#00B894', '#FF7675', '#FDCB6E', '#0984E3', '#E84393', '#00CEC9'];
+  const bits = Array.from({ length: n }, () => ({
+    x: innerWidth / 2 + (Math.random() - .5) * 160, y: innerHeight * .45,
+    vx: (Math.random() - .5) * 15, vy: -8 - Math.random() * 13,
+    r: 4 + Math.random() * 7, a: Math.random() * 6.3, va: (Math.random() - .5) * .4,
+    col: cols[(Math.random() * cols.length) | 0]
+  }));
+  let frames = 0;
+  (function tick() {
+    ctx.clearRect(0, 0, c.width, c.height);
+    bits.forEach(b => {
+      b.vy += .42; b.x += b.vx; b.y += b.vy; b.a += b.va; b.vx *= .995;
+      ctx.save(); ctx.translate(b.x, b.y); ctx.rotate(b.a); ctx.fillStyle = b.col;
+      ctx.fillRect(-b.r / 2, -b.r / 2, b.r, b.r * 1.5); ctx.restore();
+    });
+    if (++frames < 150) requestAnimationFrame(tick);
+    else { ctx.clearRect(0, 0, c.width, c.height); c.style.display = 'none'; }
+  })();
+}
+
+/* ─────────────────────────────────────────────────────────────── IndexedDB */
+const DB = (() => {
+  let dbp;
+  function open() {
+    if (dbp) return dbp;
+    dbp = new Promise((res, rej) => {
+      const rq = indexedDB.open('splitstack', 2);
+      rq.onupgradeneeded = e => {
+        const db = e.target.result;
+        if (!db.objectStoreNames.contains('kv')) db.createObjectStore('kv');
+        if (!db.objectStoreNames.contains('txns')) {
+          const s = db.createObjectStore('txns', { keyPath: 'key' });
+          s.createIndex('ledger', 'ledgerId');
+        }
+        if (!db.objectStoreNames.contains('outbox')) db.createObjectStore('outbox', { keyPath: 'seq', autoIncrement: true });
+        if (!db.objectStoreNames.contains('blobs')) db.createObjectStore('blobs');
+      };
+      rq.onsuccess = () => res(rq.result);
+      rq.onerror = () => rej(rq.error);
+    });
+    return dbp;
+  }
+  const tx = async (store, mode, fn) => {
+    const db = await open();
+    return new Promise((res, rej) => {
+      const t = db.transaction(store, mode);
+      const out = fn(t.objectStore(store));
+      t.oncomplete = () => res(out && out.result !== undefined ? out.result : out);
+      t.onerror = () => rej(t.error);
+    });
+  };
+  const req = r => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+  return {
+    async get(k) { const db = await open(); return req(db.transaction('kv').objectStore('kv').get(k)); },
+    async set(k, v) { return tx('kv', 'readwrite', s => s.put(v, k)); },
+    async del(k) { return tx('kv', 'readwrite', s => s.delete(k)); },
+    async putTxns(ledgerId, list) {
+      const db = await open();
+      return new Promise((res, rej) => {
+        const t = db.transaction('txns', 'readwrite'), s = t.objectStore('txns');
+        list.forEach(x => s.put(Object.assign({}, x, { key: ledgerId + '|' + x.id, ledgerId })));
+        t.oncomplete = res; t.onerror = () => rej(t.error);
+      });
+    },
+    async allTxns(ledgerId) {
+      const db = await open();
+      return req(db.transaction('txns').objectStore('txns').index('ledger').getAll(ledgerId));
+    },
+    async dropLedger(ledgerId) {
+      const list = await this.allTxns(ledgerId);
+      return tx('txns', 'readwrite', s => list.forEach(x => s.delete(x.key)));
+    },
+    async queue(item) { return tx('outbox', 'readwrite', s => s.add(item)); },
+    async outbox() { const db = await open(); return req(db.transaction('outbox').objectStore('outbox').getAll()); },
+    async unqueue(seq) { return tx('outbox', 'readwrite', s => s.delete(seq)); },
+    async blobGet(k) { const db = await open(); return req(db.transaction('blobs').objectStore('blobs').get(k)); },
+    async blobSet(k, v) { return tx('blobs', 'readwrite', s => s.put(v, k)); },
+    async wipe() {
+      const db = await open();
+      return new Promise(res => {
+        const t = db.transaction(['kv', 'txns', 'outbox', 'blobs'], 'readwrite');
+        ['kv', 'txns', 'outbox', 'blobs'].forEach(n => t.objectStore(n).clear());
+        t.oncomplete = res;
+      });
+    }
+  };
+})();
+
+/* ─────────────────────────────────────────────────────────────── crypto */
+async function derive(password, saltHex, iterations) {
+  if (!crypto.subtle) throw new Error('This browser needs a secure (https) connection for login.');
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+  const salt = new Uint8Array((saltHex.match(/.{1,2}/g) || []).map(b => parseInt(b, 16)));
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt, iterations: iterations || 210000, hash: 'SHA-256' }, key, 256);
+  return [...new Uint8Array(bits)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/* ─────────────────────────────────────────────────────────────────── state */
+const LS = {
+  get api() { return localStorage.getItem('ss.api') || ''; }, set api(v) { localStorage.setItem('ss.api', v); },
+  get token() { return localStorage.getItem('ss.token') || ''; }, set token(v) { v ? localStorage.setItem('ss.token', v) : localStorage.removeItem('ss.token'); }
+};
+
+const S = {
+  api: LS.api, token: LS.token,
+  me: null, users: [], ledgers: [], members: [], config: { symbol: '$', currency: 'USD', appName: 'SplitStack' },
+  cursors: {}, txns: {}, pending: {}, online: navigator.onLine,
+  view: 'boot', params: {}, tab: 'feed', syncing: false, lastError: ''
+};
+
+const userById = id => S.users.find(u => u.id === id) || { id, name: 'Unknown', color: '#8A84A6', emoji: '👤', avatar: '' };
+const ledgerById = id => S.ledgers.find(l => l.id === id);
+const memberIdsOf = id => S.members.filter(m => m.ledgerId === id).map(m => m.userId);
+const isAdmin = () => S.me && S.me.role === 'admin';
+
+/* ──────────────────────────────────────────────────────────────────── api */
+class ApiError extends Error { constructor(code) { super(code); this.code = code; } }
+
+async function api(action, payload = {}, opts = {}) {
+  if (!S.api) throw new ApiError('NO_API');
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), opts.timeout || 45000);
+  let res;
+  try {
+    res = await fetch(S.api, {
+      method: 'POST', redirect: 'follow', signal: ctl.signal,
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ action, token: S.token, payload })
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    S.online = false;
+    throw new ApiError('OFFLINE');
+  }
+  clearTimeout(timer);
+  S.online = true;
+  let j;
+  try { j = await res.json(); } catch (e) { throw new ApiError('BAD_RESPONSE'); }
+  if (!j.ok) {
+    if (/^AUTH_/.test(j.error)) { await signOut(true); throw new ApiError(j.error); }
+    throw new ApiError(j.error);
+  }
+  return j.data;
+}
+
+const ERRORS = {
+  NO_API: 'No backend configured yet.',
+  OFFLINE: "Can't reach the server — you're offline.",
+  BAD_CREDENTIALS: 'Wrong username or password.',
+  BAD_SETUP_KEY: 'That setup key is not right.',
+  ADMIN_EXISTS: 'An admin account already exists here.',
+  USERNAME_TAKEN: 'That username is taken.',
+  BAD_USERNAME: 'Usernames are 2–24 letters, numbers, dot, dash or underscore.',
+  ACCOUNT_DISABLED: 'That account has been switched off.',
+  LAST_ADMIN: "You can't remove the last admin.",
+  CANNOT_DELETE_SELF: "You can't delete your own account.",
+  SPLIT_MUST_TOTAL_100: 'The split has to add up to 100%.',
+  FORBIDDEN: "You don't have access to that.",
+  BAD_INVITE: 'That invite link is no longer valid.',
+  SEAT_TAKEN: 'That person already set up their password.',
+  AVATAR_TOO_BIG: 'That picture is too large.',
+  BAD_RESPONSE: 'The server sent something unexpected. Is the deployment URL right?'
+};
+const errMsg = e => ERRORS[e && e.code] || (e && e.message) || 'Something went wrong.';
+
+/* ────────────────────────────────────────────────────────────── sync engine */
+function syncBadge(text, cls) {
+  const el = $('#sync');
+  if (!text) { el.classList.remove('on'); return; }
+  el.className = 'on ' + (cls || '');
+  el.innerHTML = text;
+}
+
+async function applyState(st) {
+  S.me = st.me; S.users = st.users; S.ledgers = st.ledgers; S.members = st.members;
+  S.config = st.config || S.config;
+  await DB.set('state', { me: st.me, users: st.users, ledgers: st.ledgers, members: st.members, config: st.config });
+  document.title = (S.config.appName || 'SplitStack');
+}
+
+async function loadCache() {
+  const st = await DB.get('state');
+  if (st) { S.me = st.me; S.users = st.users; S.ledgers = st.ledgers; S.members = st.members; S.config = st.config || S.config; }
+  S.cursors = (await DB.get('cursors')) || {};
+  for (const l of S.ledgers) {
+    const rows = await DB.allTxns(l.id);
+    S.txns[l.id] = rows.map(r => { const c = Object.assign({}, r); delete c.key; return c; });
+  }
+  await refreshPending();
+}
+
+async function refreshPending() {
+  const ob = await DB.outbox();
+  S.pending = {};
+  ob.forEach(o => { if (o.kind === 'txn') S.pending[o.payload.id] = true; });
+  return ob;
+}
+
+function mergeTxns(ledgerId, incoming) {
+  const map = new Map((S.txns[ledgerId] || []).map(t => [t.id, t]));
+  incoming.forEach(t => {
+    const cur = map.get(t.id);
+    // An edit that is still sitting in the outbox always wins until it lands.
+    if (cur && cur._local && S.pending[t.id]) return;
+    map.set(t.id, t);
+  });
+  S.txns[ledgerId] = [...map.values()];
+}
+
+async function persistLedger(ledgerId) {
+  await DB.putTxns(ledgerId, S.txns[ledgerId] || []);
+  await DB.set('cursors', S.cursors);
+}
+
+let syncing = null;
+async function sync({ silent = false, full = false } = {}) {
+  if (syncing) return syncing;
+  syncing = (async () => {
+    if (!S.token) return;
+    if (!silent) syncBadge('<span class="spinner"></span>Syncing…');
+    try {
+      /* 1 ── drain the outbox, in order */
+      const ob = await refreshPending();
+      const byLedger = {};
+      ob.filter(o => o.kind === 'txn').forEach(o => (byLedger[o.ledgerId] = byLedger[o.ledgerId] || []).push(o));
+
+      for (const [ledgerId, items] of Object.entries(byLedger)) {
+        // receipts first so the txn row carries a real id
+        for (const it of items) {
+          if (it.payload._receiptLocal) {
+            try {
+              const data = await DB.blobGet(it.payload._receiptLocal);
+              if (data) {
+                const r = await api('putReceipt', { ledgerId, txnId: it.payload.id, dataUrl: data });
+                it.payload.receiptId = r.receiptId;
+                delete it.payload._receiptLocal;
+              }
+            } catch (e) { if (e.code === 'OFFLINE') throw e; }
+          }
+        }
+        const res = await api('push', {
+          ledgerId, txns: items.map(i => i.payload), since: S.cursors[ledgerId] || 0
+        });
+        S.cursors[ledgerId] = res.cursor;
+        (S.txns[ledgerId] || []).forEach(t => { delete t._local; });
+        mergeTxns(ledgerId, res.txns);
+        for (const it of items) await DB.unqueue(it.seq);
+        await persistLedger(ledgerId);
+      }
+      await refreshPending();
+
+      /* 2 ── pull deltas */
+      const st = await api('bootstrap');
+      await applyState(st);
+      const since = full ? {} : S.cursors;
+      const pulled = await api('pull', { since });
+      for (const [ledgerId, blk] of Object.entries(pulled.ledgers || {})) {
+        if (blk.full) S.txns[ledgerId] = [];
+        mergeTxns(ledgerId, blk.txns);
+        S.cursors[ledgerId] = blk.cursor;
+        await persistLedger(ledgerId);
+      }
+      await DB.set('lastSync', Date.now());
+      S.lastError = '';
+      if (!silent) { syncBadge('✓ Up to date', 'ok'); setTimeout(() => syncBadge(''), 1400); }
+      render();
+    } catch (e) {
+      S.lastError = errMsg(e);
+      if (e.code === 'OFFLINE') { syncBadge('📴 Offline — changes are saved', 'offline'); setTimeout(() => syncBadge(''), 2600); }
+      else if (!/^AUTH_/.test(e.code || '')) { syncBadge('⚠️ ' + esc(errMsg(e)), 'err'); setTimeout(() => syncBadge(''), 3800); }
+      render();
+    } finally { syncing = null; }
+  })();
+  return syncing;
+}
+
+async function queueTxn(ledgerId, txn) {
+  txn._local = true;
+  mergeTxns(ledgerId, [txn]);
+  S.pending[txn.id] = true;
+  await persistLedger(ledgerId);
+  await DB.queue({ kind: 'txn', ledgerId, payload: txn, ts: Date.now() });
+  render();
+  sync({ silent: true });
+}
+
+addEventListener('online', () => { S.online = true; sync({ silent: true }); render(); });
+addEventListener('offline', () => { S.online = false; render(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden && S.token) sync({ silent: true }); });
+
+/* ───────────────────────────────────────────────────────────────── balances */
+/**
+ * Turn percentages into real money that adds up to the cent.
+ * Percentages can never express thirds exactly, so we floor everyone to a
+ * cent and hand the leftover pennies to the largest fractional remainders
+ * (ties broken by user id, so every device agrees).
+ */
+function allocate(amount, split) {
+  const ids = Object.keys(split || {}).sort();
+  const out = {};
+  if (!ids.length) return out;
+  const totalCents = Math.round(round2(amount) * 100);
+  const raw = ids.map(id => round2(amount) * (Number(split[id]) || 0) / 100 * 100); // in cents
+  const cents = raw.map(v => Math.floor(v));
+  let residual = totalCents - cents.reduce((a, b) => a + b, 0);
+  const order = ids.map((id, i) => ({ i, id, frac: raw[i] - cents[i] }))
+    .sort((a, b) => (b.frac - a.frac) || (a.id < b.id ? -1 : 1));
+  for (let k = 0; residual > 0 && k < 10000; k++, residual--) cents[order[k % ids.length].i]++;
+  for (let k = 0; residual < 0 && k < 10000; k++, residual++) cents[order[order.length - 1 - (k % ids.length)].i]--;
+  ids.forEach((id, i) => out[id] = cents[i] / 100);
+  return out;
+}
+/** What this transaction does to one person's balance. */
+function impactOf(t, userId) {
+  if (t.type === 'settlement')
+    return (t.paidBy === userId ? t.amount : 0) - (t.paidTo === userId ? t.amount : 0);
+  const share = allocate(t.amount, t.split)[userId] || 0;
+  return round2((t.paidBy === userId ? t.amount : 0) - share);
+}
+
+function balancesFor(ledgerId) {
+  const ids = memberIdsOf(ledgerId);
+  const net = {}; ids.forEach(i => net[i] = 0);
+  (S.txns[ledgerId] || []).filter(t => !t.deleted).forEach(t => {
+    if (t.type === 'settlement') {
+      net[t.paidBy] = round2((net[t.paidBy] || 0) + t.amount);
+      net[t.paidTo] = round2((net[t.paidTo] || 0) - t.amount);
+    } else {
+      net[t.paidBy] = round2((net[t.paidBy] || 0) + t.amount);
+      const shares = allocate(t.amount, t.split);
+      Object.entries(shares).forEach(([uid, v]) => net[uid] = round2((net[uid] || 0) - v));
+    }
+  });
+  Object.keys(net).forEach(k => net[k] = round2(net[k]));
+  return net;
+}
+
+/** Greedy minimum-cash-flow: fewest transfers that zero everyone out. */
+function simplify(net) {
+  const cred = [], debt = [];
+  Object.entries(net).forEach(([id, v]) => {
+    if (v > 0.005) cred.push({ id, v }); else if (v < -0.005) debt.push({ id, v: -v });
+  });
+  cred.sort((a, b) => b.v - a.v); debt.sort((a, b) => b.v - a.v);
+  const out = []; let i = 0, j = 0;
+  while (i < debt.length && j < cred.length) {
+    const amt = round2(Math.min(debt[i].v, cred[j].v));
+    if (amt > 0.005) out.push({ from: debt[i].id, to: cred[j].id, amount: amt });
+    debt[i].v = round2(debt[i].v - amt); cred[j].v = round2(cred[j].v - amt);
+    if (debt[i].v <= 0.005) i++;
+    if (cred[j].v <= 0.005) j++;
+  }
+  return out;
+}
+
+function myBalance(ledgerId) {
+  const b = balancesFor(ledgerId);
+  return S.me ? (b[S.me.id] || 0) : 0;
+}
+
+/* ───────────────────────────────────────────────────────────────── snippets */
+function avatar(u, size = 'm', badge) {
+  const bg = u.avatar ? `background-image:url('${u.avatar}')` : `background:${esc(u.color || '#8A84A6')}`;
+  return `<div class="av ${size}" style="${bg}" title="${esc(u.name)}">${u.avatar ? '' : esc(u.emoji || initials(u.name))}${badge ? `<span class="badge">${badge}</span>` : ''}</div>`;
+}
+function avStack(ids, max = 5) {
+  const shown = ids.slice(0, max);
+  return `<div class="avstack">${shown.map(id => avatar(userById(id), 's')).join('')}` +
+    (ids.length > max ? `<div class="av s" style="background:var(--ink-3)">+${ids.length - max}</div>` : '') + '</div>';
+}
+const CATEGORIES = [
+  ['🍕', 'Food'], ['🛒', 'Groceries'], ['🏠', 'Home'], ['💡', 'Utilities'], ['🚗', 'Transport'],
+  ['✈️', 'Travel'], ['🏨', 'Lodging'], ['🎟️', 'Fun'], ['🍺', 'Drinks'], ['🧻', 'Supplies'],
+  ['🩺', 'Health'], ['🎁', 'Gifts'], ['🐶', 'Pets'], ['📶', 'Internet'], ['💼', 'Other']
+];
+const catEmoji = c => (CATEGORIES.find(x => x[1] === c) || ['🧾'])[0];
+
+/* ─────────────────────────────────────────────────────────────────── router */
+function go(view, params = {}, replace = false) {
+  S.view = view; S.params = params;
+  const hash = '#/' + view + (params.id ? '/' + params.id : '') + (params.token ? '/' + params.token : '');
+  if (replace) history.replaceState({ view, params }, '', hash);
+  else history.pushState({ view, params }, '', hash);
+  window.scrollTo(0, 0);
+  render();
+}
+addEventListener('popstate', e => {
+  if (e.state && e.state.view) { S.view = e.state.view; S.params = e.state.params || {}; render(); }
+  else routeFromHash();
+});
+function routeFromHash() {
+  const parts = (location.hash || '').replace(/^#\/?/, '').split('/').filter(Boolean);
+  if (parts[0] === 'join' && parts[1]) { S.view = 'invite'; S.params = { token: parts[1] }; }
+  else if (parts[0] === 'ledger' && parts[1]) { S.view = 'ledger'; S.params = { id: parts[1] }; }
+  else if (parts[0] && S.token) { S.view = parts[0]; S.params = { id: parts[1] }; }
+  else S.view = S.token ? 'home' : 'login';
+  render();
+}
+
+/* ──────────────────────────────────────────────────────────────────── sheets */
+function openSheet(html, opts = {}) {
+  const scrim = document.createElement('div');
+  scrim.className = 'scrim';
+  scrim.innerHTML = `<div class="sheet"><div class="grip"></div>${html}</div>`;
+  document.body.appendChild(scrim);
+  document.body.style.overflow = 'hidden';
+  requestAnimationFrame(() => scrim.classList.add('on'));
+  const close = () => {
+    scrim.classList.remove('on');
+    document.body.style.overflow = '';
+    setTimeout(() => scrim.remove(), 340);
+    opts.onClose && opts.onClose();
+  };
+  scrim.addEventListener('click', e => { if (e.target === scrim) close(); });
+  scrim.close = close;
+  return scrim;
+}
+function confirmSheet(title, body, confirmLabel = 'Do it', danger = true) {
+  return new Promise(res => {
+    const s = openSheet(`
+      <h2>${esc(title)}</h2><p class="sheet-sub">${esc(body)}</p>
+      <div class="flex mt"><button class="btn ghost grow" data-x="no">Cancel</button>
+      <button class="btn ${danger ? 'danger' : ''} grow" data-x="yes">${esc(confirmLabel)}</button></div>`);
+    s.addEventListener('click', e => {
+      const b = e.target.closest('[data-x]'); if (!b) return;
+      s.close(); res(b.dataset.x === 'yes');
+    });
+  });
+}
+
+/* ────────────────────────────────────────────────────────────── image utils */
+function pickImage(maxPx, quality) {
+  return new Promise(res => {
+    const inp = document.createElement('input');
+    inp.type = 'file'; inp.accept = 'image/*';
+    inp.onchange = () => {
+      const f = inp.files[0]; if (!f) return res(null);
+      const img = new Image(), url = URL.createObjectURL(f);
+      img.onload = () => {
+        const scale = Math.min(1, maxPx / Math.max(img.width, img.height));
+        const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
+        const c = document.createElement('canvas'); c.width = w; c.height = h;
+        const g = c.getContext('2d');
+        g.fillStyle = '#fff'; g.fillRect(0, 0, w, h);
+        g.drawImage(img, 0, 0, w, h);
+        URL.revokeObjectURL(url);
+        res(c.toDataURL('image/jpeg', quality));
+      };
+      img.onerror = () => res(null);
+      img.src = url;
+    };
+    inp.click();
+  });
+}
+/** Square crop for avatars. */
+function pickAvatar() {
+  return new Promise(res => {
+    const inp = document.createElement('input');
+    inp.type = 'file'; inp.accept = 'image/*';
+    inp.onchange = () => {
+      const f = inp.files[0]; if (!f) return res(null);
+      const img = new Image(), url = URL.createObjectURL(f);
+      img.onload = () => {
+        const side = Math.min(img.width, img.height), out = 220;
+        const c = document.createElement('canvas'); c.width = c.height = out;
+        const g = c.getContext('2d');
+        g.drawImage(img, (img.width - side) / 2, (img.height - side) / 2, side, side, 0, 0, out, out);
+        URL.revokeObjectURL(url);
+        res(c.toDataURL('image/jpeg', .82));
+      };
+      img.onerror = () => res(null);
+      img.src = url;
+    };
+    inp.click();
+  });
+}
+
+/* ══════════════════════════════════════════════════════════════════ RENDER */
+function render() {
+  const root = $('#root');
+  let html = '';
+  switch (S.view) {
+    case 'connect': html = viewConnect(); break;
+    case 'setupAdmin': html = viewSetupAdmin(); break;
+    case 'login': html = viewLogin(); break;
+    case 'invite': html = viewInvite(); break;
+    case 'home': html = viewHome(); break;
+    case 'ledger': html = viewLedger(); break;
+    case 'profile': html = viewProfile(); break;
+    case 'admin': html = viewAdmin(); break;
+    default: html = viewBoot();
+  }
+  root.innerHTML = html;
+  wire();
+}
+
+const shell = (title, body, opts = {}) => `
+  <div class="topbar"><div class="wrap row">
+    ${opts.back ? `<button class="iconbtn back" data-act="back">‹</button>` : `<div class="av m" style="background:linear-gradient(140deg,var(--violet),var(--pink))">💸</div>`}
+    <h1>${esc(title)}</h1>
+    ${opts.actions || ''}
+  </div></div>
+  <div class="screen"><div class="wrap page">${body}</div></div>
+  ${opts.fab ? `<button class="fab" data-act="${opts.fab}">+</button>` : ''}`;
+
+function offlineChip() {
+  if (S.online) return '';
+  return `<div class="card mt" style="background:rgba(247,159,31,.14);border-color:rgba(247,159,31,.4)">
+    <div class="flex"><span style="font-size:22px">📴</span>
+    <div class="grow"><div class="ttl">Working offline</div>
+    <div class="sub">Everything you do is saved and will sync automatically.</div></div></div></div>`;
+}
+
+/* ───────────────────────────────────────────────────────────────── boot */
+function viewBoot() {
+  return `<div class="screen wrap"><div class="hero"><span class="mark">💸</span>
+    <h1>SplitStack</h1><p>Loading your stuff…</p></div>
+    <div class="card"><div class="skel" style="height:20px;width:60%"></div>
+    <div class="skel mt" style="height:14px"></div><div class="skel mt" style="height:14px;width:80%"></div></div></div>`;
+}
+
+/* ─────────────────────────────────────────────────────────── connect screen */
+function viewConnect() {
+  return `<div class="screen wrap">
+    <div class="hero"><span class="mark">🔌</span><h1>Connect</h1>
+      <p>Paste the web app URL from your Apps Script deployment.</p></div>
+    <div class="card">
+      <div class="field"><label>Web app URL</label>
+        <input class="input" id="c-url" placeholder="https://script.google.com/macros/s/…/exec"
+               value="${esc(S.api)}" autocapitalize="off" autocorrect="off" spellcheck="false" inputmode="url"></div>
+      <div id="c-err"></div>
+      <button class="btn block mt" data-act="connect">Connect →</button>
+      <p class="hint">It ends in <b>/exec</b>. Open SETUP.md if you haven't deployed the script yet — it takes about four minutes.</p>
+    </div></div>`;
+}
+
+/* ───────────────────────────────────────────────────────── admin claim */
+function viewSetupAdmin() {
+  return `<div class="screen wrap">
+    <div class="hero"><span class="mark">👑</span><h1>You're the boss</h1>
+      <p>Create the admin account for this instance.</p></div>
+    <div class="card">
+      <div class="field"><label>Setup key</label>
+        <input class="input" id="s-key" placeholder="ABC123" autocapitalize="characters" autocorrect="off" spellcheck="false">
+        <p class="hint">Printed by <b>setup()</b> in the Apps Script editor (View ▸ Logs), or run <b>showSetupKey()</b>.</p></div>
+      <div class="field"><label>Your name</label><input class="input" id="s-name" placeholder="Mike"></div>
+      <div class="field"><label>Username</label>
+        <input class="input" id="s-user" placeholder="mike" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
+      <div class="field"><label>Password</label>
+        <input class="input" id="s-pw" type="password" placeholder="Make it a good one"></div>
+      <div class="field"><label>Confirm password</label>
+        <input class="input" id="s-pw2" type="password"></div>
+      <div id="s-err"></div>
+      <button class="btn block mt" data-act="claim-admin">Create admin account 🎉</button>
+      <button class="btn ghost block mt" data-act="to-login">I already have an account</button>
+    </div></div>`;
+}
+
+/* ──────────────────────────────────────────────────────────────── login */
+function viewLogin() {
+  return `<div class="screen wrap">
+    <div class="hero"><span class="mark">💸</span><h1>${esc(S.config.appName || 'SplitStack')}</h1>
+      <p>Who owes who? Let's find out.</p></div>
+    <div class="card">
+      <div class="field"><label>Username</label>
+        <input class="input" id="l-user" autocapitalize="off" autocorrect="off" spellcheck="false"
+               autocomplete="username" placeholder="mike"></div>
+      <div class="field"><label>Password</label>
+        <input class="input" id="l-pw" type="password" autocomplete="current-password"></div>
+      <div id="l-err"></div>
+      <button class="btn block mt" data-act="login">Let me in →</button>
+    </div>
+    <p class="hint center mt2"><a href="#" data-act="change-api">Change server</a></p>
+  </div>`;
+}
+
+/* ─────────────────────────────────────────────────────────────── invite */
+function viewInvite() {
+  const inv = S.params.invite;
+  if (!inv) return `<div class="screen wrap"><div class="hero"><span class="mark">✉️</span><h1>Checking invite…</h1></div></div>`;
+  if (inv.error) {
+    return `<div class="screen wrap"><div class="hero"><span class="mark">🙈</span><h1>Hmm</h1><p>${esc(inv.error)}</p></div>
+      <button class="btn block" data-act="to-login">Go to login</button></div>`;
+  }
+  const claimable = inv.members.filter(m => m.claimable);
+  return `<div class="screen wrap">
+    <div class="hero"><span class="mark">${esc(inv.ledger.emoji)}</span>
+      <h1>${esc(inv.ledger.name)}</h1><p>You've been invited to split expenses here.</p></div>
+    <div class="card">
+      <div class="section-title" style="margin-top:0">Who's already in</div>
+      ${inv.members.map(m => `<div class="row-item">${avatar(m, 'm')}<div class="grow">
+        <div class="ttl">${esc(m.name)}</div>
+        <div class="sub">${m.claimable ? 'Seat waiting — no password set' : 'Active'}</div></div></div>`).join('') ||
+        '<p class="hint">Nobody yet.</p>'}
+    </div>
+    ${claimable.length ? `<div class="card">
+      <h3>Claim your seat</h3>
+      <p class="hint mb">Pick yourself, choose a password, and you're in.</p>
+      <div class="chips">${claimable.map(m =>
+        `<button class="chip" data-claim="${esc(m.id)}">${avatar(m, 's')}${esc(m.name)}</button>`).join('')}</div>
+    </div>` : ''}
+    <div class="card">
+      <h3>Already have an account?</h3>
+      <p class="hint mb">Log in and this ledger gets added to your list.</p>
+      <button class="btn ghost block" data-act="invite-login">Log in and join</button>
+    </div>
+  </div>`;
+}
+
+/* ──────────────────────────────────────────────────────────────── home */
+function viewHome() {
+  if (!S.me) return viewBoot();
+  const active = S.ledgers.filter(l => !l.archived);
+  const archived = S.ledgers.filter(l => l.archived);
+  let total = 0;
+  active.forEach(l => total += myBalance(l.id));
+  total = round2(total);
+
+  const summary = `
+    <div class="card" style="background:linear-gradient(140deg,var(--violet),var(--pink));border:0;color:#fff">
+      <div class="flex">
+        ${avatar(S.me, 'l')}
+        <div class="grow">
+          <div style="font-size:13px;font-weight:800;opacity:.85;text-transform:uppercase;letter-spacing:.07em">
+            ${total > 0.005 ? 'You are owed' : total < -0.005 ? 'You owe' : 'All square'}</div>
+          <div style="font-size:34px;font-weight:900;letter-spacing:-.03em" class="mono">${money(total)}</div>
+        </div>
+        <div style="font-size:44px">${total > 0.005 ? '🤑' : total < -0.005 ? '😬' : '😎'}</div>
+      </div>
+    </div>`;
+
+  const cards = active.map(l => {
+    const bal = myBalance(l.id);
+    const ids = memberIdsOf(l.id);
+    const n = (S.txns[l.id] || []).filter(t => !t.deleted).length;
+    return `<button class="tile" data-ledger="${esc(l.id)}"
+        style="background:linear-gradient(140deg,${esc(l.color)},${shade(l.color, -32)})">
+      <div class="between" style="align-items:flex-start">
+        <div class="emoji">${esc(l.emoji)}</div>
+        ${avStack(ids)}
+      </div>
+      <div style="font-size:20px;font-weight:900;margin-top:10px;text-align:left">${esc(l.name)}</div>
+      <div class="between" style="margin-top:6px">
+        <div style="font-size:12.5px;font-weight:750;opacity:.88">${n} ${n === 1 ? 'entry' : 'entries'}</div>
+        <div style="font-size:17px;font-weight:900" class="mono">
+          ${Math.abs(bal) < 0.005 ? 'settled ✓' : (bal > 0 ? '+' : '−') + money(bal)}
+        </div>
+      </div>
+    </button>`;
+  }).join('');
+
+  const empty = `<div class="empty"><span class="big">🌱</span>
+    <h3>No ledgers yet</h3>
+    <p>${isAdmin() ? 'Create one for your house, a trip, whatever.' : 'Ask your admin to add you to one.'}</p>
+    ${isAdmin() ? '<button class="btn mt" data-act="new-ledger">Create a ledger</button>' : ''}</div>`;
+
+  return shell(S.config.appName || 'SplitStack', `
+    ${offlineChip()}
+    ${summary}
+    <div class="section-title">Your ledgers</div>
+    ${active.length ? `<div class="grid2">${cards}</div>` : empty}
+    ${archived.length ? `<div class="section-title">Archived</div>
+      <div class="card">${archived.map(l => `<div class="row-item tap" data-ledger="${esc(l.id)}">
+        <div style="font-size:22px">${esc(l.emoji)}</div><div class="grow"><div class="ttl">${esc(l.name)}</div>
+        <div class="sub">archived</div></div><div>›</div></div>`).join('')}</div>` : ''}
+    <div class="section-title">Account</div>
+    <div class="card">
+      <div class="row-item tap" data-act="profile">${avatar(S.me, 'm')}
+        <div class="grow"><div class="ttl">${esc(S.me.name)}</div><div class="sub">@${esc(S.me.username)}${isAdmin() ? ' · admin' : ''}</div></div><div>›</div></div>
+      ${isAdmin() ? `<div class="row-item tap" data-act="admin"><div class="av m" style="background:var(--ink)">⚙️</div>
+        <div class="grow"><div class="ttl">Settings</div><div class="sub">People, ledgers, app</div></div><div>›</div></div>` : ''}
+      <div class="row-item tap" data-act="sync"><div class="av m" style="background:var(--sky)">🔄</div>
+        <div class="grow"><div class="ttl">Sync now</div><div class="sub">${S.online ? 'Connected' : 'Offline — will retry'}</div></div></div>
+    </div>`,
+    { fab: isAdmin() ? 'new-ledger' : '' });
+}
+
+function shade(hex, amt) {
+  const h = String(hex || '#6C5CE7').replace('#', '');
+  const n = parseInt(h.length === 3 ? h.split('').map(c => c + c).join('') : h, 16);
+  const r = clamp(((n >> 16) & 255) + amt, 0, 255), g = clamp(((n >> 8) & 255) + amt, 0, 255), b = clamp((n & 255) + amt, 0, 255);
+  return '#' + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1);
+}
+
+/* ─────────────────────────────────────────────────────────────── ledger */
+function viewLedger() {
+  const l = ledgerById(S.params.id);
+  if (!l) return shell('Ledger', `<div class="empty"><span class="big">🫥</span><h3>Not found</h3>
+    <p>This ledger isn't in your list.</p><button class="btn mt" data-act="home">Back home</button></div>`, { back: true });
+
+  const tabs = `<div class="seg mb">
+    <button data-tab="feed" class="${S.tab === 'feed' ? 'on' : ''}">Expenses</button>
+    <button data-tab="balances" class="${S.tab === 'balances' ? 'on' : ''}">Balances</button>
+    <button data-tab="charts" class="${S.tab === 'charts' ? 'on' : ''}">Stats</button>
+  </div>`;
+
+  let body = '';
+  if (S.tab === 'feed') body = ledgerFeed(l);
+  else if (S.tab === 'balances') body = ledgerBalances(l);
+  else body = ledgerCharts(l);
+
+  const actions = `<button class="iconbtn" data-act="share-invite" title="Invite">✉️</button>
+    ${isAdmin() ? `<button class="iconbtn" data-act="edit-ledger" title="Edit">⚙️</button>` : ''}`;
+
+  return shell(l.emoji + '  ' + l.name, offlineChip() + tabs + body, { back: true, fab: 'new-expense', actions });
+}
+
+function ledgerFeed(l) {
+  const txns = (S.txns[l.id] || []).filter(t => !t.deleted)
+    .sort((a, b) => (b.date || '').localeCompare(a.date || '') || (b.createdAt || '').localeCompare(a.createdAt || ''));
+  if (!txns.length) return `<div class="empty"><span class="big">🧾</span><h3>Nothing here yet</h3>
+    <p>Tap the + to log the first expense.</p></div>`;
+
+  const groups = {};
+  txns.forEach(t => (groups[t.date] = groups[t.date] || []).push(t));
+
+  return Object.entries(groups).map(([date, list]) => `
+    <div class="section-title">${esc(niceDate(date))}</div>
+    <div class="card">${list.map(t => txnRow(t, l)).join('')}</div>`).join('');
+}
+
+function txnRow(t, l) {
+  const mine = S.me.id;
+  const pending = S.pending[t.id];
+  if (t.type === 'settlement') {
+    const from = userById(t.paidBy), to = userById(t.paidTo);
+    return `<div class="row-item tap" data-txn="${esc(t.id)}">
+      <div class="av m" style="background:var(--good)">🤝</div>
+      <div class="grow"><div class="ttl">${esc(from.name)} paid ${esc(to.name)}</div>
+      <div class="sub">Settle up${t.notes ? ' · ' + esc(t.notes) : ''}${pending ? ' · syncing' : ''}</div></div>
+      <div class="num zero mono">${money(t.amount)}</div></div>`;
+  }
+  const payer = userById(t.paidBy);
+  const impact = impactOf(t, mine);
+  const cls = impact > 0.005 ? 'pos' : impact < -0.005 ? 'neg' : 'zero';
+  const label = impact > 0.005 ? 'you lent' : impact < -0.005 ? 'you owe' : 'not you';
+  return `<div class="row-item tap" data-txn="${esc(t.id)}">
+    <div class="av m" style="background:${esc(l.color)}">${esc(catEmoji(t.category))}</div>
+    <div class="grow">
+      <div class="ttl">${esc(t.name)}${t.receiptId || t._receiptLocal ? ' 📎' : ''}</div>
+      <div class="sub">${esc(payer.name)} paid ${money(t.amount)}${pending ? ' · <span style="color:var(--warn)">syncing</span>' : ''}</div>
+    </div>
+    <div style="text-align:right">
+      <div class="num ${cls} mono">${impact > 0.005 ? '+' : impact < -0.005 ? '−' : ''}${money(Math.abs(impact))}</div>
+      <div class="tiny">${label}</div>
+    </div></div>`;
+}
+
+function ledgerBalances(l) {
+  const net = balancesFor(l.id);
+  const ids = memberIdsOf(l.id);
+  const debts = simplify(net);
+  const max = Math.max(0.01, ...ids.map(i => Math.abs(net[i] || 0)));
+
+  const rows = ids.slice().sort((a, b) => (net[b] || 0) - (net[a] || 0)).map(id => {
+    const u = userById(id), v = net[id] || 0;
+    const cls = v > 0.005 ? 'pos' : v < -0.005 ? 'neg' : 'zero';
+    const col = v > 0.005 ? 'var(--good)' : v < -0.005 ? 'var(--bad)' : 'var(--ink-3)';
+    return `<div class="row-item">${avatar(u, 'm')}
+      <div class="grow"><div class="ttl">${esc(u.name)}${id === S.me.id ? ' <span class="pill">you</span>' : ''}</div>
+        <div class="bar mt" style="margin-top:6px"><i style="width:${(Math.abs(v) / max * 100).toFixed(1)}%;background:${col}"></i></div></div>
+      <div class="num ${cls} mono">${v > 0.005 ? '+' : v < -0.005 ? '−' : ''}${money(Math.abs(v))}</div></div>`;
+  }).join('');
+
+  const settleList = debts.length ? debts.map(d => {
+    const f = userById(d.from), t = userById(d.to);
+    const involvesMe = d.from === S.me.id || d.to === S.me.id;
+    return `<div class="row-item">
+      ${avatar(f, 'm')}<div style="font-size:18px;color:var(--ink-3)">→</div>${avatar(t, 'm')}
+      <div class="grow"><div class="ttl">${money(d.amount)}</div>
+        <div class="sub">${esc(f.name)} pays ${esc(t.name)}</div></div>
+      <button class="btn sm ${involvesMe ? 'good' : 'ghost'}" data-settle='${esc(JSON.stringify(d))}'>Settle</button></div>`;
+  }).join('') : `<div class="empty" style="padding:26px"><span class="big" style="font-size:44px">🎉</span>
+      <h3>Everyone's square</h3><p>Nothing owed in either direction.</p></div>`;
+
+  return `<div class="card"><div class="section-title" style="margin-top:0">Where everyone stands</div>${rows}</div>
+    <div class="card"><div class="between mb"><div class="section-title" style="margin:0">Simplest way to settle</div>
+      ${debts.length ? `<span class="pill">${debts.length} payment${debts.length > 1 ? 's' : ''}</span>` : ''}</div>
+      ${settleList}</div>
+    <button class="btn ghost block mt" data-act="record-payment">🤝 Record a payment</button>`;
+}
+
+function ledgerCharts(l) {
+  const txns = (S.txns[l.id] || []).filter(t => !t.deleted && t.type !== 'settlement');
+  if (!txns.length) return `<div class="empty"><span class="big">📊</span><h3>No data yet</h3><p>Add expenses and the charts fill in.</p></div>`;
+  const ids = memberIdsOf(l.id);
+  const total = round2(txns.reduce((a, t) => a + t.amount, 0));
+
+  /* by category */
+  const byCat = {};
+  txns.forEach(t => byCat[t.category || 'Other'] = round2((byCat[t.category || 'Other'] || 0) + t.amount));
+  const cats = Object.entries(byCat).sort((a, b) => b[1] - a[1]);
+  const cols = ['#6C5CE7', '#00B894', '#FF7675', '#FDCB6E', '#0984E3', '#E84393', '#00CEC9', '#E17055', '#A29BFE'];
+  let acc = 0;
+  const R = 62, C = 2 * Math.PI * R;
+  const arcs = cats.map(([name, v], i) => {
+    const frac = v / total, dash = `${(frac * C).toFixed(2)} ${(C - frac * C).toFixed(2)}`;
+    const off = -acc * C; acc += frac;
+    return `<circle cx="80" cy="80" r="${R}" fill="none" stroke="${cols[i % cols.length]}" stroke-width="30"
+      stroke-dasharray="${dash}" stroke-dashoffset="${off.toFixed(2)}" transform="rotate(-90 80 80)"/>`;
+  }).join('');
+
+  /* by person: paid vs owed */
+  const paid = {}, owed = {};
+  ids.forEach(i => { paid[i] = 0; owed[i] = 0; });
+  txns.forEach(t => {
+    paid[t.paidBy] = round2((paid[t.paidBy] || 0) + t.amount);
+    Object.entries(allocate(t.amount, t.split)).forEach(([u, v]) => owed[u] = round2((owed[u] || 0) + v));
+  });
+  const maxP = Math.max(0.01, ...ids.map(i => Math.max(paid[i] || 0, owed[i] || 0)));
+
+  /* by month */
+  const byMonth = {};
+  txns.forEach(t => { const m = (t.date || '').slice(0, 7); byMonth[m] = round2((byMonth[m] || 0) + t.amount); });
+  const months = Object.keys(byMonth).sort().slice(-8);
+  const maxM = Math.max(0.01, ...months.map(m => byMonth[m]));
+
+  const biggest = txns.slice().sort((a, b) => b.amount - a.amount)[0];
+  const topSpender = ids.slice().sort((a, b) => (paid[b] || 0) - (paid[a] || 0))[0];
+  const avg = round2(total / txns.length);
+
+  return `
+  <div class="card"><div class="flex" style="gap:10px">
+    <div class="stat"><b class="mono">${money(total)}</b><span>total</span></div>
+    <div class="stat"><b class="mono">${txns.length}</b><span>expenses</span></div>
+    <div class="stat"><b class="mono">${money(avg)}</b><span>average</span></div>
+  </div></div>
+
+  <div class="card"><div class="section-title" style="margin-top:0">Where the money went</div>
+    <svg class="donut" width="160" height="160" viewBox="0 0 160 160">${arcs}
+      <text x="80" y="76" text-anchor="middle" font-size="13" font-weight="800" fill="var(--ink-3)">total</text>
+      <text x="80" y="96" text-anchor="middle" font-size="17" font-weight="900" fill="var(--ink)">${esc(money(total))}</text>
+    </svg>
+    <div class="legend">${cats.slice(0, 9).map(([n, v], i) =>
+      `<div><span class="dot" style="background:${cols[i % cols.length]}"></span>${esc(catEmoji(n))} ${esc(n)}
+      <b class="mono">${esc(money(v))}</b></div>`).join('')}</div>
+  </div>
+
+  <div class="card"><div class="section-title" style="margin-top:0">Paid vs. fair share</div>
+    ${ids.map(id => {
+      const u = userById(id);
+      return `<div style="padding:9px 0">
+        <div class="between" style="margin-bottom:6px">
+          <div class="flex" style="gap:8px">${avatar(u, 's')}<b style="font-size:14.5px">${esc(u.name)}</b></div>
+          <div class="tiny mono">paid ${money(paid[id] || 0)} · owed ${money(owed[id] || 0)}</div></div>
+        <div class="bar" style="margin-bottom:4px"><i style="width:${((paid[id] || 0) / maxP * 100).toFixed(1)}%;background:var(--violet)"></i></div>
+        <div class="bar"><i style="width:${((owed[id] || 0) / maxP * 100).toFixed(1)}%;background:var(--teal)"></i></div>
+      </div>`;
+    }).join('')}
+    <div class="legend"><div><span class="dot" style="background:var(--violet)"></span>paid</div>
+      <div><span class="dot" style="background:var(--teal)"></span>their share</div></div>
+  </div>
+
+  ${months.length > 1 ? `<div class="card"><div class="section-title" style="margin-top:0">Month by month</div>
+    <div class="spark">${months.map(m => `<i style="height:${(byMonth[m] / maxM * 100).toFixed(1)}%" title="${esc(m)}: ${esc(money(byMonth[m]))}"></i>`).join('')}</div>
+    <div class="flex mt" style="justify-content:space-between">${months.map(m =>
+      `<span class="tiny" style="flex:1;text-align:center">${new Date(m + '-02').toLocaleDateString(undefined, { month: 'short' })}</span>`).join('')}</div>
+  </div>` : ''}
+
+  <div class="card"><div class="section-title" style="margin-top:0">Fun facts</div>
+    <div class="row-item"><div class="av m" style="background:var(--sun)">🏆</div><div class="grow">
+      <div class="ttl">${esc(userById(topSpender).name)}</div><div class="sub">has fronted the most cash</div></div>
+      <div class="num mono">${money(paid[topSpender] || 0)}</div></div>
+    <div class="row-item"><div class="av m" style="background:var(--coral)">💥</div><div class="grow">
+      <div class="ttl">${esc(biggest.name)}</div><div class="sub">biggest single expense</div></div>
+      <div class="num mono">${money(biggest.amount)}</div></div>
+  </div>`;
+}
+
+/* ─────────────────────────────────────────────────────────────── profile */
+function viewProfile() {
+  const u = S.me;
+  return shell('Your profile', `
+    <div class="card center">
+      <div style="display:inline-block;position:relative">${avatar(u, 'xl')}</div>
+      <div class="mt"><button class="btn sm ghost" data-act="pick-avatar">📷 Change photo</button>
+        ${u.avatar ? `<button class="btn sm ghost" data-act="clear-avatar">Remove</button>` : ''}</div>
+      <h2 class="mt">${esc(u.name)}</h2><p class="hint">@${esc(u.username)}${isAdmin() ? ' · admin 👑' : ''}</p>
+    </div>
+    <div class="card">
+      <div class="row-item tap" data-act="change-password"><div class="av m" style="background:var(--sky)">🔑</div>
+        <div class="grow"><div class="ttl">Change password</div><div class="sub">Sets a new one for this account</div></div><div>›</div></div>
+      <div class="row-item tap" data-act="full-resync"><div class="av m" style="background:var(--teal)">♻️</div>
+        <div class="grow"><div class="ttl">Rebuild local data</div><div class="sub">Re-download everything from the sheet</div></div><div>›</div></div>
+      <div class="row-item tap" data-act="signout"><div class="av m" style="background:var(--bad)">👋</div>
+        <div class="grow"><div class="ttl">Sign out</div><div class="sub">Clears this device</div></div><div>›</div></div>
+    </div>
+    <p class="hint center mt2">Server: ${esc((S.api || '').slice(0, 46))}…<br>
+      <a href="#" data-act="change-api">Change server</a></p>`, { back: true });
+}
+
+/* ────────────────────────────────────────────────────────────────── admin */
+function viewAdmin() {
+  if (!isAdmin()) return shell('Settings', `<div class="empty"><span class="big">🔒</span><h3>Admins only</h3></div>`, { back: true });
+  const users = S.users;
+  return shell('Settings', `
+    <div class="section-title" style="margin-top:6px">People</div>
+    <div class="card">
+      ${users.map(u => `<div class="row-item tap" data-user="${esc(u.id)}">
+        ${avatar(u, 'm')}
+        <div class="grow"><div class="ttl">${esc(u.name)} ${u.role === 'admin' ? '<span class="pill">admin</span>' : ''}</div>
+          <div class="sub">@${esc(u.username)}${u.email ? ' · ' + esc(u.email) : ''}</div></div>
+        ${!u.active ? '<span class="pill no">off</span>' : !u.hasPassword ? '<span class="pill pend">no password</span>' : ''}
+        <div>›</div></div>`).join('')}
+      <button class="btn ghost block mt" data-act="new-user">+ Add a person</button>
+    </div>
+
+    <div class="section-title">Ledgers</div>
+    <div class="card">
+      ${S.ledgers.map(l => `<div class="row-item tap" data-editledger="${esc(l.id)}">
+        <div class="av m" style="background:${esc(l.color)}">${esc(l.emoji)}</div>
+        <div class="grow"><div class="ttl">${esc(l.name)}</div>
+          <div class="sub">${memberIdsOf(l.id).length} people · ${(S.txns[l.id] || []).filter(t => !t.deleted).length} entries</div></div>
+        ${l.archived ? '<span class="pill">archived</span>' : ''}<div>›</div></div>`).join('') || '<p class="hint">None yet.</p>'}
+      <button class="btn ghost block mt" data-act="new-ledger">+ Create a ledger</button>
+    </div>
+
+    <div class="section-title">App</div>
+    <div class="card">
+      <div class="field"><label>App name</label><input class="input" id="a-name" value="${esc(S.config.appName || 'SplitStack')}"></div>
+      <div class="grid2">
+        <div class="field"><label>Currency code</label><input class="input" id="a-cur" value="${esc(S.config.currency || 'USD')}"></div>
+        <div class="field"><label>Symbol</label><input class="input" id="a-sym" value="${esc(S.config.symbol || '$')}"></div>
+      </div>
+      <button class="btn block" data-act="save-config">Save</button>
+    </div>`, { back: true });
+}
+
+/* ══════════════════════════════════════════════════════ sheets: expense */
+function expenseSheet(ledger, existing) {
+  const ids = memberIdsOf(ledger.id);
+  const t = existing || {
+    id: uuid(), type: 'expense', date: todayISO(), name: '', category: 'Food', amount: 0,
+    paidBy: S.me.id, enteredBy: S.me.id, notes: '', split: {}, receiptId: ''
+  };
+  // editor state
+  const ed = {
+    id: t.id, date: t.date, name: t.name, category: t.category || 'Food',
+    amount: t.amount || 0, paidBy: t.paidBy || S.me.id, notes: t.notes || '',
+    mode: 'equal', receiptId: t.receiptId || '', receiptLocal: t._receiptLocal || '',
+    receiptPreview: '',
+    parts: Object.assign({}, t.split),
+    on: {}, locked: {}
+  };
+  if (!Object.keys(ed.parts).length) ids.forEach(i => ed.on[i] = true);
+  else ids.forEach(i => { if (ed.parts[i] !== undefined) ed.on[i] = true; });
+  if (existing && Object.keys(t.split).length) {
+    const eq = 100 / Object.keys(t.split).length;
+    ed.mode = Object.values(t.split).every(v => Math.abs(v - eq) < 0.02) ? 'equal' : 'percent';
+  }
+
+  const sheet = openSheet(`<div id="ex-body"></div>`);
+  const body = () => $('#ex-body', sheet);
+
+  function equalise() {
+    const on = ids.filter(i => ed.on[i]);
+    if (!on.length) { ed.parts = {}; return; }
+    const each = Math.floor((100 / on.length) * 100) / 100;
+    ed.parts = {};
+    on.forEach(i => ed.parts[i] = each);
+    const drift = round2(100 - each * on.length);
+    if (Math.abs(drift) > 0.001) ed.parts[on[0]] = round2(ed.parts[on[0]] + drift);
+  }
+  if (ed.mode === 'equal') equalise();
+
+  const sum = () => round2(ids.filter(i => ed.on[i]).reduce((a, i) => a + (Number(ed.parts[i]) || 0), 0));
+
+  /** Live money-per-person. Exact-to-the-cent once the split totals 100. */
+  function liveShares() {
+    const on = ids.filter(i => ed.on[i]);
+    const split = {}; on.forEach(i => split[i] = Number(ed.parts[i]) || 0);
+    if (Math.abs(sum() - 100) < 0.05) return allocate(ed.amount, split);
+    const out = {}; on.forEach(i => out[i] = round2(ed.amount * (split[i] || 0) / 100));
+    return out;
+  }
+
+  function draw() {
+    const on = ids.filter(i => ed.on[i]);
+    const total = sum();
+    const ok = Math.abs(total - 100) < 0.05;
+    const shares = liveShares();
+    body().innerHTML = `
+      <h2>${existing ? 'Edit expense' : 'New expense'}</h2>
+      <p class="sheet-sub">${esc(ledger.emoji)} ${esc(ledger.name)}</p>
+
+      <div class="amount-wrap mb"><span class="cur">${esc(S.config.symbol || '$')}</span>
+        <input id="f-amount" type="text" inputmode="decimal" placeholder="0.00" value="${ed.amount ? esc(String(ed.amount)) : ''}"></div>
+
+      <div class="field"><label>What was it</label>
+        <input class="input" id="f-name" placeholder="Pizza night" value="${esc(ed.name)}"></div>
+
+      <div class="field"><label>Category</label>
+        <div class="chips">${CATEGORIES.map(([e, n]) =>
+          `<button class="chip ${ed.category === n ? 'on' : ''}" data-cat="${esc(n)}">${e} ${esc(n)}</button>`).join('')}</div></div>
+
+      <div class="field"><label>Date</label><input class="input" id="f-date" type="date" value="${esc(ed.date)}"></div>
+
+      <div class="field"><label>Who paid</label>
+        <div class="chips">${ids.map(i => { const u = userById(i);
+          return `<button class="chip ${ed.paidBy === i ? 'on' : ''}" data-paid="${esc(i)}">${avatar(u, 's')}${esc(u.name)}</button>`; }).join('')}</div></div>
+
+      <div class="field"><label>Split between</label>
+        <div class="chips mb">${ids.map(i => { const u = userById(i);
+          return `<button class="chip ${ed.on[i] ? 'on' : ''}" data-tog="${esc(i)}">${avatar(u, 's')}${esc(u.name)}</button>`; }).join('')}</div>
+        <div class="seg mb">
+          <button data-mode="equal" class="${ed.mode === 'equal' ? 'on' : ''}">Equal</button>
+          <button data-mode="percent" class="${ed.mode === 'percent' ? 'on' : ''}">%</button>
+          <button data-mode="amount" class="${ed.mode === 'amount' ? 'on' : ''}">${esc(S.config.symbol || '$')}</button>
+        </div>
+        ${on.length ? on.map(i => {
+          const u = userById(i), pct = Number(ed.parts[i]) || 0;
+          const shown = ed.mode === 'amount' ? (shares[i] || 0).toFixed(2) : String(round2(pct));
+          return `<div class="split-row">
+            ${avatar(u, 's')}<div class="grow"><div class="ttl" style="font-size:14.5px">${esc(u.name)}</div>
+              <div class="sub mono">${esc(money(shares[i] || 0))} · ${round2(pct)}%</div></div>
+            ${ed.mode === 'percent' ? `<button class="lock ${ed.locked[i] ? 'on' : ''}" data-lock="${esc(i)}" title="Lock">${ed.locked[i] ? '🔒' : '🔓'}</button>` : ''}
+            <div class="pctbox"><input type="text" inputmode="decimal" data-part="${esc(i)}" value="${esc(shown)}"
+              ${ed.mode === 'equal' ? 'disabled' : ''}><span>${ed.mode === 'amount' ? esc(S.config.symbol || '$') : '%'}</span></div>
+          </div>`;
+        }).join('') : '<p class="hint">Pick at least one person.</p>'}
+        <div class="total-bar ${on.length ? (ok ? 'ok' : 'bad') : ''}">
+          <span>${ed.mode === 'amount' ? 'Allocated' : 'Total split'}</span>
+          <span class="mono">${ed.mode === 'amount' ? esc(money(ed.amount * total / 100)) + ' / ' + esc(money(ed.amount)) : round2(total) + '%'}</span>
+        </div>
+      </div>
+
+      <div class="field"><label>Receipt</label>
+        ${ed.receiptPreview || ed.receiptId ? `<div class="flex mb">
+          ${ed.receiptPreview ? `<img src="${ed.receiptPreview}" style="width:72px;height:72px;object-fit:cover;border-radius:14px">` :
+            `<div class="av l" style="background:var(--card-2);color:var(--ink-3)">📎</div>`}
+          <button class="btn sm ghost" data-act="rm-receipt">Remove</button></div>` : ''}
+        <button class="btn ghost block" data-act="add-receipt">📷 ${ed.receiptPreview || ed.receiptId ? 'Replace photo' : 'Attach a photo'}</button></div>
+
+      <div class="field"><label>Notes</label>
+        <textarea class="input" id="f-notes" placeholder="Anything worth remembering">${esc(ed.notes)}</textarea></div>
+
+      <div class="flex mt">
+        ${existing ? `<button class="btn ghost" data-act="del-expense">🗑</button>` : ''}
+        <button class="btn ghost grow" data-act="cancel">Cancel</button>
+        <button class="btn grow" data-act="save-expense">${existing ? 'Save' : 'Add it'}</button>
+      </div>`;
+  }
+
+  function readFields() {
+    const a = parseFloat(($('#f-amount', sheet) || {}).value || '0');
+    ed.amount = isNaN(a) ? 0 : Math.max(0, a);
+    ed.name = ($('#f-name', sheet) || {}).value || '';
+    ed.date = ($('#f-date', sheet) || {}).value || todayISO();
+    ed.notes = ($('#f-notes', sheet) || {}).value || '';
+  }
+
+  /** Redistribute unlocked shares so everything totals 100. */
+  function rebalance(changedId) {
+    const on = ids.filter(i => ed.on[i]);
+    const free = on.filter(i => i !== changedId && !ed.locked[i]);
+    if (!free.length) return;
+    const fixed = on.filter(i => i === changedId || ed.locked[i])
+      .reduce((a, i) => a + (Number(ed.parts[i]) || 0), 0);
+    let rest = round2(100 - fixed);
+    if (rest < 0) rest = 0;
+    const each = Math.floor((rest / free.length) * 100) / 100;
+    free.forEach(i => ed.parts[i] = each);
+    const drift = round2(rest - each * free.length);
+    if (Math.abs(drift) > 0.001) ed.parts[free[0]] = round2(ed.parts[free[0]] + drift);
+  }
+
+  sheet.addEventListener('click', async e => {
+    const el = e.target.closest('[data-cat],[data-paid],[data-tog],[data-mode],[data-lock],[data-act]');
+    if (!el) return;
+    readFields();
+    if (el.dataset.cat) { ed.category = el.dataset.cat; haptic(); }
+    else if (el.dataset.paid) { ed.paidBy = el.dataset.paid; haptic(); }
+    else if (el.dataset.tog) {
+      const i = el.dataset.tog; ed.on[i] = !ed.on[i];
+      if (!ed.on[i]) { delete ed.parts[i]; delete ed.locked[i]; }
+      if (ed.mode === 'equal') equalise(); else rebalance(null);
+      haptic();
+    }
+    else if (el.dataset.mode) {
+      ed.mode = el.dataset.mode;
+      if (ed.mode === 'equal') { ed.locked = {}; equalise(); }
+      haptic();
+    }
+    else if (el.dataset.lock) { const i = el.dataset.lock; ed.locked[i] = !ed.locked[i]; haptic(); }
+    else {
+      const act = el.dataset.act;
+      if (act === 'cancel') return sheet.close();
+      if (act === 'add-receipt') {
+        const d = await pickImage(1400, .72);
+        if (d) {
+          ed.receiptPreview = d;
+          ed.receiptLocal = 'rcp_' + ed.id;
+          await DB.blobSet(ed.receiptLocal, d);
+          ed.receiptId = '';
+          toast('Photo attached');
+        }
+      }
+      if (act === 'rm-receipt') { ed.receiptPreview = ''; ed.receiptLocal = ''; ed.receiptId = ''; }
+      if (act === 'del-expense') {
+        sheet.close();
+        if (await confirmSheet('Delete this expense?', 'It disappears for everyone on the ledger.', 'Delete')) {
+          await queueTxn(ledger.id, Object.assign({}, existing, { deleted: true, updatedAt: Date.now() }));
+          toast('Deleted');
+        }
+        return;
+      }
+      if (act === 'save-expense') {
+        const on = ids.filter(i => ed.on[i]);
+        if (!ed.amount || ed.amount <= 0) return toast('Add an amount first');
+        if (!ed.name.trim()) return toast('Give it a name');
+        if (!on.length) return toast('Pick who splits it');
+        if (ed.mode === 'equal') equalise();
+        if (Math.abs(sum() - 100) > 0.05) return toast('The split has to add up to 100%');
+        const split = {}; on.forEach(i => split[i] = round2(Number(ed.parts[i]) || 0));
+        const txn = {
+          id: ed.id, type: 'expense', date: ed.date, name: ed.name.trim(), category: ed.category,
+          amount: round2(ed.amount), paidBy: ed.paidBy, paidTo: '',
+          enteredBy: existing ? (existing.enteredBy || S.me.id) : S.me.id,
+          split, notes: ed.notes.trim(), receiptId: ed.receiptId || '',
+          deleted: false, createdAt: existing ? existing.createdAt : new Date().toISOString(),
+          updatedAt: Date.now()
+        };
+        if (ed.receiptLocal) txn._receiptLocal = ed.receiptLocal;
+        sheet.close();
+        await queueTxn(ledger.id, txn);
+        haptic(25);
+        toast(existing ? 'Saved ✓' : `${money(txn.amount)} added ✓`);
+        if (!existing) confetti(50);
+        return;
+      }
+    }
+    draw();
+  });
+
+  sheet.addEventListener('input', e => {
+    const t = e.target;
+    if (t.id === 'f-amount') {
+      const a = parseFloat(t.value || '0'); ed.amount = isNaN(a) ? 0 : Math.max(0, a);
+      const sh = liveShares();
+      $$('.split-row .sub', sheet).forEach((el, k) => {
+        const on = ids.filter(i => ed.on[i]); const i = on[k];
+        if (i) el.textContent = `${money(sh[i] || 0)} · ${round2(ed.parts[i] || 0)}%`;
+      });
+      const tb = $('.total-bar span:last-child', sheet);
+      if (tb && ed.mode === 'amount') tb.textContent = money(ed.amount * sum() / 100) + ' / ' + money(ed.amount);
+      return;
+    }
+    if (t.dataset && t.dataset.part) {
+      const i = t.dataset.part;
+      let v = parseFloat(t.value || '0'); if (isNaN(v)) v = 0;
+      ed.parts[i] = ed.mode === 'amount' ? (ed.amount > 0 ? round2(v / ed.amount * 100) : 0) : round2(v);
+      const total = sum(), ok = Math.abs(total - 100) < 0.05;
+      const bar = $('.total-bar', sheet);
+      if (bar) {
+        bar.className = 'total-bar ' + (ok ? 'ok' : 'bad');
+        bar.lastElementChild.textContent = ed.mode === 'amount'
+          ? money(ed.amount * total / 100) + ' / ' + money(ed.amount) : round2(total) + '%';
+      }
+    }
+  });
+  sheet.addEventListener('change', e => {
+    if (e.target.dataset && e.target.dataset.part && ed.mode === 'percent') {
+      readFields(); rebalance(e.target.dataset.part); draw();
+    }
+  });
+
+  draw();
+  setTimeout(() => { const a = $('#f-amount', sheet); a && a.focus(); }, 380);
+}
+
+/* ─────────────────────────────────────────────────────────── settle sheet */
+function settleSheet(ledger, preset) {
+  const ids = memberIdsOf(ledger.id);
+  const st = {
+    from: preset ? preset.from : S.me.id,
+    to: preset ? preset.to : (ids.find(i => i !== S.me.id) || ids[0]),
+    amount: preset ? preset.amount : 0,
+    date: todayISO(), notes: ''
+  };
+  const sheet = openSheet('<div id="st-body"></div>');
+  const draw = () => {
+    $('#st-body', sheet).innerHTML = `
+      <h2>Record a payment 🤝</h2>
+      <p class="sheet-sub">Someone handed over real money — log it so balances update.</p>
+      <div class="amount-wrap mb"><span class="cur">${esc(S.config.symbol || '$')}</span>
+        <input id="f-amount" type="text" inputmode="decimal" placeholder="0.00" value="${st.amount ? esc(String(st.amount)) : ''}"></div>
+      <div class="field"><label>Who paid</label><div class="chips">${ids.map(i => { const u = userById(i);
+        return `<button class="chip ${st.from === i ? 'on' : ''}" data-from="${esc(i)}">${avatar(u, 's')}${esc(u.name)}</button>`; }).join('')}</div></div>
+      <div class="field"><label>Who received it</label><div class="chips">${ids.map(i => { const u = userById(i);
+        return `<button class="chip ${st.to === i ? 'on' : ''}" data-to="${esc(i)}" ${i === st.from ? 'style="opacity:.35"' : ''}>${avatar(u, 's')}${esc(u.name)}</button>`; }).join('')}</div></div>
+      <div class="field"><label>Date</label><input class="input" id="f-date" type="date" value="${esc(st.date)}"></div>
+      <div class="field"><label>Notes</label><input class="input" id="f-notes" placeholder="Venmo, cash, …" value="${esc(st.notes)}"></div>
+      <div class="flex mt"><button class="btn ghost grow" data-act="cancel">Cancel</button>
+        <button class="btn good grow" data-act="save-settle">Record it</button></div>`;
+  };
+  const readF = () => {
+    const a = parseFloat(($('#f-amount', sheet) || {}).value || '0');
+    st.amount = isNaN(a) ? 0 : Math.max(0, a);
+    st.date = ($('#f-date', sheet) || {}).value || todayISO();
+    st.notes = ($('#f-notes', sheet) || {}).value || '';
+  };
+  sheet.addEventListener('click', async e => {
+    const el = e.target.closest('[data-from],[data-to],[data-act]'); if (!el) return;
+    readF();
+    if (el.dataset.from) { st.from = el.dataset.from; if (st.to === st.from) st.to = ids.find(i => i !== st.from); }
+    else if (el.dataset.to) { if (el.dataset.to === st.from) return toast("Can't pay yourself"); st.to = el.dataset.to; }
+    else if (el.dataset.act === 'cancel') return sheet.close();
+    else if (el.dataset.act === 'save-settle') {
+      if (!st.amount) return toast('How much was it?');
+      if (st.from === st.to) return toast('Pick two different people');
+      sheet.close();
+      await queueTxn(ledger.id, {
+        id: uuid(), type: 'settlement', date: st.date, name: 'Settle up', category: '',
+        amount: round2(st.amount), paidBy: st.from, paidTo: st.to, enteredBy: S.me.id,
+        split: {}, notes: st.notes, receiptId: '', deleted: false,
+        createdAt: new Date().toISOString(), updatedAt: Date.now()
+      });
+      haptic(30); confetti(120); toast('Settled up! 🎉');
+      return;
+    }
+    draw();
+  });
+  draw();
+}
+
+/* ───────────────────────────────────────────────────── ledger edit sheet */
+const EMOJIS = ['💸', '🏠', '✈️', '🏝️', '🍕', '🎿', '🚗', '🎉', '🛒', '🏕️', '🎓', '🐕', '⛵', '🎸', '🍻', '👨‍👩‍👧'];
+function ledgerSheet(existing) {
+  const st = existing ? {
+    id: existing.id, name: existing.name, emoji: existing.emoji, color: existing.color,
+    archived: existing.archived, members: memberIdsOf(existing.id).slice()
+  } : { name: '', emoji: '💸', color: '#6C5CE7', archived: false, members: [S.me.id] };
+
+  const PAL = ['#6C5CE7', '#00B894', '#FF7675', '#FDCB6E', '#0984E3', '#E84393', '#00CEC9', '#E17055'];
+  const sheet = openSheet('<div id="lg-body"></div>');
+  const draw = () => {
+    $('#lg-body', sheet).innerHTML = `
+      <h2>${existing ? 'Edit ledger' : 'New ledger'}</h2>
+      <p class="sheet-sub">${existing ? 'Rename it, restyle it, change the crew.' : 'A trip, the house bills, whatever you share.'}</p>
+      <div class="card mb" style="background:linear-gradient(140deg,${esc(st.color)},${shade(st.color, -32)});color:#fff;border:0;box-shadow:var(--shadow-lg)">
+        <div style="font-size:36px">${esc(st.emoji)}</div>
+        <div style="font-size:21px;font-weight:900;margin-top:6px">${esc(st.name || 'Untitled ledger')}</div>
+        <div style="opacity:.85;font-size:13px;font-weight:700">${st.members.length} ${st.members.length === 1 ? 'person' : 'people'}</div>
+      </div>
+      <div class="field"><label>Name</label><input class="input" id="lg-name" placeholder="Beach house 2026" value="${esc(st.name)}"></div>
+      <div class="field"><label>Icon</label><div class="chips">${EMOJIS.map(e =>
+        `<button class="chip ${st.emoji === e ? 'on' : ''}" data-emoji="${e}" style="font-size:19px">${e}</button>`).join('')}</div></div>
+      <div class="field"><label>Colour</label><div class="chips">${PAL.map(c =>
+        `<button class="chip" data-color="${c}" style="background:${c};border-color:${c};width:44px;height:38px;${st.color === c ? 'outline:3px solid var(--ink);outline-offset:2px' : ''}"></button>`).join('')}</div></div>
+      <div class="field"><label>Who's in it</label><div class="chips">${S.users.filter(u => u.active).map(u =>
+        `<button class="chip ${st.members.includes(u.id) ? 'on' : ''}" data-mem="${esc(u.id)}">${avatar(u, 's')}${esc(u.name)}</button>`).join('')}</div>
+        <p class="hint">Anyone here can add expenses and see the whole ledger.</p></div>
+      ${existing ? `<div class="field"><label>Status</label>
+        <button class="chip ${st.archived ? 'on' : ''}" data-arch="1">${st.archived ? '📦 Archived' : '✅ Active'}</button></div>` : ''}
+      <div class="flex mt">
+        ${existing ? `<button class="btn ghost" data-act="del-ledger">🗑</button>` : ''}
+        <button class="btn ghost grow" data-act="cancel">Cancel</button>
+        <button class="btn grow" data-act="save-ledger">${existing ? 'Save' : 'Create'}</button></div>`;
+  };
+  sheet.addEventListener('click', async e => {
+    const el = e.target.closest('[data-emoji],[data-color],[data-mem],[data-arch],[data-act]'); if (!el) return;
+    st.name = ($('#lg-name', sheet) || {}).value || st.name;
+    if (el.dataset.emoji) st.emoji = el.dataset.emoji;
+    else if (el.dataset.color) st.color = el.dataset.color;
+    else if (el.dataset.mem) {
+      const id = el.dataset.mem;
+      st.members = st.members.includes(id) ? st.members.filter(x => x !== id) : st.members.concat(id);
+    }
+    else if (el.dataset.arch) st.archived = !st.archived;
+    else if (el.dataset.act === 'cancel') return sheet.close();
+    else if (el.dataset.act === 'del-ledger') {
+      sheet.close();
+      if (await confirmSheet('Delete "' + st.name + '"?',
+        'The tab and every expense on it are removed from your spreadsheet. This cannot be undone.', 'Delete forever')) {
+        try {
+          await api('adminDeleteLedger', { id: st.id });
+          await DB.dropLedger(st.id); delete S.txns[st.id]; delete S.cursors[st.id];
+          toast('Ledger deleted'); go('admin', {}, true); await sync({ silent: true });
+        } catch (err) { toast(errMsg(err)); }
+      }
+      return;
+    }
+    else if (el.dataset.act === 'save-ledger') {
+      if (!st.name.trim()) return toast('Give it a name');
+      if (!st.members.length) return toast('Add at least one person');
+      sheet.close();
+      try {
+        syncBadge('<span class="spinner"></span>Saving…');
+        const r = await api('adminSaveLedger', {
+          id: st.id, name: st.name.trim(), emoji: st.emoji, color: st.color,
+          archived: st.archived, memberIds: st.members
+        });
+        syncBadge('');
+        toast(existing ? 'Saved ✓' : 'Ledger created 🎉');
+        if (!existing) confetti(70);
+        await sync({ silent: true });
+        if (!existing && r.ledger) go('ledger', { id: r.ledger.id });
+      } catch (err) { syncBadge(''); toast(errMsg(err)); }
+      return;
+    }
+    draw();
+  });
+  draw();
+}
+
+/* ───────────────────────────────────────────────────────── user edit sheet */
+function userSheet(existing) {
+  const st = existing ? Object.assign({}, existing) :
+    { name: '', username: '', email: '', emoji: '', color: '#6C5CE7', role: 'member', active: true };
+  st.pw = ''; st.pw2 = '';
+  const PAL = ['#6C5CE7', '#00B894', '#FF7675', '#FDCB6E', '#0984E3', '#E84393', '#00CEC9', '#E17055'];
+  const sheet = openSheet('<div id="us-body"></div>');
+  const draw = () => {
+    $('#us-body', sheet).innerHTML = `
+      <h2>${existing ? 'Edit person' : 'Add a person'}</h2>
+      <p class="sheet-sub">${existing ? '@' + esc(existing.username) : 'They get their own login.'}</p>
+      <div class="center mb">${avatar({ name: st.name || '?', color: st.color, emoji: st.emoji, avatar: existing ? existing.avatar : '' }, 'xl')}
+        ${existing ? `<div class="mt"><button class="btn sm ghost" data-act="pick-avatar-for">📷 Set photo</button></div>` : ''}</div>
+      <div class="field"><label>Display name</label><input class="input" id="us-name" value="${esc(st.name)}" placeholder="Sam"></div>
+      <div class="field"><label>Username</label><input class="input" id="us-user" value="${esc(st.username)}"
+        autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="sam"></div>
+      <div class="field"><label>Email (optional)</label><input class="input" id="us-email" type="email" value="${esc(st.email || '')}"></div>
+      <div class="field"><label>Badge emoji (optional)</label><input class="input" id="us-emoji" value="${esc(st.emoji || '')}" placeholder="🦊" maxlength="4"></div>
+      <div class="field"><label>Colour</label><div class="chips">${PAL.map(c =>
+        `<button class="chip" data-color="${c}" style="background:${c};border-color:${c};width:44px;height:38px;${st.color === c ? 'outline:3px solid var(--ink);outline-offset:2px' : ''}"></button>`).join('')}</div></div>
+      <div class="field"><label>Role</label><div class="seg">
+        <button data-role="member" class="${st.role !== 'admin' ? 'on' : ''}">Member</button>
+        <button data-role="admin" class="${st.role === 'admin' ? 'on' : ''}">Admin 👑</button></div>
+        <p class="hint">Admins can manage people and ledgers.</p></div>
+      ${existing ? `<div class="field"><label>Account</label>
+        <button class="chip ${st.active ? 'on' : ''}" data-active="1">${st.active ? '✅ Active' : '🚫 Disabled'}</button></div>` : ''}
+      <div class="field"><label>${existing ? 'Reset password' : 'Password'}</label>
+        <input class="input mb" id="us-pw" type="password" placeholder="${existing ? 'Leave blank to keep current' : 'Optional — they can set it via invite'}">
+        <input class="input" id="us-pw2" type="password" placeholder="Confirm">
+        <p class="hint">${existing ? '' : 'Leave blank and they can claim their own seat from the invite link.'}</p></div>
+      <div class="flex mt">
+        ${existing ? `<button class="btn ghost" data-act="del-user">🗑</button>` : ''}
+        <button class="btn ghost grow" data-act="cancel">Cancel</button>
+        <button class="btn grow" data-act="save-user">Save</button></div>`;
+  };
+  const readF = () => {
+    st.name = ($('#us-name', sheet) || {}).value || '';
+    st.username = ($('#us-user', sheet) || {}).value || '';
+    st.email = ($('#us-email', sheet) || {}).value || '';
+    st.emoji = ($('#us-emoji', sheet) || {}).value || '';
+    st.pw = ($('#us-pw', sheet) || {}).value || '';
+    st.pw2 = ($('#us-pw2', sheet) || {}).value || '';
+  };
+  sheet.addEventListener('click', async e => {
+    const el = e.target.closest('[data-color],[data-role],[data-active],[data-act]'); if (!el) return;
+    readF();
+    if (el.dataset.color) st.color = el.dataset.color;
+    else if (el.dataset.role) st.role = el.dataset.role;
+    else if (el.dataset.active) st.active = !st.active;
+    else if (el.dataset.act === 'cancel') return sheet.close();
+    else if (el.dataset.act === 'pick-avatar-for') {
+      const d = await pickAvatar();
+      if (d) {
+        try { await api('setAvatar', { userId: existing.id, avatar: d }); existing.avatar = d;
+          toast('Photo set'); await sync({ silent: true }); } catch (err) { toast(errMsg(err)); }
+      }
+      return;
+    }
+    else if (el.dataset.act === 'del-user') {
+      sheet.close();
+      if (await confirmSheet('Remove ' + st.name + '?',
+        'Their login is deleted and they leave every ledger. Past expenses keep their name on them.', 'Remove')) {
+        try { await api('adminDeleteUser', { id: existing.id }); toast('Removed'); await sync({ silent: true }); }
+        catch (err) { toast(errMsg(err)); }
+      }
+      return;
+    }
+    else if (el.dataset.act === 'save-user') {
+      if (!st.username.trim()) return toast('Username required');
+      if (st.pw || st.pw2) {
+        if (st.pw !== st.pw2) return toast("Passwords don't match");
+        if (st.pw.length < 6) return toast('Use at least 6 characters');
+      }
+      sheet.close();
+      try {
+        syncBadge('<span class="spinner"></span>Saving…');
+        const payload = {
+          id: existing ? existing.id : undefined,
+          name: st.name.trim() || st.username.trim(), username: st.username.trim(),
+          email: st.email.trim(), emoji: st.emoji.trim(), color: st.color, role: st.role
+        };
+        if (existing) payload.active = st.active;
+        if (st.pw && !existing) {
+          const salt = hexBytes(16);
+          payload.salt = salt; payload.dk = await derive(st.pw, salt, 210000);
+        }
+        const r = await api('adminSaveUser', payload);
+        if (st.pw && existing) {
+          const salt = hexBytes(16);
+          await api('adminSetPassword', { userId: existing.id, salt, dk: await derive(st.pw, salt, 210000) });
+        }
+        syncBadge('');
+        toast('Saved ✓');
+        await sync({ silent: true });
+      } catch (err) { syncBadge(''); toast(errMsg(err)); }
+      return;
+    }
+    draw();
+  });
+  draw();
+}
+
+/* ─────────────────────────────────────────────────────────── invite sheet */
+function inviteSheet(ledger) {
+  const url = location.origin + location.pathname + '#/join/' + ledger.invite;
+  const sheet = openSheet(`
+    <h2>Invite people ✉️</h2>
+    <p class="sheet-sub">Anyone with this link can join <b>${esc(ledger.name)}</b>.</p>
+    <div class="card mb" style="word-break:break-all;font-size:13.5px;font-weight:700">${esc(url)}</div>
+    <div class="flex">
+      <button class="btn grow" data-x="copy">📋 Copy link</button>
+      ${navigator.share ? `<button class="btn ghost grow" data-x="share">Share…</button>` : ''}
+    </div>
+    <p class="hint">Tip: in Settings ▸ People, add someone <b>without</b> a password. They can then claim their
+      own seat from this link and pick their own password.</p>
+    ${isAdmin() ? `<button class="btn ghost block mt" data-x="rotate">🔄 Generate a new link</button>
+      <p class="hint">The old link stops working immediately.</p>` : ''}`);
+  sheet.addEventListener('click', async e => {
+    const b = e.target.closest('[data-x]'); if (!b) return;
+    if (b.dataset.x === 'copy') {
+      try { await navigator.clipboard.writeText(url); toast('Link copied 📋'); }
+      catch (err) { toast('Copy failed — long-press the link'); }
+    }
+    if (b.dataset.x === 'share') {
+      try { await navigator.share({ title: ledger.name, text: 'Join our expense ledger', url }); } catch (err) {}
+    }
+    if (b.dataset.x === 'rotate') {
+      sheet.close();
+      if (await confirmSheet('New invite link?', 'The current link stops working right away.', 'Regenerate')) {
+        try { await api('adminRotateInvite', { id: ledger.id }); await sync({ silent: true }); toast('New link ready'); }
+        catch (err) { toast(errMsg(err)); }
+      }
+    }
+  });
+}
+
+/* ───────────────────────────────────────────────────── password sheets */
+function changePasswordSheet() {
+  const sheet = openSheet(`
+    <h2>Change password 🔑</h2><p class="sheet-sub">You'll stay signed in on this device.</p>
+    <div class="field"><label>Current password</label><input class="input" id="p-old" type="password"></div>
+    <div class="field"><label>New password</label><input class="input" id="p-new" type="password"></div>
+    <div class="field"><label>Confirm new password</label><input class="input" id="p-new2" type="password"></div>
+    <div class="flex mt"><button class="btn ghost grow" data-x="cancel">Cancel</button>
+      <button class="btn grow" data-x="save">Update</button></div>`);
+  sheet.addEventListener('click', async e => {
+    const b = e.target.closest('[data-x]'); if (!b) return;
+    if (b.dataset.x === 'cancel') return sheet.close();
+    const oldPw = $('#p-old', sheet).value, np = $('#p-new', sheet).value, np2 = $('#p-new2', sheet).value;
+    if (np !== np2) return toast("New passwords don't match");
+    if (np.length < 6) return toast('Use at least 6 characters');
+    try {
+      syncBadge('<span class="spinner"></span>Updating…');
+      const sInfo = await api('authSalt', { username: S.me.username });
+      const oldDk = await derive(oldPw, sInfo.salt, sInfo.iterations);
+      const salt = hexBytes(16);
+      const dk = await derive(np, salt, 210000);
+      const r = await api('changePassword', { oldDk, salt, dk });
+      S.token = r.token; LS.token = r.token;
+      syncBadge(''); sheet.close(); toast('Password updated ✓');
+    } catch (err) { syncBadge(''); toast(errMsg(err)); }
+  });
+}
+
+function claimSeatSheet(invite, member) {
+  const sheet = openSheet(`
+    <h2>Hi ${esc(member.name)} 👋</h2><p class="sheet-sub">Pick a password and you're in.</p>
+    <div class="center mb">${avatar(member, 'xl')}</div>
+    <div class="field"><label>Password</label><input class="input" id="cs-pw" type="password"></div>
+    <div class="field"><label>Confirm</label><input class="input" id="cs-pw2" type="password"></div>
+    <div class="flex mt"><button class="btn ghost grow" data-x="cancel">Cancel</button>
+      <button class="btn grow" data-x="go">Join 🎉</button></div>`);
+  sheet.addEventListener('click', async e => {
+    const b = e.target.closest('[data-x]'); if (!b) return;
+    if (b.dataset.x === 'cancel') return sheet.close();
+    const pw = $('#cs-pw', sheet).value, pw2 = $('#cs-pw2', sheet).value;
+    if (pw !== pw2) return toast("Passwords don't match");
+    if (pw.length < 6) return toast('Use at least 6 characters');
+    try {
+      syncBadge('<span class="spinner"></span>Setting up…');
+      const salt = hexBytes(16);
+      const dk = await derive(pw, salt, 210000);
+      const r = await api('claimSeat', { invite, userId: member.id, salt, dk });
+      S.token = r.token; LS.token = r.token;
+      await applyState(r.state);
+      syncBadge(''); sheet.close(); confetti(110); toast('Welcome aboard! 🎉');
+      go('home', {}, true);
+      sync({ silent: true, full: true });
+    } catch (err) { syncBadge(''); toast(errMsg(err)); }
+  });
+}
+
+/* ──────────────────────────────────────────────────────── txn detail sheet */
+async function txnSheet(ledger, txn) {
+  const payer = userById(txn.paidBy), entered = userById(txn.enteredBy);
+  const parts = Object.entries(txn.split || {});
+  const canEdit = true;
+  const sheet = openSheet(`
+    <div class="center mb">
+      <div class="av xl" style="background:${esc(ledger.color)};margin:0 auto">${esc(txn.type === 'settlement' ? '🤝' : catEmoji(txn.category))}</div>
+      <h2 class="mt">${esc(txn.name)}</h2>
+      <div style="font-size:32px;font-weight:900" class="mono">${esc(money(txn.amount))}</div>
+      <p class="hint">${esc(niceDate(txn.date))}${txn.category ? ' · ' + esc(txn.category) : ''}</p>
+    </div>
+    ${txn.type === 'settlement' ? `<div class="card mb">
+      <div class="row-item">${avatar(payer, 'm')}<div class="grow"><div class="ttl">${esc(payer.name)}</div>
+        <div class="sub">paid</div></div><div style="font-size:19px">→</div>
+        ${avatar(userById(txn.paidTo), 'm')}<div class="grow"><div class="ttl">${esc(userById(txn.paidTo).name)}</div>
+        <div class="sub">received</div></div></div></div>` :
+    `<div class="card mb"><div class="row-item">${avatar(payer, 'm')}
+        <div class="grow"><div class="ttl">${esc(payer.name)} paid</div><div class="sub">the whole ${money(txn.amount)}</div></div></div>
+      <div class="section-title">Split</div>
+      ${(() => { const sh = allocate(txn.amount, txn.split);
+        return parts.map(([id, pct]) => { const u = userById(id);
+        return `<div class="row-item">${avatar(u, 's')}<div class="grow"><div class="ttl">${esc(u.name)}</div>
+          <div class="sub">${round2(pct)}%</div></div>
+          <div class="num mono">${money(sh[id] || 0)}</div></div>`; }).join(''); })()}</div>`}
+    ${txn.notes ? `<div class="card mb"><div class="section-title" style="margin-top:0">Notes</div>
+      <p style="font-weight:600;line-height:1.5;white-space:pre-wrap">${esc(txn.notes)}</p></div>` : ''}
+    <div id="rcp"></div>
+    <p class="hint center">Entered by ${esc(entered.name)}${S.pending[txn.id] ? ' · <b style="color:var(--warn)">waiting to sync</b>' : ''}</p>
+    <div class="flex mt">
+      <button class="btn ghost grow" data-x="close">Close</button>
+      ${canEdit ? `<button class="btn grow" data-x="edit">Edit</button>` : ''}
+    </div>`);
+
+  sheet.addEventListener('click', async e => {
+    const b = e.target.closest('[data-x]'); if (!b) return;
+    if (b.dataset.x === 'close') sheet.close();
+    if (b.dataset.x === 'edit') {
+      sheet.close();
+      setTimeout(() => txn.type === 'settlement' ? settleSheet(ledger, { from: txn.paidBy, to: txn.paidTo, amount: txn.amount }) : expenseSheet(ledger, txn), 200);
+    }
+  });
+
+  // receipt (local first, then server)
+  const box = $('#rcp', sheet);
+  if (txn._receiptLocal) {
+    const d = await DB.blobGet(txn._receiptLocal);
+    if (d) box.innerHTML = `<div class="card mb"><div class="section-title" style="margin-top:0">Receipt</div>
+      <img src="${d}" style="width:100%;border-radius:16px"></div>`;
+  } else if (txn.receiptId) {
+    const cacheKey = 'srv_' + txn.receiptId;
+    let d = await DB.blobGet(cacheKey);
+    if (!d) {
+      box.innerHTML = `<div class="card mb"><div class="skel" style="height:180px"></div></div>`;
+      try { const r = await api('getReceipt', { receiptId: txn.receiptId }); d = r.dataUrl; await DB.blobSet(cacheKey, d); }
+      catch (err) { box.innerHTML = `<p class="hint center">📎 Receipt can't be loaded right now.</p>`; }
+    }
+    if (d) box.innerHTML = `<div class="card mb"><div class="section-title" style="margin-top:0">Receipt</div>
+      <img src="${d}" style="width:100%;border-radius:16px"></div>`;
+  }
+}
+
+/* ══════════════════════════════════════════════════════════════════ wiring */
+function wire() {
+  const root = $('#root');
+
+  root.onclick = async e => {
+    const t = e.target;
+
+    const tabBtn = t.closest('[data-tab]');
+    if (tabBtn) { S.tab = tabBtn.dataset.tab; haptic(); return render(); }
+
+    const led = t.closest('[data-ledger]');
+    if (led) { S.tab = 'feed'; return go('ledger', { id: led.dataset.ledger }); }
+
+    const txnEl = t.closest('[data-txn]');
+    if (txnEl) {
+      const l = ledgerById(S.params.id);
+      const x = (S.txns[l.id] || []).find(z => z.id === txnEl.dataset.txn);
+      if (x) txnSheet(l, x);
+      return;
+    }
+
+    const set = t.closest('[data-settle]');
+    if (set) { settleSheet(ledgerById(S.params.id), JSON.parse(set.dataset.settle)); return; }
+
+    const usr = t.closest('[data-user]');
+    if (usr) { userSheet(S.users.find(u => u.id === usr.dataset.user)); return; }
+
+    const el2 = t.closest('[data-editledger]');
+    if (el2) { ledgerSheet(ledgerById(el2.dataset.editledger)); return; }
+
+    const clm = t.closest('[data-claim]');
+    if (clm) {
+      const m = S.params.invite.members.find(x => x.id === clm.dataset.claim);
+      claimSeatSheet(S.params.token, m); return;
+    }
+
+    const act = t.closest('[data-act]');
+    if (!act) return;
+    e.preventDefault();
+    await handle(act.dataset.act, act);
+  };
+
+  root.onkeydown = e => {
+    if (e.key !== 'Enter') return;
+    if (['l-user', 'l-pw'].includes(e.target.id)) handle('login');
+    if (['c-url'].includes(e.target.id)) handle('connect');
+  };
+}
+
+async function handle(act, el) {
+  switch (act) {
+    case 'back': return history.length > 1 ? history.back() : go('home', {}, true);
+    case 'home': return go('home', {}, true);
+    case 'profile': return go('profile');
+    case 'admin': return go('admin');
+    case 'sync': haptic(); return sync({ full: false });
+    case 'full-resync': {
+      S.cursors = {}; await DB.set('cursors', {});
+      for (const l of S.ledgers) { await DB.dropLedger(l.id); S.txns[l.id] = []; }
+      toast('Rebuilding…'); return sync({ full: true });
+    }
+    case 'to-login': return go('login', {}, true);
+    case 'change-api': {
+      if (await confirmSheet('Change server?', 'You will be signed out of this device.', 'Change', false)) {
+        await signOut(true); localStorage.removeItem('ss.api'); S.api = '';
+        go('connect', {}, true);
+      }
+      return;
+    }
+    case 'connect': return doConnect();
+    case 'claim-admin': return doClaimAdmin();
+    case 'login': return doLogin();
+    case 'invite-login': { S.params.pendingInvite = S.params.token; return go('login', { joinAfter: S.params.token }, true); }
+    case 'new-ledger': return ledgerSheet(null);
+    case 'edit-ledger': return ledgerSheet(ledgerById(S.params.id));
+    case 'share-invite': return inviteSheet(ledgerById(S.params.id));
+    case 'new-expense': return expenseSheet(ledgerById(S.params.id), null);
+    case 'record-payment': return settleSheet(ledgerById(S.params.id), null);
+    case 'new-user': return userSheet(null);
+    case 'change-password': return changePasswordSheet();
+    case 'signout': {
+      if (await confirmSheet('Sign out?', 'Anything not yet synced stays queued on this device.', 'Sign out', false))
+        await signOut();
+      return;
+    }
+    case 'pick-avatar': {
+      const d = await pickAvatar();
+      if (!d) return;
+      try { syncBadge('<span class="spinner"></span>Uploading…'); await api('setAvatar', { avatar: d });
+        S.me.avatar = d; await sync({ silent: true }); syncBadge(''); toast('Looking good 😎'); render(); }
+      catch (err) { syncBadge(''); toast(errMsg(err)); }
+      return;
+    }
+    case 'clear-avatar': {
+      try { await api('setAvatar', { avatar: '' }); S.me.avatar = ''; await sync({ silent: true }); render(); }
+      catch (err) { toast(errMsg(err)); }
+      return;
+    }
+    case 'save-config': {
+      try {
+        await api('adminSetConfig', {
+          appName: $('#a-name').value.trim() || 'SplitStack',
+          currency: $('#a-cur').value.trim().toUpperCase() || 'USD',
+          currencySymbol: $('#a-sym').value.trim() || '$'
+        });
+        toast('Saved ✓'); await sync({ silent: true });
+      } catch (err) { toast(errMsg(err)); }
+      return;
+    }
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────── actions */
+function fieldErr(sel, msg) {
+  const box = $(sel); if (!box) return toast(msg);
+  box.innerHTML = `<div class="err">${esc(msg)}</div>`;
+  box.classList.add('shake'); setTimeout(() => box.classList.remove('shake'), 520);
+}
+
+async function doConnect() {
+  let url = $('#c-url').value.trim();
+  if (!url) return fieldErr('#c-err', 'Paste the /exec URL first.');
+  url = url.replace(/\/dev$/, '/exec');
+  if (!/^https:\/\/script\.google(usercontent)?\.com\//.test(url))
+    return fieldErr('#c-err', 'That should be a script.google.com URL ending in /exec.');
+  S.api = url;
+  try {
+    syncBadge('<span class="spinner"></span>Knocking…');
+    const info = await api('ping', {}, { timeout: 25000 });
+    syncBadge('');
+    LS.api = url;
+    S.config.appName = info.appName || 'SplitStack';
+    go(info.ready ? 'login' : 'setupAdmin', {}, true);
+  } catch (err) {
+    syncBadge('');
+    S.api = LS.api;
+    fieldErr('#c-err', err.code === 'OFFLINE'
+      ? "Couldn't reach it. Check the URL, and that the deployment is set to “Anyone”."
+      : errMsg(err));
+  }
+}
+
+async function doClaimAdmin() {
+  const key = $('#s-key').value.trim(), name = $('#s-name').value.trim();
+  const username = $('#s-user').value.trim(), pw = $('#s-pw').value, pw2 = $('#s-pw2').value;
+  if (!key) return fieldErr('#s-err', 'The setup key is required.');
+  if (!username) return fieldErr('#s-err', 'Pick a username.');
+  if (pw.length < 8) return fieldErr('#s-err', 'Admin passwords need at least 8 characters.');
+  if (pw !== pw2) return fieldErr('#s-err', "Those passwords don't match.");
+  try {
+    syncBadge('<span class="spinner"></span>Creating…');
+    const salt = hexBytes(16);
+    const dk = await derive(pw, salt, 210000);
+    const r = await api('claimAdmin', { setupKey: key, username, displayName: name || username, salt, dk });
+    S.token = r.token; LS.token = r.token;
+    await applyState(r.state);
+    syncBadge(''); confetti(140);
+    go('home', {}, true);
+    sync({ silent: true, full: true });
+  } catch (err) { syncBadge(''); fieldErr('#s-err', errMsg(err)); }
+}
+
+async function doLogin() {
+  const username = $('#l-user').value.trim(), pw = $('#l-pw').value;
+  if (!username || !pw) return fieldErr('#l-err', 'Both fields, please.');
+  try {
+    syncBadge('<span class="spinner"></span>Checking…');
+    const s = await api('authSalt', { username });
+    const dk = await derive(pw, s.salt, s.iterations);
+    const r = await api('login', { username, dk });
+    S.token = r.token; LS.token = r.token;
+    await applyState(r.state);
+    const joinAfter = S.params.joinAfter;
+    if (joinAfter) {
+      try { const j = await api('joinLedger', { invite: joinAfter }); await applyState(j.state); confetti(90); }
+      catch (e2) { toast(errMsg(e2)); }
+    }
+    syncBadge('');
+    go('home', {}, true);
+    sync({ silent: true, full: true });
+  } catch (err) { syncBadge(''); fieldErr('#l-err', errMsg(err)); }
+}
+
+async function signOut(silent) {
+  S.token = ''; LS.token = '';
+  S.me = null; S.users = []; S.ledgers = []; S.members = []; S.txns = {}; S.cursors = {};
+  await DB.wipe();
+  if (!silent) { go('login', {}, true); toast('Signed out'); }
+  else render();
+}
+
+/* ───────────────────────────────────────────────────────────────── boot */
+async function boot() {
+  if ('serviceWorker' in navigator) {
+    try { await navigator.serviceWorker.register('sw.js'); } catch (e) {}
+  }
+
+  await loadCache();
+
+  const hash = (location.hash || '').replace(/^#\/?/, '').split('/').filter(Boolean);
+  const inviteToken = hash[0] === 'join' ? hash[1] : null;
+
+  if (!S.api) { S.view = 'connect'; return render(); }
+
+  if (inviteToken && !S.token) {
+    S.view = 'invite'; S.params = { token: inviteToken }; render();
+    try { S.params.invite = await api('inviteInfo', { invite: inviteToken }); }
+    catch (e) { S.params.invite = { error: errMsg(e) }; }
+    return render();
+  }
+
+  if (!S.token) {
+    try { const info = await api('ping', {}, { timeout: 20000 });
+      S.config.appName = info.appName || S.config.appName;
+      S.view = info.ready ? 'login' : 'setupAdmin';
+    } catch (e) { S.view = 'login'; }
+    return render();
+  }
+
+  // logged in
+  S.view = S.me ? 'home' : 'home';
+  render();
+
+  if (inviteToken) {
+    try { const j = await api('joinLedger', { invite: inviteToken }); await applyState(j.state);
+      history.replaceState(null, '', location.pathname); toast('Joined! 🎉'); confetti(80); }
+    catch (e) { if (e.code !== 'OFFLINE') toast(errMsg(e)); }
+  }
+
+  await sync({ silent: false });
+  if (!S.me) { S.view = 'login'; render(); }
+}
+
+boot();
