@@ -215,6 +215,13 @@ with five people that's usually four payments instead of ten.
 **Record a payment** (🤝) logs actual money changing hands and adjusts the balances. It doesn't
 delete anything, so the history stays honest.
 
+**Finding an expense** — tap 🔍 in a ledger's header to filter the Expenses list as you type.
+It matches the expense name and the amount, and every word you type has to land somewhere, so
+`pizza 40` finds the $40 pizza and nothing else. Amounts are forgiving about formatting: `12.5`,
+`$12.50` and `1,840` all find what you'd expect. Settlements match on who paid whom. The running
+`3 matches · $9,600.00` line above the results totals what you're looking at. Search runs on the
+copy already on your phone, so it works offline too.
+
 ---
 
 ## What's in the spreadsheet

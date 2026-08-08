@@ -6,7 +6,7 @@
 
 /* Shown in Settings ▸ App & updates. Bump this and SW_BUILD in sw.js together
    whenever you re-upload the app. */
-const APP_BUILD = '2026-08-08.1';
+const APP_BUILD = '2026-08-08.2';
 
 /* ────────────────────────────────────────────────────────────────  helpers */
 const $  = (s, r = document) => r.querySelector(s);
@@ -185,7 +185,8 @@ const S = {
   api: LS.api, token: LS.token, gate: LS.gate,
   me: null, users: [], ledgers: [], members: [], config: { symbol: '$', currency: 'USD', appName: 'SplitStack' },
   cursors: {}, txns: {}, pending: {}, online: navigator.onLine,
-  view: 'boot', params: {}, tab: 'feed', syncing: false, lastError: '', updateReady: false
+  view: 'boot', params: {}, tab: 'feed', syncing: false, lastError: '', updateReady: false,
+  searchOpen: false, search: ''
 };
 
 const userById = id => S.users.find(u => u.id === id) || { id, name: 'Unknown', color: '#8A84A6', emoji: '👤', avatar: '' };
@@ -581,7 +582,11 @@ const CATEGORIES = [
 const catEmoji = c => (CATEGORIES.find(x => x[1] === c) || ['🧾'])[0];
 
 /* ─────────────────────────────────────────────────────────────────── router */
+/** Search is per-visit, not sticky — leaving a ledger drops the query. */
+const closeSearch = () => { S.searchOpen = false; S.search = ''; };
+
 function go(view, params = {}, replace = false) {
+  closeSearch();
   S.view = view; S.params = params;
   const hash = '#/' + view + (params.id ? '/' + params.id : '') + (params.token ? '/' + params.token : '');
   if (replace) history.replaceState({ view, params }, '', hash);
@@ -590,11 +595,13 @@ function go(view, params = {}, replace = false) {
   render();
 }
 addEventListener('popstate', e => {
+  closeSearch();
   if (e.state && e.state.view) { S.view = e.state.view; S.params = e.state.params || {}; render(); }
   else routeFromHash();
 });
 const HASH_VIEWS = ['home', 'profile', 'admin', 'ledger'];
 function routeFromHash() {
+  closeSearch();
   const parts = (location.hash || '').replace(/^#\/?/, '').split('/').filter(Boolean);
   // join/connect links can carry a backend id, so let boot() do the full dance
   if (parts[0] === 'join' || parts[0] === 'connect') return void boot();
@@ -685,6 +692,9 @@ function pickAvatar() {
 /* ══════════════════════════════════════════════════════════════════ RENDER */
 function render() {
   const root = $('#root');
+  // A background sync can land mid-keystroke — hold the search caret in place.
+  const focused = document.activeElement;
+  const caret = focused && focused.id === 'q-search' ? focused.selectionStart : null;
   let html = '';
   switch (S.view) {
     case 'connect': html = viewConnect(); break;
@@ -701,6 +711,10 @@ function render() {
   }
   root.innerHTML = html;
   wire();
+  if (caret !== null) {
+    const box = $('#q-search');
+    if (box) { box.focus(); try { box.setSelectionRange(caret, caret); } catch (e) {} }
+  }
 }
 
 const shell = (title, body, opts = {}) => `
@@ -968,24 +982,86 @@ function viewLedger() {
   else if (S.tab === 'balances') body = ledgerBalances(l);
   else body = ledgerCharts(l);
 
-  const actions = `<button class="iconbtn" data-act="share-invite" title="Invite">✉️</button>
+  // Search belongs to the expense feed, so the magnifier only rides along there.
+  const searchable = S.tab === 'feed' && liveTxns(l.id).length > 0;
+  const actions = `${searchable ? `<button class="iconbtn ${S.searchOpen ? 'on' : ''}" data-act="toggle-search"
+      title="Search expenses" aria-label="Search expenses">🔍</button>` : ''}
+    <button class="iconbtn" data-act="share-invite" title="Invite">✉️</button>
     ${isAdmin() ? `<button class="iconbtn" data-act="edit-ledger" title="Edit">⚙️</button>` : ''}`;
 
   return shell(l.emoji + '  ' + l.name, offlineChip() + tabs + body, { back: true, fab: 'new-expense', actions });
 }
 
+const liveTxns = id => (S.txns[id] || []).filter(t => !t.deleted)
+  .sort((a, b) => (b.date || '').localeCompare(a.date || '') || (b.createdAt || '').localeCompare(a.createdAt || ''));
+
+/* ───────────────────────────────────────────────────────────────── search */
+/**
+ * Every whitespace-separated word has to land somewhere in the row, so
+ * "pizza 40" finds the one that cost 40 and nothing else. A word with a digit is
+ * matched loosely against the amount — the currency symbol and thousands
+ * separators are stripped from it, and the amount is compared at 2dp, so "12.5",
+ * "$12.50" and "1,840" all hit what you'd expect them to.
+ */
+function prepQuery(raw) {
+  const q = String(raw || '').trim().toLowerCase();
+  if (!q) return null;
+  const toks = q.split(/\s+/)
+    .map(t => /\d/.test(t) ? t.replace(/[$£€¥₹,]/g, '') : t)
+    .filter(Boolean);
+  return toks.length ? toks : null;
+}
+/** Settlements have no name of their own, so they search on who paid whom. */
+function txnHaystack(t) {
+  const name = t.type === 'settlement'
+    ? `${userById(t.paidBy).name} paid ${userById(t.paidTo).name}`
+    : t.name;
+  return (String(name || '') + ' ' + round2(t.amount).toFixed(2)).toLowerCase();
+}
+const txnMatches = (t, toks) => { const h = txnHaystack(t); return toks.every(k => h.includes(k)); };
+
+function searchBar() {
+  return `<div class="searchbar mb${S.search ? '' : ' empty'}">
+    <span class="ico" aria-hidden="true">🔍</span>
+    <input id="q-search" type="search" autocomplete="off" spellcheck="false" enterkeyhint="search"
+      placeholder="Name or amount…" aria-label="Search expenses" value="${esc(S.search)}">
+    <button class="clear" data-act="clear-search" title="Clear" aria-label="Clear search">✕</button>
+  </div>`;
+}
+
 function ledgerFeed(l) {
-  const txns = (S.txns[l.id] || []).filter(t => !t.deleted)
-    .sort((a, b) => (b.date || '').localeCompare(a.date || '') || (b.createdAt || '').localeCompare(a.createdAt || ''));
-  if (!txns.length) return `<div class="empty"><span class="big">🧾</span><h3>Nothing here yet</h3>
+  if (!liveTxns(l.id).length) return `<div class="empty"><span class="big">🧾</span><h3>Nothing here yet</h3>
     <p>Tap the + to log the first expense.</p></div>`;
+  return (S.searchOpen ? searchBar() : '') + `<div id="feed-list">${feedList(l)}</div>`;
+}
+
+function feedList(l) {
+  const toks = S.searchOpen ? prepQuery(S.search) : null;
+  const all = liveTxns(l.id);
+  const txns = toks ? all.filter(t => txnMatches(t, toks)) : all;
+
+  if (!txns.length) return `<div class="empty"><span class="big">🔍</span><h3>No matches</h3>
+    <p>Nothing here is called that, or costs that.</p></div>`;
 
   const groups = {};
   txns.forEach(t => (groups[t.date] = groups[t.date] || []).push(t));
 
-  return Object.entries(groups).map(([date, list]) => `
+  const spent = round2(txns.reduce((a, t) => a + (t.type === 'settlement' ? 0 : t.amount), 0));
+  const tally = toks ? `<div class="section-title" style="margin-top:2px">
+    ${txns.length} match${txns.length === 1 ? '' : 'es'}${spent ? ' · ' + money(spent) : ''}</div>` : '';
+
+  return tally + Object.entries(groups).map(([date, list]) => `
     <div class="section-title">${esc(niceDate(date))}</div>
     <div class="card">${list.map(t => txnRow(t, l)).join('')}</div>`).join('');
+}
+
+/** Repaints just the results, so typing never costs the input its focus. */
+function applySearch() {
+  const l = ledgerById(S.params.id), box = $('#feed-list');
+  if (!l || !box) return;
+  box.innerHTML = feedList(l);
+  const bar = $('.searchbar');
+  if (bar) bar.classList.toggle('empty', !S.search);
 }
 
 function txnRow(t, l) {
@@ -1912,7 +1988,19 @@ function wire() {
     await handle(act.dataset.act, act);
   };
 
+  root.oninput = e => {
+    if (e.target.id !== 'q-search') return;
+    S.search = e.target.value;
+    applySearch();
+  };
+
   root.onkeydown = e => {
+    if (e.target.id === 'q-search') {
+      // Enter just dismisses the keyboard — results are already live.
+      if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); }
+      if (e.key === 'Escape') handle('toggle-search');
+      return;
+    }
     if (e.key !== 'Enter') return;
     if (['l-user', 'l-pw'].includes(e.target.id)) handle('login');
     if (['c-url'].includes(e.target.id)) handle('connect');
@@ -2001,6 +2089,19 @@ async function handle(act, el) {
     case 'new-ledger': return ledgerSheet(null);
     case 'edit-ledger': return ledgerSheet(ledgerById(S.params.id));
     case 'share-invite': return inviteSheet(ledgerById(S.params.id));
+    case 'toggle-search': {
+      S.searchOpen = !S.searchOpen;
+      if (!S.searchOpen) S.search = '';
+      haptic(); render();
+      const box = $('#q-search'); if (box) box.focus();
+      return;
+    }
+    case 'clear-search': {
+      S.search = '';
+      const box = $('#q-search');
+      if (box) { box.value = ''; box.focus(); }
+      return applySearch();
+    }
     case 'new-expense': return expenseSheet(ledgerById(S.params.id), null);
     case 'record-payment': return settleSheet(ledgerById(S.params.id), null);
     case 'new-user': return userSheet(null);
