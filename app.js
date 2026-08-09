@@ -6,7 +6,7 @@
 
 /* Shown in Settings ▸ App & updates. Bump this and SW_BUILD in sw.js together
    whenever you re-upload the app. */
-const APP_BUILD = '2026-08-08.1';
+const APP_BUILD = '2026-08-09.2';
 
 /* ────────────────────────────────────────────────────────────────  helpers */
 const $  = (s, r = document) => r.querySelector(s);
@@ -185,8 +185,13 @@ const S = {
   api: LS.api, token: LS.token, gate: LS.gate,
   me: null, users: [], ledgers: [], members: [], config: { symbol: '$', currency: 'USD', appName: 'SplitStack' },
   cursors: {}, txns: {}, pending: {}, online: navigator.onLine,
-  view: 'boot', params: {}, tab: 'feed', syncing: false, lastError: '', updateReady: false
+  view: 'boot', params: {}, tab: 'feed', syncing: false, lastError: '', updateReady: false,
+  searchOpen: false, search: '', reviewOnly: false, apiVersion: 0
 };
+
+/* The backend API this build needs. The Apps Script is pasted in by hand, so
+   it can lag the PWA — which updates itself — by any amount. */
+const NEEDS_API = 3;
 
 const userById = id => S.users.find(u => u.id === id) || { id, name: 'Unknown', color: '#8A84A6', emoji: '👤', avatar: '' };
 const ledgerById = id => S.ledgers.find(l => l.id === id);
@@ -337,7 +342,33 @@ async function sync({ silent = false, full = false } = {}) {
         for (const it of items) await DB.unqueue(it.seq);
         await persistLedger(ledgerId);
       }
+
+      /* sign-offs and flags, after the rows they talk about exist */
+      for (const it of ob.filter(o => o.kind === 'review')) {
+        try {
+          const r = await api('reviewTxn', it.payload);
+          mergeTxns(it.payload.ledgerId, [r.txn]);
+          await persistLedger(it.payload.ledgerId);
+        } catch (e) {
+          if (e.code === 'OFFLINE') throw e;
+          // A backend that predates reviews doesn't know the action. That is
+          // fixable by pasting the new Code.gs, so hold the queue rather than
+          // throwing the sign-off away — it lands the moment they update.
+          if (/^UNKNOWN_ACTION/.test(e.code || '')) { S.apiVersion = 1; break; }
+          // Anything else (row gone, already cleared by someone else) is not
+          // worth jamming the queue over — the next pull carries the truth.
+        }
+        await DB.unqueue(it.seq);
+      }
       await refreshPending();
+
+      /* Once per session, check the backend is new enough to store reviews at
+         all. Fired without awaiting: it must not slow a sync down. */
+      if (!S.apiVersion) {
+        api('ping', {}, { timeout: 15000 })
+          .then(i => { S.apiVersion = Number(i.version) || 1; if (S.apiVersion < NEEDS_API) render(); })
+          .catch(() => {});
+      }
 
       /* 2 ── pull deltas (and tell the backend where this app is hosted) */
       const st = await api('bootstrap', { home: appHome() });
@@ -370,6 +401,30 @@ async function queueTxn(ledgerId, txn) {
   S.pending[txn.id] = true;
   await persistLedger(ledgerId);
   await DB.queue({ kind: 'txn', ledgerId, payload: txn, ts: Date.now() });
+  render();
+  sync({ silent: true });
+}
+
+/**
+ * Signing off, flagging and withdrawing all go through the outbox like
+ * everything else, so they work on a plane. The local row is updated straight
+ * away and the server's version replaces it when the queue drains.
+ */
+async function queueReview(ledgerId, txnId, op, note = '') {
+  const t = (S.txns[ledgerId] || []).find(x => x.id === txnId);
+  if (t) {
+    const clear = () => { t.reviewState = ''; t.reviewBy = ''; t.reviewNote = ''; t.reviewDone = []; t.reviewWas = null; };
+    if (op === 'flag') {
+      t.reviewState = 'flag'; t.reviewBy = S.me.id; t.reviewNote = note;
+      t.reviewDone = [S.me.id]; t.reviewWas = null;
+    } else if (op === 'unflag') clear();
+    else if (op === 'ack') {
+      t.reviewDone = reviewDoneBy(t).concat(reviewDoneBy(t).includes(S.me.id) ? [] : [S.me.id]);
+      if (!reviewOutstanding(t).length) clear();
+    }
+    await persistLedger(ledgerId);
+  }
+  await DB.queue({ kind: 'review', ledgerId, payload: { ledgerId, txnId, op, note }, ts: Date.now() });
   render();
   sync({ silent: true });
 }
@@ -563,6 +618,79 @@ function myBalance(ledgerId) {
   return S.me ? (b[S.me.id] || 0) : 0;
 }
 
+/* ─────────────────────────────────────────────────────────────────── review */
+/**
+ * Three ways a row ends up wanting a second pair of eyes:
+ *   edit      someone who didn't enter it changed it  -> the author signs off
+ *   conflict  …and they collided with a change they
+ *             hadn't seen yet                         -> same, flagged louder
+ *   flag      anyone asking everyone to look, for
+ *             placeholders and not-yet-final amounts  -> everyone signs off
+ * A review never changes the money: balances count an under-review row exactly
+ * like any other, and the Balances tab says so out loud.
+ */
+const REVIEW_LABEL = { edit: 'Edited by someone else', conflict: 'Edited at the same time', flag: 'Marked for review' };
+
+/** Who still has to sign this off. Mirrors reviewersOf() in Code.gs. */
+function reviewersFor(t) {
+  if (!t.reviewState) return [];
+  if (t.reviewState !== 'flag') return t.enteredBy ? [t.enteredBy] : [];
+  if (t.type === 'settlement') return [t.paidBy, t.paidTo].filter(Boolean);
+  return Object.keys(t.split || {});
+}
+const reviewDoneBy = t => t.reviewDone || [];
+const reviewOutstanding = t => reviewersFor(t).filter(u => !reviewDoneBy(t).includes(u));
+const needsMyReview = t => !!t.reviewState && S.me && reviewOutstanding(t).includes(S.me.id);
+const underReview = t => !!t.reviewState && !t.deleted;
+
+/** Rows in a ledger waiting on me — including ones deleted out from under me. */
+const myReviews = ledgerId => (S.txns[ledgerId] || []).filter(needsMyReview);
+const openReviews = ledgerId => (S.txns[ledgerId] || []).filter(t => t.reviewState && !t.deleted);
+
+/**
+ * Plain language account of what an edit did, written by the editor's client
+ * because it is the side holding both the old row and the currency symbol.
+ */
+function changeSummary(before, after) {
+  const bits = [];
+  const nm = (a, b, label, fmt = String) => {
+    if (String(a ?? '') !== String(b ?? '')) bits.push(`${label} ${fmt(a) || '—'} → ${fmt(b) || '—'}`);
+  };
+  if (after.deleted && !before.deleted) return 'Deleted it';
+  nm(before.name, after.name, 'Name', v => v ? `“${v}”` : '');
+  if (round2(before.amount) !== round2(after.amount)) bits.push(`Amount ${money(before.amount)} → ${money(after.amount)}`);
+  nm(before.date, after.date, 'Date', niceDate);
+  nm(before.category, after.category, 'Category');
+  if (before.paidBy !== after.paidBy) bits.push(`Paid by ${userById(before.paidBy).name} → ${userById(after.paidBy).name}`);
+  if (JSON.stringify(before.split || {}) !== JSON.stringify(after.split || {})) bits.push('Changed the split');
+  if (String(before.notes ?? '') !== String(after.notes ?? ''))
+    bits.push(!before.notes ? 'Added a note' : !after.notes ? 'Cleared the notes' : 'Changed the notes');
+  if (!bits.length) return 'Saved it again without changing anything';
+  return bits.slice(0, 4).join(' · ') + (bits.length > 4 ? ` · +${bits.length - 4} more` : '');
+}
+
+/** The fields "Put it back" restores. Receipts are blobs and stay put. */
+const REVERTABLE = ['name', 'amount', 'date', 'category', 'paidBy', 'paidTo', 'split', 'notes', 'deleted'];
+function snapshotOf(t) {
+  const out = {};
+  REVERTABLE.forEach(k => out[k] = t[k]);
+  return out;
+}
+
+/**
+ * What the editor sends alongside an edit. baseRev is only meaningful once the
+ * row has been to the server and back — a row still in the outbox carries a
+ * local clock value, which would make the collision check meaningless.
+ */
+function reviewPatch(existing, next) {
+  if (!existing || existing.enteredBy === S.me.id) return {};
+  return {
+    baseRev: existing._local ? 0 : (existing.updatedAt || 0),
+    reviewNote: changeSummary(existing, next),
+    reviewWas: snapshotOf(existing)
+  };
+}
+
 /* ───────────────────────────────────────────────────────────────── snippets */
 function avatar(u, size = 'm', badge) {
   const bg = u.avatar ? `background-image:url('${u.avatar}')` : `background:${esc(u.color || '#8A84A6')}`;
@@ -581,7 +709,11 @@ const CATEGORIES = [
 const catEmoji = c => (CATEGORIES.find(x => x[1] === c) || ['🧾'])[0];
 
 /* ─────────────────────────────────────────────────────────────────── router */
+/** Feed filters are per-visit, not sticky — leaving a ledger drops them. */
+const resetFeedView = () => { S.searchOpen = false; S.search = ''; S.reviewOnly = false; };
+
 function go(view, params = {}, replace = false) {
+  resetFeedView();
   S.view = view; S.params = params;
   const hash = '#/' + view + (params.id ? '/' + params.id : '') + (params.token ? '/' + params.token : '');
   if (replace) history.replaceState({ view, params }, '', hash);
@@ -590,11 +722,13 @@ function go(view, params = {}, replace = false) {
   render();
 }
 addEventListener('popstate', e => {
+  resetFeedView();
   if (e.state && e.state.view) { S.view = e.state.view; S.params = e.state.params || {}; render(); }
   else routeFromHash();
 });
 const HASH_VIEWS = ['home', 'profile', 'admin', 'ledger'];
 function routeFromHash() {
+  resetFeedView();
   const parts = (location.hash || '').replace(/^#\/?/, '').split('/').filter(Boolean);
   // join/connect links can carry a backend id, so let boot() do the full dance
   if (parts[0] === 'join' || parts[0] === 'connect') return void boot();
@@ -685,6 +819,9 @@ function pickAvatar() {
 /* ══════════════════════════════════════════════════════════════════ RENDER */
 function render() {
   const root = $('#root');
+  // A background sync can land mid-keystroke — hold the search caret in place.
+  const focused = document.activeElement;
+  const caret = focused && focused.id === 'q-search' ? focused.selectionStart : null;
   let html = '';
   switch (S.view) {
     case 'connect': html = viewConnect(); break;
@@ -701,6 +838,10 @@ function render() {
   }
   root.innerHTML = html;
   wire();
+  if (caret !== null) {
+    const box = $('#q-search');
+    if (box) { box.focus(); try { box.setSelectionRange(caret, caret); } catch (e) {} }
+  }
 }
 
 const shell = (title, body, opts = {}) => `
@@ -709,7 +850,7 @@ const shell = (title, body, opts = {}) => `
     <h1>${esc(title)}</h1>
     ${opts.actions || ''}
   </div></div>
-  <div class="screen"><div class="wrap page">${updateBanner()}${body}</div></div>
+  <div class="screen"><div class="wrap page">${updateBanner()}${backendBanner()}${body}</div></div>
   ${opts.fab ? `<button class="fab" data-act="${opts.fab}">+</button>` : ''}`;
 
 function updateBanner() {
@@ -721,6 +862,24 @@ function updateBanner() {
         <div class="sub" style="color:rgba(255,255,255,.85)">Tap to restart — nothing unsaved is lost.</div></div>
       <span class="pill" style="background:rgba(255,255,255,.25);color:#fff">RESTART</span></div>
   </button>`;
+}
+
+/**
+ * The PWA updates itself; the Apps Script behind it does not. When the two
+ * drift far enough that a feature silently can't work, say so — the failure
+ * mode otherwise is "I flagged it and nothing happened on the other phone".
+ */
+function backendBanner() {
+  if (!S.apiVersion || S.apiVersion >= NEEDS_API) return '';
+  return `<div class="card mb reviewnote">
+    <div class="flex"><span style="font-size:26px">🔌</span>
+      <div class="grow"><div class="ttl">Your backend script is out of date</div>
+        <div class="sub" style="white-space:normal">Reviews and flags can't sync until it's updated.
+          Anything you've marked is saved on this device and will go through afterwards.</div></div></div>
+    <div class="tiny mt" style="line-height:1.5">Open your spreadsheet ▸ <b>Extensions ▸ Apps Script</b>,
+      paste the latest <b>Code.gs</b> over what's there, then
+      <b>Deploy ▸ Manage deployments ▸ ✏️ ▸ Version: New version ▸ Deploy</b>.</div>
+  </div>`;
 }
 
 function offlineChip() {
@@ -902,6 +1061,7 @@ function viewHome() {
     const bal = myBalance(l.id);
     const ids = memberIdsOf(l.id);
     const n = (S.txns[l.id] || []).filter(t => !t.deleted).length;
+    const rev = myReviews(l.id).length;
     return `<button class="tile" data-ledger="${esc(l.id)}"
         style="background:linear-gradient(140deg,${esc(l.color)},${shade(l.color, -32)})">
       <div class="between" style="align-items:flex-start">
@@ -910,7 +1070,9 @@ function viewHome() {
       </div>
       <div style="font-size:20px;font-weight:900;margin-top:10px;text-align:left">${esc(l.name)}</div>
       <div class="between" style="margin-top:6px">
-        <div style="font-size:12.5px;font-weight:750;opacity:.88">${n} ${n === 1 ? 'entry' : 'entries'}</div>
+        <div style="font-size:12.5px;font-weight:750;opacity:.88">${rev
+          ? `<span class="pill" style="background:rgba(255,255,255,.28);color:#fff">👀 ${rev}</span>`
+          : `${n} ${n === 1 ? 'entry' : 'entries'}`}</div>
         <div style="font-size:17px;font-weight:900" class="mono">
           ${Math.abs(bal) < 0.005 ? 'settled ✓' : (bal > 0 ? '+' : '−') + money(bal)}
         </div>
@@ -968,50 +1130,147 @@ function viewLedger() {
   else if (S.tab === 'balances') body = ledgerBalances(l);
   else body = ledgerCharts(l);
 
-  const actions = `<button class="iconbtn" data-act="share-invite" title="Invite">✉️</button>
+  // Search belongs to the expense feed, so the magnifier only rides along there.
+  const searchable = S.tab === 'feed' && liveTxns(l.id).length > 0;
+  const actions = `${searchable ? `<button class="iconbtn ${S.searchOpen ? 'on' : ''}" data-act="toggle-search"
+      title="Search expenses" aria-label="Search expenses">🔍</button>` : ''}
+    <button class="iconbtn" data-act="share-invite" title="Invite">✉️</button>
     ${isAdmin() ? `<button class="iconbtn" data-act="edit-ledger" title="Edit">⚙️</button>` : ''}`;
 
   return shell(l.emoji + '  ' + l.name, offlineChip() + tabs + body, { back: true, fab: 'new-expense', actions });
 }
 
+/* A deleted row normally vanishes. One deleted by someone else stays visible,
+   as a tombstone, to the person being asked to sign the deletion off — an
+   expense quietly disappearing is the thing reviews exist to prevent. */
+const liveTxns = id => (S.txns[id] || []).filter(t => !t.deleted || needsMyReview(t))
+  .sort((a, b) => (b.date || '').localeCompare(a.date || '') || (b.createdAt || '').localeCompare(a.createdAt || ''));
+
+/* ───────────────────────────────────────────────────────────────── search */
+/**
+ * Every whitespace-separated word has to land somewhere in the row, so
+ * "pizza 40" finds the one that cost 40 and nothing else. A word with a digit is
+ * matched loosely against the amount — the currency symbol and thousands
+ * separators are stripped from it, and the amount is compared at 2dp, so "12.5",
+ * "$12.50" and "1,840" all hit what you'd expect them to.
+ */
+function prepQuery(raw) {
+  const q = String(raw || '').trim().toLowerCase();
+  if (!q) return null;
+  const toks = q.split(/\s+/)
+    .map(t => /\d/.test(t) ? t.replace(/[$£€¥₹,]/g, '') : t)
+    .filter(Boolean);
+  return toks.length ? toks : null;
+}
+/** Settlements have no name of their own, so they search on who paid whom. */
+function txnHaystack(t) {
+  const name = t.type === 'settlement'
+    ? `${userById(t.paidBy).name} paid ${userById(t.paidTo).name}`
+    : t.name;
+  return (String(name || '') + ' ' + round2(t.amount).toFixed(2)).toLowerCase();
+}
+const txnMatches = (t, toks) => { const h = txnHaystack(t); return toks.every(k => h.includes(k)); };
+
+function searchBar() {
+  return `<div class="searchbar mb${S.search ? '' : ' blank'}">
+    <span class="ico" aria-hidden="true">🔍</span>
+    <input id="q-search" type="search" autocomplete="off" spellcheck="false" enterkeyhint="search"
+      placeholder="Name or amount…" aria-label="Search expenses" value="${esc(S.search)}">
+    <button class="clear" data-act="clear-search" title="Clear" aria-label="Clear search">✕</button>
+  </div>`;
+}
+
+function reviewBanner(l) {
+  const n = myReviews(l.id).length;
+  if (!n) return '';
+  return `<button class="card mb reviewbar${S.reviewOnly ? ' on' : ''}" data-act="toggle-reviews">
+    <div class="flex"><span style="font-size:24px">👀</span>
+      <div class="grow" style="text-align:left">
+        <div class="ttl">${n} ${n === 1 ? 'entry needs' : 'entries need'} your review</div>
+        <div class="sub">${S.reviewOnly ? 'Showing only these — tap to show everything' : 'Tap to see just those'}</div>
+      </div>
+      <span class="pill pend">${S.reviewOnly ? 'SHOW ALL' : 'REVIEW'}</span></div>
+  </button>`;
+}
+
 function ledgerFeed(l) {
-  const txns = (S.txns[l.id] || []).filter(t => !t.deleted)
-    .sort((a, b) => (b.date || '').localeCompare(a.date || '') || (b.createdAt || '').localeCompare(a.createdAt || ''));
-  if (!txns.length) return `<div class="empty"><span class="big">🧾</span><h3>Nothing here yet</h3>
+  // Signing off the last one takes the banner away with it, so the filter must
+  // not be able to outlive the control that turns it off.
+  if (S.reviewOnly && !myReviews(l.id).length) S.reviewOnly = false;
+  if (!liveTxns(l.id).length) return `<div class="empty"><span class="big">🧾</span><h3>Nothing here yet</h3>
     <p>Tap the + to log the first expense.</p></div>`;
+  return reviewBanner(l) + (S.searchOpen ? searchBar() : '') + `<div id="feed-list">${feedList(l)}</div>`;
+}
+
+function feedList(l) {
+  const toks = S.searchOpen ? prepQuery(S.search) : null;
+  let all = liveTxns(l.id);
+  if (S.reviewOnly) all = all.filter(needsMyReview);
+  const txns = toks ? all.filter(t => txnMatches(t, toks)) : all;
+
+  if (!txns.length) return `<div class="empty"><span class="big">🔍</span><h3>No matches</h3>
+    <p>Nothing here is called that, or costs that.</p></div>`;
 
   const groups = {};
   txns.forEach(t => (groups[t.date] = groups[t.date] || []).push(t));
 
-  return Object.entries(groups).map(([date, list]) => `
+  const spent = round2(txns.reduce((a, t) => a + (t.type === 'settlement' ? 0 : t.amount), 0));
+  const tally = toks ? `<div class="section-title" style="margin-top:2px">
+    ${txns.length} match${txns.length === 1 ? '' : 'es'}${spent ? ' · ' + money(spent) : ''}</div>` : '';
+
+  return tally + Object.entries(groups).map(([date, list]) => `
     <div class="section-title">${esc(niceDate(date))}</div>
     <div class="card">${list.map(t => txnRow(t, l)).join('')}</div>`).join('');
+}
+
+/** Repaints just the results, so typing never costs the input its focus. */
+function applySearch() {
+  const l = ledgerById(S.params.id), box = $('#feed-list');
+  if (!l || !box) return;
+  box.innerHTML = feedList(l);
+  const bar = $('.searchbar');
+  if (bar) bar.classList.toggle('blank', !S.search);
+}
+
+/** The amber marker a row wears while it is waiting on somebody. */
+function reviewPill(t) {
+  if (!t.reviewState) return '';
+  const need = reviewersFor(t), out = reviewOutstanding(t);
+  const conflict = t.reviewState === 'conflict';
+  const text = needsMyReview(t)
+    ? (t.reviewState === 'flag' ? 'NEEDS YOUR OK' : conflict ? 'EDITED AT THE SAME TIME' : 'REVIEW THIS CHANGE')
+    : `UNDER REVIEW${need.length > 1 ? ` · ${need.length - out.length} OF ${need.length}` : ''}`;
+  return `<div style="margin-top:5px"><span class="pill ${conflict ? 'no' : 'pend'}">${conflict ? '⚠️' : '👀'} ${text}</span></div>`;
 }
 
 function txnRow(t, l) {
   const mine = S.me.id;
   const pending = S.pending[t.id];
+  const gone = t.deleted ? ' gone' : '';
   if (t.type === 'settlement') {
     const from = userById(t.paidBy), to = userById(t.paidTo);
-    return `<div class="row-item tap" data-txn="${esc(t.id)}">
+    return `<div class="row-item tap${gone}" data-txn="${esc(t.id)}">
       <div class="av m" style="background:var(--good)">🤝</div>
       <div class="grow"><div class="ttl">${esc(from.name)} paid ${esc(to.name)}</div>
-      <div class="sub">Settle up${t.notes ? ' · ' + esc(t.notes) : ''}${pending ? ' · syncing' : ''}</div></div>
+      <div class="sub">${t.deleted ? 'Deleted' : 'Settle up'}${t.notes ? ' · ' + esc(t.notes) : ''}${pending ? ' · syncing' : ''}</div>
+      ${reviewPill(t)}</div>
       <div class="num zero mono">${money(t.amount)}</div></div>`;
   }
   const payer = userById(t.paidBy);
   const impact = impactOf(t, mine);
   const cls = impact > 0.005 ? 'pos' : impact < -0.005 ? 'neg' : 'zero';
   const label = impact > 0.005 ? 'you lent' : impact < -0.005 ? 'you owe' : 'not you';
-  return `<div class="row-item tap" data-txn="${esc(t.id)}">
+  return `<div class="row-item tap${gone}" data-txn="${esc(t.id)}">
     <div class="av m" style="background:${esc(l.color)}">${esc(catEmoji(t.category))}</div>
     <div class="grow">
       <div class="ttl">${esc(t.name)}${t.receiptId || t._receiptLocal ? ' 📎' : ''}</div>
-      <div class="sub">${esc(payer.name)} paid ${money(t.amount)}${pending ? ' · <span style="color:var(--warn)">syncing</span>' : ''}</div>
+      <div class="sub">${t.deleted ? `Deleted by ${esc(userById(t.reviewBy).name)}`
+        : `${esc(payer.name)} paid ${money(t.amount)}`}${pending ? ' · <span style="color:var(--warn)">syncing</span>' : ''}</div>
+      ${reviewPill(t)}
     </div>
     <div style="text-align:right">
       <div class="num ${cls} mono">${impact > 0.005 ? '+' : impact < -0.005 ? '−' : ''}${money(Math.abs(impact))}</div>
-      <div class="tiny">${label}</div>
+      <div class="tiny">${t.deleted ? 'no longer counts' : label}</div>
     </div></div>`;
 }
 
@@ -1042,7 +1301,15 @@ function ledgerBalances(l) {
   }).join('') : `<div class="empty" style="padding:26px"><span class="big" style="font-size:44px">🎉</span>
       <h3>Everyone's square</h3><p>Nothing owed in either direction.</p></div>`;
 
-  return `<div class="card"><div class="section-title" style="margin-top:0">Where everyone stands</div>${rows}</div>
+  // Under-review rows count like any other, so say so rather than let the
+  // numbers quietly disagree with the pills on the Expenses tab.
+  const open = openReviews(l.id);
+  const caveat = open.length ? `<div class="card mb reviewnote">
+    <div class="flex"><span style="font-size:22px">👀</span>
+      <div class="grow"><div class="ttl">${open.length} ${open.length === 1 ? 'entry is' : 'entries are'} under review</div>
+      <div class="sub">They're counted below, so these totals may still move.</div></div></div></div>` : '';
+
+  return caveat + `<div class="card"><div class="section-title" style="margin-top:0">Where everyone stands</div>${rows}</div>
     <div class="card"><div class="between mb"><div class="section-title" style="margin:0">Simplest way to settle</div>
       ${debts.length ? `<span class="pill">${debts.length} payment${debts.length > 1 ? 's' : ''}</span>` : ''}</div>
       ${settleList}</div>
@@ -1409,8 +1676,13 @@ function expenseSheet(ledger, existing) {
       if (act === 'rm-receipt') { ed.receiptPreview = ''; ed.receiptLocal = ''; ed.receiptId = ''; }
       if (act === 'del-expense') {
         sheet.close();
-        if (await confirmSheet('Delete this expense?', 'It disappears for everyone on the ledger.', 'Delete')) {
-          await queueTxn(ledger.id, Object.assign({}, existing, { deleted: true, updatedAt: Date.now() }));
+        const mine = existing.enteredBy === S.me.id;
+        if (await confirmSheet('Delete this expense?',
+          mine ? 'It disappears for everyone on the ledger.'
+               : `${userById(existing.enteredBy).name} entered this, so they'll be asked to review the deletion.`,
+          'Delete')) {
+          const gone = Object.assign({}, existing, { deleted: true, updatedAt: Date.now() });
+          await queueTxn(ledger.id, Object.assign(gone, reviewPatch(existing, gone)));
           toast('Deleted');
         }
         return;
@@ -1432,10 +1704,13 @@ function expenseSheet(ledger, existing) {
           updatedAt: Date.now()
         };
         if (ed.receiptLocal) txn._receiptLocal = ed.receiptLocal;
+        Object.assign(txn, reviewPatch(existing, txn));
         sheet.close();
         await queueTxn(ledger.id, txn);
         haptic(25);
-        toast(existing ? 'Saved ✓' : `${money(txn.amount)} added ✓`);
+        toast(existing
+          ? (txn.reviewNote ? `Saved · ${userById(existing.enteredBy).name} will review it` : 'Saved ✓')
+          : `${money(txn.amount)} added ✓`);
         if (!existing) confetti(50);
         return;
       }
@@ -1717,6 +1992,33 @@ function userSheet(existing) {
 }
 
 /* ─────────────────────────────────────────────────────────── invite sheet */
+/** Raising a manual review request: an optional word on why, then everyone's asked. */
+function flagSheet(ledger, txn) {
+  const need = txn.type === 'settlement'
+    ? [txn.paidBy, txn.paidTo].filter(Boolean) : Object.keys(txn.split || {});
+  const others = need.filter(u => u !== S.me.id);
+  const sheet = openSheet(`
+    <h2>Ask everyone to review 👀</h2>
+    <p class="sheet-sub">Good for placeholders, rough amounts and anything not finalised.
+      It stays marked until everyone splitting it has signed off.</p>
+    <div class="field"><label>Why? (optional)</label>
+      <input class="input" id="fl-note" maxlength="120" placeholder="Estimate — waiting on the real receipt"></div>
+    <p class="hint">${others.length
+      ? 'Waiting on ' + others.map(u => esc(userById(u).name)).join(', ') + '. It still counts towards balances meanwhile.'
+      : "Nobody else is splitting this, so it'll just be marked for you."}</p>
+    <div class="flex mt"><button class="btn ghost grow" data-x="cancel">Cancel</button>
+      <button class="btn grow" data-x="go">Ask for review</button></div>`);
+
+  sheet.addEventListener('click', async e => {
+    const b = e.target.closest('[data-x]'); if (!b) return;
+    if (b.dataset.x === 'cancel') return sheet.close();
+    const note = ($('#fl-note', sheet) || {}).value || '';
+    sheet.close();
+    await queueReview(ledger.id, txn.id, 'flag', note.trim());
+    haptic(25); toast('Marked for review 👀');
+  });
+}
+
 function inviteSheet(ledger) {
   // The link carries the backend id too, so a brand-new phone needs nothing else.
   const bid = backendId(S.api);
@@ -1809,6 +2111,37 @@ function claimSeatSheet(invite, member) {
 }
 
 /* ──────────────────────────────────────────────────────── txn detail sheet */
+/** The review panel inside a transaction: what happened, who's left, what to do. */
+function reviewCard(t) {
+  if (!t.reviewState) return '';
+  const who = userById(t.reviewBy);
+  const need = reviewersFor(t), out = reviewOutstanding(t);
+  const conflict = t.reviewState === 'conflict';
+  const iAmAuthor = t.enteredBy === S.me.id;
+  const canRevert = t.reviewState !== 'flag' && t.reviewWas && (iAmAuthor || isAdmin());
+  const canWithdraw = t.reviewState === 'flag' && (t.reviewBy === S.me.id || isAdmin());
+
+  const heading = t.reviewState === 'flag'
+    ? `${esc(who.name)} asked everyone to take a look`
+    : conflict ? `${esc(who.name)} changed this at the same time you did`
+               : `${esc(who.name)} changed this`;
+
+  return `<div class="card mb reviewnote${conflict ? ' bad' : ''}">
+    <div class="flex mb"><span style="font-size:24px">${conflict ? '⚠️' : '👀'}</span>
+      <div class="grow"><div class="ttl">${heading}</div>
+        <div class="sub" style="white-space:normal">${esc(REVIEW_LABEL[t.reviewState])}</div></div></div>
+    ${t.reviewNote ? `<p style="font-weight:700;line-height:1.5;margin:0 0 12px">${esc(t.reviewNote)}</p>` : ''}
+    ${need.length > 1 ? `<div class="flex mb" style="flex-wrap:wrap">
+      ${need.map(u => `<span class="chip ${out.includes(u) ? '' : 'on'}" style="pointer-events:none">
+        ${avatar(userById(u), 's')}${esc(userById(u).name)}${out.includes(u) ? '' : ' ✓'}</span>`).join('')}</div>` : ''}
+    ${needsMyReview(t) ? `<button class="btn good block" data-x="ack">Looks right to me</button>` : ''}
+    ${canRevert ? `<button class="btn ghost block mt" data-x="revert">↩️ Put it back the way it was</button>` : ''}
+    ${canWithdraw ? `<button class="btn ghost block mt" data-x="unflag">Withdraw the review request</button>` : ''}
+    ${!needsMyReview(t) && !canRevert && !canWithdraw
+      ? `<p class="hint center" style="margin:0">Waiting on ${out.map(u => esc(userById(u).name)).join(', ') || 'nobody'}.</p>` : ''}
+  </div>`;
+}
+
 async function txnSheet(ledger, txn) {
   const payer = userById(txn.paidBy), entered = userById(txn.enteredBy);
   const parts = Object.entries(txn.split || {});
@@ -1820,6 +2153,7 @@ async function txnSheet(ledger, txn) {
       <div style="font-size:32px;font-weight:900" class="mono">${esc(money(txn.amount))}</div>
       <p class="hint">${esc(niceDate(txn.date))}${txn.category ? ' · ' + esc(txn.category) : ''}</p>
     </div>
+    ${reviewCard(txn)}
     ${txn.type === 'settlement' ? `<div class="card mb">
       <div class="row-item">${avatar(payer, 'm')}<div class="grow"><div class="ttl">${esc(payer.name)}</div>
         <div class="sub">paid</div></div><div style="font-size:19px">→</div>
@@ -1837,6 +2171,8 @@ async function txnSheet(ledger, txn) {
       <p style="font-weight:600;line-height:1.5;white-space:pre-wrap">${esc(txn.notes)}</p></div>` : ''}
     <div id="rcp"></div>
     <p class="hint center">Entered by ${esc(entered.name)}${S.pending[txn.id] ? ' · <b style="color:var(--warn)">waiting to sync</b>' : ''}</p>
+    ${!txn.reviewState && !txn.deleted
+      ? `<button class="btn ghost block" data-x="flag">👀 Ask everyone to review this</button>` : ''}
     <div class="flex mt">
       <button class="btn ghost grow" data-x="close">Close</button>
       ${canEdit ? `<button class="btn grow" data-x="edit">Edit</button>` : ''}
@@ -1844,10 +2180,35 @@ async function txnSheet(ledger, txn) {
 
   sheet.addEventListener('click', async e => {
     const b = e.target.closest('[data-x]'); if (!b) return;
-    if (b.dataset.x === 'close') sheet.close();
-    if (b.dataset.x === 'edit') {
+    const act = b.dataset.x;
+    if (act === 'close') sheet.close();
+    if (act === 'edit') {
       sheet.close();
       setTimeout(() => txn.type === 'settlement' ? settleSheet(ledger, { from: txn.paidBy, to: txn.paidTo, amount: txn.amount }) : expenseSheet(ledger, txn), 200);
+    }
+    if (act === 'ack') {
+      sheet.close();
+      await queueReview(ledger.id, txn.id, 'ack');
+      haptic(25); toast('Signed off ✓');
+    }
+    if (act === 'unflag') {
+      sheet.close();
+      await queueReview(ledger.id, txn.id, 'unflag');
+      toast('Review request withdrawn');
+    }
+    if (act === 'flag') { sheet.close(); setTimeout(() => flagSheet(ledger, txn), 200); }
+    if (act === 'revert') {
+      sheet.close();
+      if (!await confirmSheet('Put it back?',
+        `This restores the values from before ${userById(txn.reviewBy).name} changed it. They'll be asked to review that.`,
+        'Put it back', false)) return;
+      // Restoring is an ordinary edit made by the author, which is what clears
+      // the review — no special server path needed.
+      const back = Object.assign({}, txn, txn.reviewWas, {
+        updatedAt: Date.now(), reviewState: '', reviewBy: '', reviewNote: '', reviewDone: [], reviewWas: null
+      });
+      await queueTxn(ledger.id, Object.assign(back, reviewPatch(txn, back)));
+      haptic(25); toast('Put back ✓');
     }
   });
 
@@ -1912,7 +2273,19 @@ function wire() {
     await handle(act.dataset.act, act);
   };
 
+  root.oninput = e => {
+    if (e.target.id !== 'q-search') return;
+    S.search = e.target.value;
+    applySearch();
+  };
+
   root.onkeydown = e => {
+    if (e.target.id === 'q-search') {
+      // Enter just dismisses the keyboard — results are already live.
+      if (e.key === 'Enter') { e.preventDefault(); e.target.blur(); }
+      if (e.key === 'Escape') handle('toggle-search');
+      return;
+    }
     if (e.key !== 'Enter') return;
     if (['l-user', 'l-pw'].includes(e.target.id)) handle('login');
     if (['c-url'].includes(e.target.id)) handle('connect');
@@ -2001,6 +2374,20 @@ async function handle(act, el) {
     case 'new-ledger': return ledgerSheet(null);
     case 'edit-ledger': return ledgerSheet(ledgerById(S.params.id));
     case 'share-invite': return inviteSheet(ledgerById(S.params.id));
+    case 'toggle-search': {
+      S.searchOpen = !S.searchOpen;
+      if (!S.searchOpen) S.search = '';
+      haptic(); render();
+      const box = $('#q-search'); if (box) box.focus();
+      return;
+    }
+    case 'toggle-reviews': { S.reviewOnly = !S.reviewOnly; haptic(); return render(); }
+    case 'clear-search': {
+      S.search = '';
+      const box = $('#q-search');
+      if (box) { box.value = ''; box.focus(); }
+      return applySearch();
+    }
     case 'new-expense': return expenseSheet(ledgerById(S.params.id), null);
     case 'record-payment': return settleSheet(ledgerById(S.params.id), null);
     case 'new-user': return userSheet(null);

@@ -79,7 +79,14 @@ h1,h2,h3,h4{margin:0;letter-spacing:-.02em}
 .iconbtn{width:40px;height:40px;border-radius:14px;display:grid;place-items:center;font-size:19px;
   background:var(--card-2);transition:transform .18s var(--spring),background .18s}
 .iconbtn:active{transform:scale(.88)}
+.iconbtn.on{background:var(--violet);box-shadow:0 6px 16px -8px rgba(108,92,231,.9)}
 .back{font-size:22px;font-weight:800;color:var(--violet)}
+/* Small phones run out of room once a ledger carries three actions — buy the
+   title back some characters rather than let it ellipsis away to nothing. */
+@media (max-width:360px){
+  .topbar .row{gap:8px}
+  .topbar .iconbtn{width:36px;height:36px;font-size:17px}
+}
 
 /* ═══════════════════════════════════════════════════════════════════ cards */
 .card{background:var(--card);border-radius:var(--r-lg);box-shadow:var(--shadow);padding:18px;border:1px solid var(--line)}
@@ -131,6 +138,24 @@ select.input{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xml
 #f-amount{flex:1;min-width:0;border:0;background:none;outline:0;font-size:44px;font-weight:850;
   letter-spacing:-.03em;padding:8px 0 0;font-variant-numeric:tabular-nums}
 
+/* search bar — borrows the .input skin so it reads as part of the furniture */
+.searchbar{display:flex;align-items:center;gap:10px;padding:0 14px;border-radius:16px;
+  border:2px solid var(--line);background:var(--card-2);transition:border-color .18s,box-shadow .18s;
+  animation:fadeUp .26s var(--spring) both}
+.searchbar:focus-within{border-color:var(--violet);box-shadow:0 0 0 4px rgba(108,92,231,.16)}
+.searchbar .ico{font-size:16px;flex:none;opacity:.6}
+/* 16px keeps iOS from zooming the page when the field takes focus. */
+.searchbar input{flex:1;min-width:0;border:0;background:none;outline:0;padding:13px 0;
+  font-size:16px;font-weight:600}
+.searchbar input::-webkit-search-cancel-button{display:none}
+.searchbar .clear{flex:none;width:26px;height:26px;border-radius:50%;display:grid;place-items:center;
+  font-size:13px;font-weight:800;color:var(--ink-3);background:var(--line);
+  transition:transform .18s var(--spring)}
+.searchbar .clear:active{transform:scale(.84)}
+/* "blank", not "empty" — .empty is the app's empty-state block, and it would
+   land 46px of padding on the bar the moment the query cleared. */
+.searchbar.blank .clear{visibility:hidden}
+
 /* ════════════════════════════════════════════════════════════════ avatars */
 .av{border-radius:50%;background-size:cover;background-position:center;display:grid;place-items:center;
   font-weight:850;color:#fff;flex:none;box-shadow:0 3px 8px -3px rgba(0,0,0,.45);overflow:hidden;position:relative}
@@ -159,6 +184,17 @@ select.input{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xml
 .pill.ok{background:rgba(0,184,148,.16);color:var(--good)}
 .pill.no{background:rgba(255,90,110,.16);color:var(--bad)}
 .pill.pend{background:rgba(247,159,31,.18);color:var(--warn)}
+/* review — amber, the same language the "syncing"/pending pill already speaks */
+.reviewnote{background:rgba(247,159,31,.12);border-color:rgba(247,159,31,.42)}
+.reviewnote.bad{background:rgba(255,90,110,.12);border-color:rgba(255,90,110,.42)}
+.reviewbar{display:block;width:100%;text-align:left;cursor:pointer;
+  background:rgba(247,159,31,.12);border-color:rgba(247,159,31,.42);
+  transition:transform .16s var(--spring)}
+.reviewbar:active{transform:scale(.985)}
+.reviewbar.on{background:rgba(247,159,31,.22)}
+/* a tombstone: deleted, but still shown to whoever has to sign the deletion off */
+.row-item.gone{opacity:.68}
+.row-item.gone .ttl{text-decoration:line-through}
 .section-title{font-size:12.5px;font-weight:850;text-transform:uppercase;letter-spacing:.09em;
   color:var(--ink-3);margin:22px 4px 10px}
 .empty{text-align:center;padding:46px 18px;color:var(--ink-3)}

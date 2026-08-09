@@ -60,15 +60,24 @@ const stub = `
   const eq=ids=>{const e=Math.floor((100/ids.length)*100)/100,p={};ids.forEach(i=>p[i]=e);
     const d=Math.round((100-e*ids.length)*100)/100; if(Math.abs(d)>0.001)p[ids[0]]=Math.round((p[ids[0]]+d)*100)/100; return p;};
   let n=0; const T=(o)=>Object.assign({id:'d'+(++n),type:'expense',paidTo:'',notes:'',receiptId:'',
-    deleted:false,createdAt:o.date+'T12:00:00Z',updatedAt:1000+n},o);
+    deleted:false,createdAt:o.date+'T12:00:00Z',updatedAt:1000+n,
+    reviewState:'',reviewBy:'',reviewNote:'',reviewDone:[],reviewWas:null},o);
+  const ME='u1';
+  const needFor=(t)=> t.reviewState==='flag'
+    ? (t.type==='settlement'?[t.paidBy,t.paidTo].filter(Boolean):Object.keys(t.split||{}))
+    : (t.enteredBy?[t.enteredBy]:[]);
+  const noReview={reviewState:'',reviewBy:'',reviewNote:'',reviewDone:[],reviewWas:null};
 
   const data={
     l1:[
-      T({date:'2026-08-07',name:'Beach house rental',category:'Lodging',amount:1840,paidBy:'u1',enteredBy:'u1',split:eq(['u1','u2','u3','u4']),notes:'Three nights, ocean side.'}),
+      T({date:'2026-08-07',name:'Beach house rental',category:'Lodging',amount:1840,paidBy:'u1',enteredBy:'u1',split:eq(['u1','u2','u3','u4']),notes:'Three nights, ocean side.',
+         reviewState:'edit',reviewBy:'u2',reviewNote:'Amount $1,760.00 → $1,840.00 · Added a note',
+         reviewWas:{name:'Beach house rental',amount:1760,date:'2026-08-07',category:'Lodging',paidBy:'u1',paidTo:'',split:eq(['u1','u2','u3','u4']),notes:'',deleted:false}}),
       T({date:'2026-08-07',name:'Big grocery run',category:'Groceries',amount:213.47,paidBy:'u2',enteredBy:'u2',split:eq(['u1','u2','u3','u4'])}),
       T({date:'2026-08-07',name:'Firewood + s\\'mores',category:'Supplies',amount:38.20,paidBy:'u3',enteredBy:'u3',split:eq(['u1','u2','u3','u4'])}),
       T({date:'2026-08-06',name:'Kayak rental',category:'Fun',amount:120,paidBy:'u4',enteredBy:'u4',split:{u3:50,u4:50},notes:'Only Ada and Ben went out.'}),
-      T({date:'2026-08-06',name:'Seafood dinner',category:'Food',amount:287.65,paidBy:'u1',enteredBy:'u2',split:{u1:30,u2:30,u3:20,u4:20},notes:'Ada and Ben skipped the lobster.'}),
+      T({date:'2026-08-06',name:'Seafood dinner',category:'Food',amount:287.65,paidBy:'u1',enteredBy:'u2',split:{u1:30,u2:30,u3:20,u4:20},notes:'Ada and Ben skipped the lobster.',
+         reviewState:'flag',reviewBy:'u2',reviewNote:'Rough split — check I got the lobster share right',reviewDone:['u2']}),
       T({date:'2026-08-05',name:'Gas for the drive',category:'Transport',amount:76.40,paidBy:'u2',enteredBy:'u2',split:eq(['u1','u2','u3','u4'])}),
       T({date:'2026-08-05',name:'Beer + ice',category:'Drinks',amount:54.10,paidBy:'u4',enteredBy:'u4',split:eq(['u1','u2','u4'])}),
       T({date:'2026-08-04',name:'Sam paid Mike back',type:'settlement',category:'',amount:200,paidBy:'u2',paidTo:'u1',enteredBy:'u2',split:{},notes:'Venmo'})
@@ -97,16 +106,45 @@ const stub = `
     const {action,payload}=JSON.parse(opts.body);
     await new Promise(r=>setTimeout(r,180));      // a little latency, for realism
     let d;
-    if(action==='ping') d={version:1,ready:true,appName:'SplitStack',iterations:210000};
+    if(action==='ping') d={version:3,ready:true,appName:'SplitStack',iterations:210000};
     else if(action==='bootstrap') d=state;
     else if(action==='pull'){
       d={ledgers:{}};
       ledgers.forEach(l=>{ d.ledgers[l.id]={txns:data[l.id]||[],cursor:9999,full:!(payload.since||{})[l.id]}; });
     }
     else if(action==='push'){
-      (payload.txns||[]).forEach(t=>{ const arr=data[payload.ledgerId]||(data[payload.ledgerId]=[]);
-        const i=arr.findIndex(x=>x.id===t.id); if(i>=0) arr[i]=t; else arr.push(t); });
-      d={applied:(payload.txns||[]).map(t=>t.id),txns:payload.txns||[],cursor:9999};
+      const arr=data[payload.ledgerId]||(data[payload.ledgerId]=[]);
+      const out=[];
+      (payload.txns||[]).forEach(t=>{
+        const i=arr.findIndex(x=>x.id===t.id), prior=i>=0?arr[i]:null;
+        const author=prior?(prior.enteredBy||t.enteredBy):t.enteredBy;
+        let rv=noReview;
+        if(prior && author && author!==ME){
+          const collided=Number(t.baseRev||0)>0 && Number(prior.updatedAt||0)>Number(t.baseRev);
+          rv={reviewState:collided?'conflict':'edit',reviewBy:ME,
+              reviewNote:t.reviewNote||'',reviewDone:[],reviewWas:t.reviewWas||null};
+        }
+        const row=Object.assign({},t,rv,{updatedAt:Date.now()}); delete row.baseRev;
+        if(i>=0) arr[i]=row; else arr.push(row);
+        out.push(row);
+      });
+      d={applied:out.map(t=>t.id),txns:out,cursor:9999};
+    }
+    else if(action==='reviewTxn'){
+      const t=(data[payload.ledgerId]||[]).find(x=>x.id===payload.txnId);
+      if(t){
+        const need=needFor(t);
+        if(payload.op==='flag') Object.assign(t,{reviewState:'flag',reviewBy:ME,
+          reviewNote:payload.note||'',reviewDone:[ME],reviewWas:null});
+        else if(payload.op==='unflag') Object.assign(t,noReview);
+        else if(payload.op==='ack'){
+          const done=(t.reviewDone||[]).slice(); if(done.indexOf(ME)<0) done.push(ME);
+          t.reviewDone=done;
+          if(need.every(u=>done.indexOf(u)>=0)) Object.assign(t,noReview);
+        }
+        t.updatedAt=Date.now();
+      }
+      d={txn:t,cursor:9999};
     }
     else if(action==='adminSaveLedger'){
       const p=payload;

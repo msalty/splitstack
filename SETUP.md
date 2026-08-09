@@ -217,6 +217,42 @@ delete anything, so the history stays honest.
 
 ---
 
+## When someone changes your expense
+
+Everyone on a ledger can edit everything — that's deliberate, because the person with the receipt
+isn't always the person who typed it in. What the app adds is that a change never happens quietly.
+
+**If someone who didn't enter it changes it**, it's marked for review by whoever *did* enter it. They
+see 👀 on the row, a count on the ledger tile, and a banner above the feed that filters the list down
+to just the entries waiting on them. Opening it shows plain language about what moved — *Amount
+$1,760.00 → $1,840.00 · Changed the split* — and two choices: **Looks right to me**, or **Put it back
+the way it was**, which restores the previous values in one tap. Deleting someone else's expense
+works the same way: it stays visible to them, struck through, until they sign the deletion off.
+
+**If two people changed it at once** — both offline, say — the app can tell, because an edit carries
+the revision it was built on. The later one still wins, as it always did, but it's marked as a
+collision rather than an ordinary edit so the author knows two people were in there.
+
+**To ask everyone to look**, open any expense and tap **👀 Ask everyone to review this**. Good for
+placeholders, estimates and anything not yet final. Everyone splitting it signs off individually —
+the row shows *2 of 4* until the last person agrees — and whoever raised it (or an admin) can
+withdraw it early.
+
+Reviews never change the money. An entry under review counts towards balances exactly like any
+other, and the Balances tab says so rather than letting the numbers quietly disagree with the feed.
+Signing off works offline like everything else; it queues and syncs when you're back.
+
+---
+
+**Finding an expense** — tap 🔍 in a ledger's header to filter the Expenses list as you type.
+It matches the expense name and the amount, and every word you type has to land somewhere, so
+`pizza 40` finds the $40 pizza and nothing else. Amounts are forgiving about formatting: `12.5`,
+`$12.50` and `1,840` all find what you'd expect. Settlements match on who paid whom. The running
+`3 matches · $9,600.00` line above the results totals what you're looking at. Search runs on the
+copy already on your phone, so it works offline too.
+
+---
+
 ## What's in the spreadsheet
 
 | Tab | What it holds |
@@ -230,7 +266,12 @@ delete anything, so the history stays honest.
 Each ledger tab has these columns:
 
 `TxnId` · `Type` · `Date` · `Name` · `Category` · `Amount` · `PaidBy` · `PaidTo` ·
-`EnteredBy` · `SplitPct` · `Notes` · `ReceiptId` · `Deleted` · `CreatedAt` · `UpdatedAt` · `Rev`
+`EnteredBy` · `SplitPct` · `Notes` · `ReceiptId` · `Deleted` · `CreatedAt` · `UpdatedAt` · `Rev` ·
+`ReviewState` · `ReviewBy` · `ReviewNote` · `ReviewDone` · `ReviewWas`
+
+The last five track [reviews](#when-someone-changes-your-expense): `ReviewState` is empty, `edit`,
+`conflict` or `flag`; `ReviewDone` lists who has signed off; `ReviewWas` holds the pre-edit values
+that **Put it back** restores. Filter on `ReviewState` to see everything still open.
 
 You can read and filter these freely, and build your own pivot tables and charts against them.
 
@@ -357,6 +398,26 @@ inside the app instead.
 
 **The app won't update after I re-upload the files.**
 See *Updating the app* below — there's a button for this now.
+
+---
+
+## Updating the backend script
+
+The app updates itself. **The Apps Script doesn't** — you pasted it in by hand, so you replace it by
+hand. Anything that needs a new backend action (reviews, for one) silently does nothing until you do.
+
+1. Open your spreadsheet ▸ **Extensions ▸ Apps Script**
+2. Select everything in `Code.gs` and paste the latest version over it. **Save.**
+3. **Deploy ▸ Manage deployments ▸ ✏️ (edit) ▸ Version: New version ▸ Deploy**
+
+> **Step 3 is the one people miss.** Saving the editor does not change what your `/exec` URL serves —
+> Apps Script keeps serving the deployed version until you publish a new one. Same URL, same setup
+> key, everyone stays logged in.
+
+New columns appear on their own; the script adds any it's missing the next time a phone syncs, and
+existing rows are left alone. If the app is talking to a backend too old for a feature, it now says
+so in a banner rather than failing quietly, and anything you marked in the meantime is held on the
+device and goes through once you've deployed.
 
 ---
 
