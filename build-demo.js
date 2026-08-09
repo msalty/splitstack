@@ -44,9 +44,13 @@ const stub = `
   try { Object.defineProperty(navigator,'serviceWorker',{configurable:true,value:undefined}); } catch(e){}
 
   const U=(id,n,role,color,emoji,email)=>({id,username:n.toLowerCase(),name:n,email:email||'',role:role||'member',
-    avatar:'',color,emoji:emoji||'',active:true,notify:true,hasPassword:true});
+    avatar:'',color,emoji:emoji||'',active:true,notify:true,kind:'person',hasPassword:true});
+  /* A member who isn't a person: holds a balance, can't log in, never emailed. */
+  const E=(id,n,color,emoji)=>({id,username:n.toLowerCase().replace(/[^a-z0-9]+/g,'-'),name:n,email:'',
+    role:'member',avatar:'',color,emoji,active:true,notify:false,kind:'entity',hasPassword:false});
   const users=[U('u1','Mike','admin','#6C5CE7','👑','mike@example.com'),U('u2','Sam',null,'#00B894','🦊','sam@example.com'),
-               U('u3','Ada',null,'#E84393','🐙','ada@example.com'),U('u4','Ben',null,'#0984E3','🐢','ben@example.com')];
+               U('u3','Ada',null,'#E84393','🐙','ada@example.com'),U('u4','Ben',null,'#0984E3','🐢','ben@example.com'),
+               E('e1','House Kitty','#E17055','🏺')];
   const ledgers=[
     {id:'l1',name:'Beach House',emoji:'🏝️',color:'#00B894',invite:'demoinvite1',archived:false,presets:[],createdAt:'2026-06-01T00:00:00Z'},
     {id:'l2',name:'Monthly Bills',emoji:'🏠',color:'#6C5CE7',invite:'demoinvite2',archived:false,createdAt:'2026-01-01T00:00:00Z',
@@ -117,7 +121,7 @@ const stub = `
     const {action,payload}=JSON.parse(opts.body);
     await new Promise(r=>setTimeout(r,180));      // a little latency, for realism
     let d;
-    if(action==='ping') d={version:4,ready:true,appName:'SplitStack',iterations:210000};
+    if(action==='ping') d={version:5,ready:true,appName:'SplitStack',iterations:210000};
     else if(action==='bootstrap') d=state;
     else if(action==='pull'){
       d={ledgers:{}};
@@ -169,8 +173,13 @@ const stub = `
     else if(action==='adminSaveUser'){
       const p=payload;
       if(p.id){ const u=users.find(x=>x.id===p.id); Object.assign(u,{name:p.name,username:p.username,email:p.email,emoji:p.emoji,color:p.color,role:p.role,active:p.active!==false}); d={user:u}; }
-      else { const u={id:'u'+(users.length+1),username:p.username,name:p.name,email:p.email||'',role:p.role,
-        avatar:'',color:p.color,emoji:p.emoji||'',active:true,hasPassword:!!p.dk}; users.push(u); d={user:u}; }
+      else { const ent=p.kind==='entity';
+        const u={id:'u'+(users.length+1),
+          username:ent?String(p.name||'').toLowerCase().replace(/[^a-z0-9]+/g,'-'):p.username,
+          name:p.name,email:ent?'':(p.email||''),role:ent?'member':p.role,avatar:'',color:p.color,
+          emoji:p.emoji||(ent?'🏢':''),active:true,notify:!ent,kind:ent?'entity':'person',
+          hasPassword:!ent&&!!p.dk};
+        users.push(u); d={user:u}; }
     }
     else if(action==='adminDeleteUser'){ const i=users.findIndex(u=>u.id===payload.id); if(i>=0) users.splice(i,1); d={ok:true}; }
     else if(action==='adminDeleteLedger'){ const i=ledgers.findIndex(l=>l.id===payload.id); if(i>=0) ledgers.splice(i,1); d={ok:true}; }

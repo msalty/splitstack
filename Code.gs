@@ -27,7 +27,8 @@ var TAB_CONFIG    = 'Config';
 var TAB_RECURRING = 'Recurring';
 
 var USER_COLS   = ['UserId','Username','DisplayName','Email','Role','Salt','Iterations',
-                   'Verifier','TokenVer','Avatar','Color','Emoji','Active','Notify','CreatedAt','UpdatedAt'];
+                   'Verifier','TokenVer','Avatar','Color','Emoji','Active','Notify','Kind',
+                   'CreatedAt','UpdatedAt'];
 var LEDGER_COLS = ['LedgerId','Name','SheetName','Emoji','Color','InviteToken','Archived',
                    'Presets','CreatedBy','CreatedAt','UpdatedAt'];
 var MEMBER_COLS = ['LedgerId','UserId','JoinedAt'];
@@ -40,7 +41,7 @@ var RECUR_COLS  = ['RuleId','LedgerId','Name','Category','Amount','PaidBy','Spli
 
 var PBKDF2_ITERATIONS = 210000;
 var SESSION_DAYS      = 60;
-var API_VERSION       = 4;
+var API_VERSION       = 5;
 
 /* Recurring rules never run more than this many periods in one pass. A script
    whose trigger was off for a year should not wake up and post 365 rows. */
@@ -304,7 +305,7 @@ function nextRev(count) {
  * Script Properties — one cheap property read per request, and the actual
  * migration exactly once ever.
  */
-var SCHEMA_VERSION = '4';
+var SCHEMA_VERSION = '5';
 
 function ensureSchema() {
   var props = PropertiesService.getScriptProperties();
@@ -735,6 +736,9 @@ function requireAuth(token) {
 
   var u = findUser('UserId', bits[0]);
   if (!u || u.Active === false || u.Active === 'FALSE') throw new Error('AUTH_INVALID');
+  // Belt and braces: an entity is never issued a token, so holding one means
+  // something is wrong. Fail closed rather than reason about how.
+  if (isEntity(u)) throw new Error('AUTH_INVALID');
   if ((Number(u.TokenVer) || 0) !== Number(bits[2])) throw new Error('AUTH_STALE');
   return u;
 }
@@ -774,7 +778,9 @@ function authSalt(p) {
 function login(p) {
   var g = guardCheck(p.username);
   var u = findUser('Username', p.username || '');
-  if (!u || !u.Verifier)                       { guardFail(g); throw new Error('BAD_CREDENTIALS'); }
+  // An entity is indistinguishable from a name nobody has registered, which is
+  // the same answer the login screen already gives for every unknown username.
+  if (!u || !u.Verifier || isEntity(u))        { guardFail(g); throw new Error('BAD_CREDENTIALS'); }
   if (u.Active === false || u.Active === 'FALSE') throw new Error('ACCOUNT_DISABLED');
   if (verifierFor(p.dk) !== u.Verifier)        { guardFail(g); throw new Error('BAD_CREDENTIALS'); }
   guardPass(g);
@@ -834,6 +840,7 @@ function adminSetPassword(p) {
   return lock(function () {
     var u = findUser('UserId', p.userId);
     if (!u) throw new Error('NO_SUCH_USER');
+    if (isEntity(u)) throw new Error('NOT_A_PERSON');
     updateRow(TAB_USERS, USER_COLS, u.__row, {
       Salt: p.salt, Iterations: PBKDF2_ITERATIONS, Verifier: verifierFor(p.dk),
       TokenVer: (Number(u.TokenVer) || 0) + 1, UpdatedAt: new Date()
@@ -848,12 +855,52 @@ function validateUsername(n) {
 
 /* -------------------------------------------------------------------- users */
 
+/* ═══════════════════════════════════════════════════ people and non-people */
+/**
+ * Not every member of a ledger is a person with a phone.
+ *
+ * An employer you claim expenses back from, a house kitty, a partner who is
+ * never going to install this — each needs to hold a balance and appear in a
+ * split, and none of them can log in. Marking them as an entity is what stops
+ * the app treating them as somebody who simply hasn't signed up yet: the
+ * difference between "Acme Corp owes you £340" and offering a stranger with
+ * your invite link the chance to log in as your employer.
+ *
+ * Entities are ordinary rows everywhere the money is concerned, and are shut
+ * out of every path that assumes a human: login, invites, seat claiming,
+ * email, admin. Those guards are deliberately spread across each of those
+ * paths rather than centralised — a single missed check should fail closed in
+ * one place, not open up all of them.
+ */
+function isEntity(u) {
+  return !!u && String(u.Kind == null ? '' : u.Kind).toLowerCase() === 'entity';
+}
+
+/**
+ * Entities never type a username, but the sheet still wants one — it is the
+ * human-readable handle in a column people read. Derive it from the name and
+ * make it unique, so "Acme Corp" becomes acme-corp without anybody being asked
+ * to invent something.
+ */
+function entityUsername(name) {
+  var base = String(name || '').toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 20);
+  if (base.length < 2) base = 'entity';
+  var candidate = base, n = 2;
+  while (findUser('Username', candidate)) {
+    candidate = base.slice(0, 20 - String(n).length - 1) + '-' + n;
+    n++;
+  }
+  return candidate;
+}
+
 function publicUser(u) {
   return {
     id: u.UserId, username: u.Username, name: u.DisplayName || u.Username,
     email: u.Email || '', role: u.Role || 'member', avatar: u.Avatar || '',
     color: u.Color || pickColor(0), emoji: u.Emoji || '', active: u.Active !== false && u.Active !== 'FALSE',
     notify: notifyOn(u),
+    kind: isEntity(u) ? 'entity' : 'person',
     hasPassword: !!u.Verifier
   };
 }
@@ -914,7 +961,19 @@ function saveUser(me, p) {
         patch.Active = !!p.active;
         if (!p.active) patch.TokenVer = (Number(u.TokenVer) || 0) + 1;
       }
+      if (p.kind !== undefined) {
+        var wantEntity = p.kind === 'entity';
+        // Somebody who has set a password is a person, whatever the form says.
+        // Demoting them would strand a working login behind an account the app
+        // no longer offers a way to sign into.
+        if (wantEntity && u.Verifier) throw new Error('HAS_A_LOGIN');
+        if (wantEntity && u.Role === 'admin') throw new Error('ADMIN_IS_A_PERSON');
+        patch.Kind = wantEntity ? 'entity' : 'person';
+        if (wantEntity) { patch.Role = 'member'; patch.Email = ''; patch.Notify = 'off'; }
+      }
+      var willBeEntity = patch.Kind ? patch.Kind === 'entity' : isEntity(u);
       if (p.role !== undefined && p.role !== u.Role) {
+        if (willBeEntity && p.role === 'admin') throw new Error('ADMIN_IS_A_PERSON');
         if (u.Role === 'admin' && activeAdminCount() <= 1) throw new Error('LAST_ADMIN');
         patch.Role = p.role === 'admin' ? 'admin' : 'member';
       }
@@ -922,16 +981,30 @@ function saveUser(me, p) {
       return { user: publicUser(findUser('UserId', p.id)) };
     }
 
-    validateUsername(p.username);
-    if (findUser('Username', p.username)) throw new Error('USERNAME_TAKEN');
+    var entity = p.kind === 'entity';
+    var username;
+    if (entity) {
+      if (!String(p.name || '').trim()) throw new Error('NAME_REQUIRED');
+      username = entityUsername(p.name);
+    } else {
+      validateUsername(p.username);
+      if (findUser('Username', p.username)) throw new Error('USERNAME_TAKEN');
+      username = String(p.username).toLowerCase().trim();
+    }
     var n = readTab(TAB_USERS, USER_COLS).length;
     var nu = {
-      UserId: uid('usr'), Username: String(p.username).toLowerCase().trim(),
-      DisplayName: p.name || p.username, Email: p.email || '',
-      Role: p.role === 'admin' ? 'admin' : 'member',
-      Salt: p.salt || '', Iterations: PBKDF2_ITERATIONS, Verifier: p.dk ? verifierFor(p.dk) : '',
-      TokenVer: 1, Avatar: '', Color: p.color || pickColor(n), Emoji: p.emoji || '',
-      Active: true, CreatedAt: now, UpdatedAt: now
+      UserId: uid('usr'), Username: username,
+      DisplayName: p.name || p.username, Email: entity ? '' : (p.email || ''),
+      Role: (!entity && p.role === 'admin') ? 'admin' : 'member',
+      // An entity is given no credentials at all — not a blank password, which
+      // is a seat waiting to be claimed, but nothing a login could ever match.
+      Salt: entity ? '' : (p.salt || ''),
+      Iterations: PBKDF2_ITERATIONS,
+      Verifier: (!entity && p.dk) ? verifierFor(p.dk) : '',
+      TokenVer: 1, Avatar: '', Color: p.color || pickColor(n),
+      Emoji: p.emoji || (entity ? '🏢' : ''),
+      Active: true, Notify: entity ? 'off' : '', Kind: entity ? 'entity' : 'person',
+      CreatedAt: now, UpdatedAt: now
     };
     appendRow(TAB_USERS, USER_COLS, nu);
     return { user: publicUser(findUser('UserId', nu.UserId)) };
@@ -1141,7 +1214,11 @@ function inviteInfo(p) {
     members: users.filter(function (u) { return memberIds.indexOf(u.UserId) !== -1; })
                   .map(function (u) { return { id: u.UserId, name: u.DisplayName || u.Username,
                                                avatar: u.Avatar || '', color: u.Color, emoji: u.Emoji,
-                                               claimable: !u.Verifier }; })
+                                               kind: isEntity(u) ? 'entity' : 'person',
+                                               // An entity has no seat to claim. Without this, an
+                                               // employer on the ledger reads to whoever holds the
+                                               // link as an unclaimed account they may as well take.
+                                               claimable: !u.Verifier && !isEntity(u) }; })
   };
 }
 
@@ -1152,6 +1229,7 @@ function claimSeat(p) {
     if (!l) throw new Error('BAD_INVITE');
     var u = findUser('UserId', p.userId);
     if (!u) throw new Error('NO_SUCH_USER');
+    if (isEntity(u)) throw new Error('NOT_A_PERSON');
     if (u.Verifier) throw new Error('SEAT_TAKEN');
     var isMember = readTab(TAB_MEMBERS, MEMBER_COLS).some(function (m) {
       return m.LedgerId === l.LedgerId && m.UserId === u.UserId;
@@ -1993,7 +2071,7 @@ function runDigest(only) {
   var sent = 0, skipped = 0;
   users.forEach(function (u) {
     if (only && u.UserId !== only) return;
-    if (!u.Email || !notifyOn(u)) return;
+    if (!u.Email || !notifyOn(u) || isEntity(u)) return;
     if (u.Active === false || u.Active === 'FALSE') return;
     if (sent >= quota - 1) { skipped++; return; }
 
@@ -2095,6 +2173,7 @@ function nudge(me, p) {
 
   var ids = memberIdsOf(p.ledgerId);
   if (ids.indexOf(target.UserId) === -1) throw new Error('NOT_A_MEMBER');
+  if (isEntity(target)) throw new Error('NOT_A_PERSON');
   if (!target.Email) throw new Error('NO_EMAIL_ON_FILE');
   if (!notifyOn(target)) throw new Error('NOTIFY_OFF');
 

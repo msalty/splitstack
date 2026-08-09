@@ -163,6 +163,10 @@ select.input{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xml
 .av.m{width:42px;height:42px;font-size:16px}
 .av.l{width:60px;height:60px;font-size:22px}
 .av.xl{width:104px;height:104px;font-size:38px}
+/* Members who aren't people — an employer, a kitty — are squared off, so a
+   split row shows at a glance that one share isn't a housemate's. */
+.av.entity{border-radius:30%}
+.av.s.entity{border-radius:32%}
 .av .badge{position:absolute;right:-2px;bottom:-2px;font-size:14px;filter:drop-shadow(0 1px 2px rgba(0,0,0,.4))}
 .avstack{display:flex}
 .avstack .av{margin-left:-10px;border:2.5px solid var(--card)}
@@ -309,6 +313,8 @@ select.input{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xml
 .between{display:flex;justify-content:space-between;align-items:center;gap:10px}
 .mt{margin-top:14px}.mt2{margin-top:22px}.mb{margin-bottom:14px}
 .center{text-align:center}
+/* .av is a block-level grid, so text-align alone never moved it. */
+.center>.av{margin-inline:auto}
 .mono{font-variant-numeric:tabular-nums}
 .tiny{font-size:12.5px;color:var(--ink-3);font-weight:650}
 /* Breathing room under the sticky header, and clearance for the FAB below. */

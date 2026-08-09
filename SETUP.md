@@ -180,6 +180,31 @@ afterwards and they're done.
 **The set-it-yourself way** — you pick a password and tell them what it is.
 Same as above, but fill in the password fields. They can change it later from their profile.
 
+### Members who aren't people
+
+Not everyone on a ledger has a phone. **Settings ▸ People ▸ + Add someone** offers two kinds:
+
+| | |
+|---|---|
+| 👤 **Person** | Gets a login, an invite link, and email. What you've always had. |
+| 🏢 **Not a person** | Holds a balance and takes a share of a split. Nothing else. |
+
+Use the second for an employer you claim expenses back from, a house kitty, a landlord, or
+somebody who is simply never going to install this. All you give it is a name, a colour and
+optionally a badge emoji — no username, no password, no email, because none of them would mean
+anything.
+
+It behaves like any other member where money is concerned: it can pay for things, take a share,
+carry a balance, and appear in *Simplest way to settle*. It's shut out of everything that assumes
+a human — it can't sign in, it's never offered as a claimable seat on an invite link, it's never
+emailed or nudged, and it can't be an admin.
+
+**They're squared off rather than round**, so a split row shows at a glance that one of the shares
+belongs to a company rather than a housemate.
+
+> Someone who has already set a password can't be turned into a non-person — they'd have a working
+> login for an account the app no longer offers a way into. Remove them and add the entity instead.
+
 ### Someone who already has an account
 
 Send them the same invite link. They tap **Log in and join** and the ledger is added to their list.
@@ -341,7 +366,7 @@ nothing to send to, and everything else in the app behaves identically.
 
 | Tab | What it holds |
 |---|---|
-| `Users` | One row per person: username, display name, role, salt, iterations, verifier, avatar, colour, email preference |
+| `Users` | One row per member: username, display name, role, salt, iterations, verifier, avatar, colour, email preference, and whether it's a person or not |
 | `Ledgers` | One row per ledger: name, sheet tab name, icon, colour, invite token, archived flag, saved splits |
 | `Members` | Which people belong to which ledgers |
 | `Recurring` | One row per repeating expense: the template, the schedule, and when it next fires |

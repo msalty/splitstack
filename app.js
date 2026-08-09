@@ -6,7 +6,7 @@
 
 /* Shown in Settings ▸ App & updates. Bump this and SW_BUILD in sw.js together
    whenever you re-upload the app. */
-const APP_BUILD = '2026-08-09.3';
+const APP_BUILD = '2026-08-09.4';
 
 /* ────────────────────────────────────────────────────────────────  helpers */
 const $  = (s, r = document) => r.querySelector(s);
@@ -217,7 +217,10 @@ const S = {
 
 /* The backend API this build needs. The Apps Script is pasted in by hand, so
    it can lag the PWA — which updates itself — by any amount. */
-const NEEDS_API = 4;
+const NEEDS_API = 5;
+
+/** A member who isn't a person: an employer, a kitty, someone not using the app. */
+const isEntity = u => u && u.kind === 'entity';
 
 const userById = id => S.users.find(u => u.id === id) || { id, name: 'Unknown', color: '#8A84A6', emoji: '👤', avatar: '' };
 const ledgerById = id => S.ledgers.find(l => l.id === id);
@@ -297,7 +300,10 @@ const ERRORS = {
   AMOUNT_TOO_LARGE: "That's larger than this app will store.",
   NAME_REQUIRED: 'Give it a name.',
   SPLIT_REQUIRED: 'Pick who splits it.',
-  NO_SUCH_RULE: 'That repeating expense is gone.'
+  NO_SUCH_RULE: 'That repeating expense is gone.',
+  NOT_A_PERSON: "That's not a person — it can't log in or be emailed.",
+  HAS_A_LOGIN: "They've already set a password, so they're a person. Remove the account instead.",
+  ADMIN_IS_A_PERSON: 'Admins have to be people. Change the role first.'
 };
 const errMsg = e => ERRORS[e && e.code] || (e && e.message) || 'Something went wrong.';
 
@@ -833,7 +839,10 @@ function reviewPatch(existing, next) {
 /* ───────────────────────────────────────────────────────────────── snippets */
 function avatar(u, size = 'm', badge) {
   const bg = u.avatar ? `background-image:url('${u.avatar}')` : `background:${esc(u.color || '#8A84A6')}`;
-  return `<div class="av ${size}" style="${bg}" title="${esc(u.name)}">${u.avatar ? '' : esc(u.emoji || initials(u.name))}${badge ? `<span class="badge">${badge}</span>` : ''}</div>`;
+  // Entities wear squared-off corners. It reads at avatar size in a way a badge
+  // or a colour never would, and it means a split row shows at a glance that
+  // one of the shares belongs to a company rather than a housemate.
+  return `<div class="av ${size}${isEntity(u) ? ' entity' : ''}" style="${bg}" title="${esc(u.name)}">${u.avatar ? '' : esc(u.emoji || initials(u.name))}${badge ? `<span class="badge">${badge}</span>` : ''}</div>`;
 }
 function avStack(ids, max = 5) {
   const shown = ids.slice(0, max);
@@ -1168,7 +1177,8 @@ function viewInvite() {
       <div class="section-title" style="margin-top:0">Who's already in</div>
       ${inv.members.map(m => `<div class="row-item">${avatar(m, 'm')}<div class="grow">
         <div class="ttl">${esc(m.name)}</div>
-        <div class="sub">${m.claimable ? 'Seat waiting — no password set' : 'Active'}</div></div></div>`).join('') ||
+        <div class="sub">${isEntity(m) ? 'Not a person — just holds a balance'
+          : m.claimable ? 'Seat waiting — no password set' : 'Active'}</div></div></div>`).join('') ||
         '<p class="hint">Nobody yet.</p>'}
     </div>
     ${claimable.length ? `<div class="card">
@@ -1613,7 +1623,8 @@ function ledgerBalances(l) {
     const involvesMe = d.from === S.me.id || d.to === S.me.id;
     // Only the person actually owed the money gets to send the reminder, and
     // only when there is an address to send it to.
-    const canNudge = d.to === S.me.id && f.notify !== false && !!f.email && S.apiVersion >= NEEDS_API;
+    const canNudge = d.to === S.me.id && !isEntity(f) && f.notify !== false && !!f.email
+      && S.apiVersion >= NEEDS_API;
     return `<div class="row-item">
       ${avatar(f, 'm')}<div style="font-size:18px;color:var(--ink-3)">→</div>${avatar(t, 'm')}
       <div class="grow"><div class="ttl">${money(d.amount)}</div>
@@ -1802,10 +1813,12 @@ function viewAdmin() {
       ${users.map(u => `<div class="row-item tap" data-user="${esc(u.id)}">
         ${avatar(u, 'm')}
         <div class="grow"><div class="ttl">${esc(u.name)} ${u.role === 'admin' ? '<span class="pill">admin</span>' : ''}</div>
-          <div class="sub">@${esc(u.username)}${u.email ? ' · ' + esc(u.email) : ''}</div></div>
-        ${!u.active ? '<span class="pill no">off</span>' : !u.hasPassword ? '<span class="pill pend">no password</span>' : ''}
+          <div class="sub">${isEntity(u) ? 'Not a person — no login' : '@' + esc(u.username) + (u.email ? ' · ' + esc(u.email) : '')}</div></div>
+        ${!u.active ? '<span class="pill no">off</span>'
+          : isEntity(u) ? '<span class="pill">🏢</span>'
+          : !u.hasPassword ? '<span class="pill pend">no password</span>' : ''}
         <div>›</div></div>`).join('')}
-      <button class="btn ghost block mt" data-act="new-user">+ Add a person</button>
+      <button class="btn ghost block mt" data-act="new-user">+ Add someone</button>
     </div>
 
     <div class="section-title">Ledgers</div>
@@ -2443,50 +2456,82 @@ function ledgerSheet(existing) {
 /* ───────────────────────────────────────────────────────── user edit sheet */
 function userSheet(existing) {
   const st = existing ? Object.assign({}, existing) :
-    { name: '', username: '', email: '', emoji: '', color: '#6C5CE7', role: 'member', active: true };
+    { name: '', username: '', email: '', emoji: '', color: '#6C5CE7', role: 'member', active: true, kind: 'person' };
   st.pw = ''; st.pw2 = '';
+  st.kind = st.kind || 'person';
   const PAL = ['#6C5CE7', '#00B894', '#FF7675', '#FDCB6E', '#0984E3', '#E84393', '#00CEC9', '#E17055'];
   const sheet = openSheet('<div id="us-body"></div>');
   const draw = () => {
+    const ent = st.kind === 'entity';
+    // Switching an existing person across is refused server-side once they have
+    // a login, so don't offer it — a control that always errors is worse than
+    // no control.
+    const canSwitch = !existing || !existing.hasPassword;
     $('#us-body', sheet).innerHTML = `
-      <h2>${existing ? 'Edit person' : 'Add a person'}</h2>
-      <p class="sheet-sub">${existing ? '@' + esc(existing.username) : 'They get their own login.'}</p>
-      <div class="center mb">${avatar({ name: st.name || '?', color: st.color, emoji: st.emoji, avatar: existing ? existing.avatar : '' }, 'xl')}
-        ${existing ? `<div class="mt"><button class="btn sm ghost" data-act="pick-avatar-for">📷 Set photo</button></div>` : ''}</div>
-      <div class="field"><label>Display name</label><input class="input" id="us-name" value="${esc(st.name)}" placeholder="Sam"></div>
-      <div class="field"><label>Username</label><input class="input" id="us-user" value="${esc(st.username)}"
+      <h2>${existing ? (ent ? 'Edit' : 'Edit person') : 'Add someone'}</h2>
+      <p class="sheet-sub">${existing
+        ? (ent ? 'Not a person — no login, no email.' : '@' + esc(existing.username))
+        : 'Somebody who uses the app, or something that just holds a balance.'}</p>
+
+      ${canSwitch ? `<div class="seg mb">
+        <button data-kind="person" class="${ent ? '' : 'on'}">👤 Person</button>
+        <button data-kind="entity" class="${ent ? 'on' : ''}">🏢 Not a person</button></div>` : ''}
+
+      <div class="center mb">${avatar({ name: st.name || '?', color: st.color, emoji: st.emoji,
+        kind: st.kind, avatar: existing ? existing.avatar : '' }, 'xl')}
+        ${existing && !ent ? `<div class="mt"><button class="btn sm ghost" data-act="pick-avatar-for">📷 Set photo</button></div>` : ''}</div>
+
+      ${ent ? `<div class="card mb"><div class="flex"><span style="font-size:22px">🏢</span>
+        <div class="grow"><div class="sub" style="white-space:normal">Holds a balance and takes a share
+          of a split, but can't sign in, can't be invited and is never emailed. Use it for an employer
+          you claim expenses back from, a house kitty, or someone who is never going to install
+          this.</div></div></div></div>` : ''}
+
+      <div class="field"><label>${ent ? 'Name' : 'Display name'}</label>
+        <input class="input" id="us-name" value="${esc(st.name)}" placeholder="${ent ? 'Acme Corp' : 'Sam'}"></div>
+
+      ${ent ? '' : `<div class="field"><label>Username</label><input class="input" id="us-user" value="${esc(st.username)}"
         autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="sam"></div>
-      <div class="field"><label>Email (optional)</label><input class="input" id="us-email" type="email" value="${esc(st.email || '')}"></div>
-      <div class="field"><label>Badge emoji (optional)</label><input class="input" id="us-emoji" value="${esc(st.emoji || '')}" placeholder="🦊" maxlength="4"></div>
+      <div class="field"><label>Email (optional)</label><input class="input" id="us-email" type="email" value="${esc(st.email || '')}"></div>`}
+
+      <div class="field"><label>Badge emoji (optional)</label><input class="input" id="us-emoji" value="${esc(st.emoji || '')}" placeholder="${ent ? '🏢' : '🦊'}" maxlength="4"></div>
       <div class="field"><label>Colour</label><div class="chips">${PAL.map(c =>
         `<button class="chip" data-color="${c}" style="background:${c};border-color:${c};width:44px;height:38px;${st.color === c ? 'outline:3px solid var(--ink);outline-offset:2px' : ''}"></button>`).join('')}</div></div>
-      <div class="field"><label>Role</label><div class="seg">
+
+      ${ent ? '' : `<div class="field"><label>Role</label><div class="seg">
         <button data-role="member" class="${st.role !== 'admin' ? 'on' : ''}">Member</button>
         <button data-role="admin" class="${st.role === 'admin' ? 'on' : ''}">Admin 👑</button></div>
-        <p class="hint">Admins can manage people and ledgers.</p></div>
+        <p class="hint">Admins can manage people and ledgers.</p></div>`}
+
       ${existing ? `<div class="field"><label>Account</label>
         <button class="chip ${st.active ? 'on' : ''}" data-active="1">${st.active ? '✅ Active' : '🚫 Disabled'}</button></div>` : ''}
-      <div class="field"><label>${existing ? 'Reset password' : 'Password'}</label>
+
+      ${ent ? '' : `<div class="field"><label>${existing ? 'Reset password' : 'Password'}</label>
         <input class="input mb" id="us-pw" type="password" placeholder="${existing ? 'Leave blank to keep current' : 'Optional — they can set it via invite'}">
         <input class="input" id="us-pw2" type="password" placeholder="Confirm">
-        <p class="hint">${existing ? '' : 'Leave blank and they can claim their own seat from the invite link.'}</p></div>
+        <p class="hint">${existing ? '' : 'Leave blank and they can claim their own seat from the invite link.'}</p></div>`}
+
       <div class="flex mt">
         ${existing ? `<button class="btn ghost" data-act="del-user">🗑</button>` : ''}
         <button class="btn ghost grow" data-act="cancel">Cancel</button>
         <button class="btn grow" data-act="save-user">Save</button></div>`;
   };
+  /* The entity form has no username, email or password inputs, so those reads
+     have to leave the existing values alone rather than blank them. */
   const readF = () => {
-    st.name = ($('#us-name', sheet) || {}).value || '';
-    st.username = ($('#us-user', sheet) || {}).value || '';
-    st.email = ($('#us-email', sheet) || {}).value || '';
-    st.emoji = ($('#us-emoji', sheet) || {}).value || '';
-    st.pw = ($('#us-pw', sheet) || {}).value || '';
-    st.pw2 = ($('#us-pw2', sheet) || {}).value || '';
+    const get = (sel, fallback) => { const el = $(sel, sheet); return el ? el.value : fallback; };
+    st.name = get('#us-name', st.name) || '';
+    st.username = get('#us-user', st.username) || '';
+    st.email = get('#us-email', st.email) || '';
+    st.emoji = get('#us-emoji', st.emoji) || '';
+    st.pw = get('#us-pw', '') || '';
+    st.pw2 = get('#us-pw2', '') || '';
   };
   sheet.addEventListener('click', async e => {
-    const el = e.target.closest('[data-color],[data-role],[data-active],[data-act]'); if (!el) return;
+    const el = e.target.closest('[data-color],[data-role],[data-kind],[data-active],[data-act]'); if (!el) return;
     readF();
     if (el.dataset.color) st.color = el.dataset.color;
+    else if (el.dataset.kind) { st.kind = el.dataset.kind; if (st.kind === 'entity') st.role = 'member'; haptic(); }
     else if (el.dataset.role) st.role = el.dataset.role;
     else if (el.dataset.active) st.active = !st.active;
     else if (el.dataset.act === 'cancel') return sheet.close();
@@ -2501,25 +2546,33 @@ function userSheet(existing) {
     else if (el.dataset.act === 'del-user') {
       sheet.close();
       if (await confirmSheet('Remove ' + st.name + '?',
-        'Their login is deleted and they leave every ledger. Past expenses keep their name on them.', 'Remove')) {
+        st.kind === 'entity'
+          ? 'It leaves every ledger. Past expenses keep its name on them.'
+          : 'Their login is deleted and they leave every ledger. Past expenses keep their name on them.',
+        'Remove')) {
         try { await api('adminDeleteUser', { id: existing.id }); toast('Removed'); await sync({ silent: true }); }
         catch (err) { toast(errMsg(err)); }
       }
       return;
     }
     else if (el.dataset.act === 'save-user') {
-      if (!st.username.trim()) return toast('Username required');
-      if (st.pw || st.pw2) {
+      const ent = st.kind === 'entity';
+      if (ent && !st.name.trim()) return toast('Give it a name');
+      if (!ent && !st.username.trim()) return toast('Username required');
+      if (!ent && (st.pw || st.pw2)) {
         if (st.pw !== st.pw2) return toast("Passwords don't match");
         if (st.pw.length < 6) return toast('Use at least 6 characters');
       }
+      if (ent && S.apiVersion && S.apiVersion < NEEDS_API)
+        return toast('Your backend script is too old for this — update it first', 3600);
       sheet.close();
       try {
         syncBadge('<span class="spinner"></span>Saving…');
         const payload = {
           id: existing ? existing.id : undefined,
           name: st.name.trim() || st.username.trim(), username: st.username.trim(),
-          email: st.email.trim(), emoji: st.emoji.trim(), color: st.color, role: st.role
+          email: ent ? '' : st.email.trim(), emoji: st.emoji.trim(), color: st.color,
+          role: ent ? 'member' : st.role, kind: st.kind
         };
         if (existing) payload.active = st.active;
         if (st.pw && !existing) {
