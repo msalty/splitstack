@@ -731,6 +731,7 @@ to go back into the Apps Script editor.
 | **🔑 Show setup key** | The key for creating the admin account (refuses once one exists) |
 | **🛠 Run setup / repair** | Rebuilds any missing tab or column. Safe to run any time; never touches data |
 | **⏰ Check background jobs** | Says whether repeating expenses and email summaries are actually scheduled, and re-installs them if not |
+| **🧹 Clean up unused files** | Finds receipt photos nothing points at any more, tells you what it found, and bins them only if you say yes |
 | **🔓 Unlock a locked account** | Clears someone's 15-minute lockout immediately |
 | **♻️ Reset the admin account** | Clears the admin password and issues a fresh setup key. Ledgers untouched |
 
@@ -772,6 +773,13 @@ own web app and run through Part 3 — no pasting code, and roughly three minute
 - **Deleting an expense doesn't touch its receipt.** A deleted expense is a tombstone rather than a
   removed row, which is how other phones learn about the deletion and what *Put it back* restores;
   binning the photo would make that restore incomplete.
+- **SplitStack ▸ 🧹 Clean up unused files** sweeps up anything left behind — by a version that
+  predates the tidying above, or by a very large delete that hit its per-run limit. It scans first
+  and reports what it found (*"48 files checked · 45 still in use · 3 unused, 1.2 MB"*), and does
+  nothing at all unless you say yes. It's careful by design: files under a week old are never
+  touched, because a receipt is uploaded just *before* the expense that references it, and anything
+  in the folder that SplitStack didn't create is counted and left alone. Normally it should find
+  nothing.
 - **Avatars** are stored as small compressed images directly in the `Users` tab.
 - **Backups** — the spreadsheet has full revision history (**File ▸ Version history**). You already
   have a complete audit trail for free.

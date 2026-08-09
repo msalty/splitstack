@@ -427,6 +427,7 @@ function onOpen() {
       .addSeparator()
       .addItem('🛠  Run setup / repair', 'menuSetup')
       .addItem('⏰  Check background jobs', 'menuJobs')
+      .addItem('🧹  Clean up unused files', 'menuCleanup')
       .addItem('🔓  Unlock a locked account', 'menuUnlock')
       .addItem('♻️  Reset the admin account', 'menuResetAdmin')
       .addToUi();
@@ -2043,6 +2044,164 @@ function putReceipt(me, p) {
   var blob = Utilities.newBlob(bytes, m[1], (p.txnId || uid('rcp')) + '.' + m[1].split('/')[1]);
   var file = receiptFolder().createFile(blob);
   return { receiptId: file.getId() };
+}
+
+/* ══════════════════════════════════════════════ sweeping up old receipts */
+/**
+ * Finds receipt images nothing points at any more and offers to bin them.
+ *
+ * Cleanup now happens as you go, so this is for history: instances that ran
+ * versions which orphaned files, and any left behind by a delete that hit the
+ * per-run cap. It should normally find nothing.
+ *
+ * This is the most dangerous function here — it decides what to delete from a
+ * *negative*, and a reference source it fails to look at becomes a receipt it
+ * wrongly destroys. Five things keep that from happening:
+ *
+ *  1. References are read from every sheet that looks like a ledger, not from
+ *     the Ledgers tab. Deleting a ledger with keepSheet leaves a renamed tab
+ *     holding live ids and no row naming it; scanning by shape rather than by
+ *     registry is what stops those being missed.
+ *  2. Soft-deleted rows count. A deleted expense keeps its receipt on purpose.
+ *  3. Files younger than the grace period are never touched. A receipt is
+ *     uploaded *before* its transaction is pushed, so there is always a window
+ *     where a perfectly good file has nothing pointing at it yet.
+ *  4. Only files this app named are considered. Anything else in the folder is
+ *     somebody's own, counted and reported but left alone.
+ *  5. It reports before it does anything, and trashes rather than destroys.
+ */
+var ORPHAN_GRACE_DAYS = 7;
+var ORPHAN_TRASH_MAX  = 300;   // per run; the menu says when there are more
+var ORPHAN_SCAN_MAX   = 5000;  // a folder bigger than this is reported, not swept
+
+/** Every receipt id named by any sheet that carries transactions. */
+function referencedReceiptIds() {
+  var ids = {};
+  ss().getSheets().forEach(function (sh) {
+    var lastCol = sh.getLastColumn(), lastRow = sh.getLastRow();
+    if (lastCol < 1 || lastRow < 2) return;
+    var head = sh.getRange(1, 1, 1, lastCol).getValues()[0];
+    var txnAt = head.indexOf('TxnId'), rcpAt = head.indexOf('ReceiptId');
+    if (txnAt === -1 || rcpAt === -1) return;          // not a ledger tab
+    sh.getRange(2, rcpAt + 1, lastRow - 1, 1).getValues().forEach(function (r) {
+      var v = r[0] ? String(r[0]).trim() : '';
+      if (v) ids[v] = 1;
+    });
+  });
+  return ids;
+}
+
+/** Files this app created, as opposed to whatever else lives in the folder. */
+function looksLikeReceipt(name) { return /^(txn|rec|rcp)_/.test(String(name || '')); }
+
+function findOrphanReceipts() {
+  var referenced = referencedReceiptIds();
+  var cutoff = Date.now() - ORPHAN_GRACE_DAYS * 86400000;
+  var out = { orphans: [], bytes: 0, scanned: 0, recent: 0, foreign: 0, referenced: 0, truncated: false };
+
+  var it = receiptFolder().getFiles();
+  while (it.hasNext()) {
+    if (out.scanned >= ORPHAN_SCAN_MAX) { out.truncated = true; break; }
+    var f = it.next();
+    out.scanned++;
+    var id = f.getId();
+    if (referenced[id]) { out.referenced++; continue; }
+    if (!looksLikeReceipt(f.getName())) { out.foreign++; continue; }
+    var made = 0;
+    try { made = f.getDateCreated().getTime(); } catch (e) { made = Date.now(); }
+    if (made > cutoff) { out.recent++; continue; }      // possibly mid-upload
+    var size = 0;
+    try { size = f.getSize(); } catch (e) {}
+    out.bytes += size;
+    out.orphans.push({ id: id, name: f.getName() });
+  }
+  return out;
+}
+
+/** Rules whose ledger no longer exists. Older versions left these behind. */
+function findOrphanRules() {
+  var live = {};
+  readTab(TAB_LEDGERS, LEDGER_COLS).forEach(function (l) { live[l.LedgerId] = 1; });
+  return allRules().filter(function (r) { return !live[r.LedgerId]; });
+}
+
+function prettyBytes(n) {
+  if (!n) return '0 KB';
+  if (n < 1048576) return Math.max(1, Math.round(n / 1024)) + ' KB';
+  return (n / 1048576).toFixed(1) + ' MB';
+}
+
+/**
+ * The menu entry. Scans, reports, and only then asks — a sweeper that acts
+ * first and tells you afterwards is not one anybody should trust with a folder
+ * of their own photographs.
+ */
+function menuCleanup() {
+  var u = ui();
+  var rules = findOrphanRules();
+  var scan;
+  try { scan = findOrphanReceipts(); }
+  catch (e) {
+    u.alert('Could not read the receipts folder', String(e && e.message ? e.message : e), u.ButtonSet.OK);
+    return;
+  }
+
+  var lines = [];
+  lines.push('Receipt folder: ' + scan.scanned + ' file' + (scan.scanned === 1 ? '' : 's') + ' checked.');
+  lines.push('  · ' + scan.referenced + ' still in use');
+  if (scan.recent) lines.push('  · ' + scan.recent + ' too new to judge (under ' + ORPHAN_GRACE_DAYS + ' days) — left alone');
+  if (scan.foreign) lines.push('  · ' + scan.foreign + " not created by SplitStack — left alone");
+  lines.push('  · ' + scan.orphans.length + ' unused, ' + prettyBytes(scan.bytes));
+  if (scan.truncated) lines.push('\nThe folder is larger than ' + ORPHAN_SCAN_MAX +
+    ' files, so only the first ' + ORPHAN_SCAN_MAX + ' were checked. Run this again afterwards.');
+  if (rules.length) lines.push('\nAlso found ' + rules.length + ' repeating expense' +
+    (rules.length === 1 ? '' : 's') + ' belonging to a deleted ledger.');
+
+  if (!scan.orphans.length && !rules.length) {
+    u.alert('Nothing to clean up', lines.join('\n') + '\n\nEverything is accounted for.', u.ButtonSet.OK);
+    return;
+  }
+
+  var willTrash = Math.min(scan.orphans.length, ORPHAN_TRASH_MAX);
+  var ask = lines.join('\n') + '\n\n';
+  if (scan.orphans.length) {
+    ask += 'Move ' + willTrash + ' unused photo' + (willTrash === 1 ? '' : 's') + ' to your Drive bin?';
+    if (scan.orphans.length > willTrash)
+      ask += '\n(' + (scan.orphans.length - willTrash) + ' more will wait for the next run.)';
+    ask += '\n\nThey go to the bin, not straight out, so you have about 30 days to change your mind.';
+  } else {
+    ask += 'Remove those leftover repeating expenses?';
+  }
+
+  if (u.alert('Clean up?', ask, u.ButtonSet.YES_NO) !== u.Button.YES) return;
+
+  var trashed = 0;
+  scan.orphans.slice(0, ORPHAN_TRASH_MAX).forEach(function (o) { if (trashReceipt(o.id)) trashed++; });
+
+  var rs = tab(TAB_RECURRING, RECUR_COLS);
+  var ruleIds = {};
+  rules.forEach(function (r) { ruleIds[r.RuleId] = 1; });
+  allRules()
+    .filter(function (r) { return ruleIds[r.RuleId]; })
+    .sort(function (a, b) { return b.__row - a.__row; })
+    .forEach(function (r) { rs.deleteRow(r.__row); });
+
+  u.alert('Cleaned up',
+    trashed + ' photo' + (trashed === 1 ? '' : 's') + ' moved to your Drive bin' +
+    (rules.length ? ', ' + rules.length + ' leftover repeating expense' + (rules.length === 1 ? '' : 's') + ' removed' : '') +
+    '.' + (scan.orphans.length > trashed ? '\n\nRun it again to finish the rest.' : ''),
+    u.ButtonSet.OK);
+}
+
+/** Same thing from the Apps Script editor, for anyone who prefers the log. */
+function cleanUpOrphans() {
+  var scan = findOrphanReceipts();
+  var rules = findOrphanRules();
+  Logger.log('Checked %s files: %s in use, %s too new, %s not ours, %s unused (%s).',
+    scan.scanned, scan.referenced, scan.recent, scan.foreign, scan.orphans.length, prettyBytes(scan.bytes));
+  Logger.log('%s repeating expenses belong to a deleted ledger.', rules.length);
+  Logger.log('Nothing has been deleted. Use SplitStack ▸ Clean up unused files to act on this.');
+  return { unused: scan.orphans.length, bytes: scan.bytes, orphanRules: rules.length };
 }
 
 function getReceipt(me, p) {
