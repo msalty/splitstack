@@ -6,7 +6,7 @@
 
 /* Shown in Settings ▸ App & updates. Bump this and SW_BUILD in sw.js together
    whenever you re-upload the app. */
-const APP_BUILD = '2026-08-09.1';
+const APP_BUILD = '2026-08-09.2';
 
 /* ────────────────────────────────────────────────────────────────  helpers */
 const $  = (s, r = document) => r.querySelector(s);
@@ -186,8 +186,12 @@ const S = {
   me: null, users: [], ledgers: [], members: [], config: { symbol: '$', currency: 'USD', appName: 'SplitStack' },
   cursors: {}, txns: {}, pending: {}, online: navigator.onLine,
   view: 'boot', params: {}, tab: 'feed', syncing: false, lastError: '', updateReady: false,
-  searchOpen: false, search: '', reviewOnly: false
+  searchOpen: false, search: '', reviewOnly: false, apiVersion: 0
 };
+
+/* The backend API this build needs. The Apps Script is pasted in by hand, so
+   it can lag the PWA — which updates itself — by any amount. */
+const NEEDS_API = 3;
 
 const userById = id => S.users.find(u => u.id === id) || { id, name: 'Unknown', color: '#8A84A6', emoji: '👤', avatar: '' };
 const ledgerById = id => S.ledgers.find(l => l.id === id);
@@ -347,12 +351,24 @@ async function sync({ silent = false, full = false } = {}) {
           await persistLedger(it.payload.ledgerId);
         } catch (e) {
           if (e.code === 'OFFLINE') throw e;
+          // A backend that predates reviews doesn't know the action. That is
+          // fixable by pasting the new Code.gs, so hold the queue rather than
+          // throwing the sign-off away — it lands the moment they update.
+          if (/^UNKNOWN_ACTION/.test(e.code || '')) { S.apiVersion = 1; break; }
           // Anything else (row gone, already cleared by someone else) is not
           // worth jamming the queue over — the next pull carries the truth.
         }
         await DB.unqueue(it.seq);
       }
       await refreshPending();
+
+      /* Once per session, check the backend is new enough to store reviews at
+         all. Fired without awaiting: it must not slow a sync down. */
+      if (!S.apiVersion) {
+        api('ping', {}, { timeout: 15000 })
+          .then(i => { S.apiVersion = Number(i.version) || 1; if (S.apiVersion < NEEDS_API) render(); })
+          .catch(() => {});
+      }
 
       /* 2 ── pull deltas (and tell the backend where this app is hosted) */
       const st = await api('bootstrap', { home: appHome() });
@@ -834,7 +850,7 @@ const shell = (title, body, opts = {}) => `
     <h1>${esc(title)}</h1>
     ${opts.actions || ''}
   </div></div>
-  <div class="screen"><div class="wrap page">${updateBanner()}${body}</div></div>
+  <div class="screen"><div class="wrap page">${updateBanner()}${backendBanner()}${body}</div></div>
   ${opts.fab ? `<button class="fab" data-act="${opts.fab}">+</button>` : ''}`;
 
 function updateBanner() {
@@ -846,6 +862,24 @@ function updateBanner() {
         <div class="sub" style="color:rgba(255,255,255,.85)">Tap to restart — nothing unsaved is lost.</div></div>
       <span class="pill" style="background:rgba(255,255,255,.25);color:#fff">RESTART</span></div>
   </button>`;
+}
+
+/**
+ * The PWA updates itself; the Apps Script behind it does not. When the two
+ * drift far enough that a feature silently can't work, say so — the failure
+ * mode otherwise is "I flagged it and nothing happened on the other phone".
+ */
+function backendBanner() {
+  if (!S.apiVersion || S.apiVersion >= NEEDS_API) return '';
+  return `<div class="card mb reviewnote">
+    <div class="flex"><span style="font-size:26px">🔌</span>
+      <div class="grow"><div class="ttl">Your backend script is out of date</div>
+        <div class="sub" style="white-space:normal">Reviews and flags can't sync until it's updated.
+          Anything you've marked is saved on this device and will go through afterwards.</div></div></div>
+    <div class="tiny mt" style="line-height:1.5">Open your spreadsheet ▸ <b>Extensions ▸ Apps Script</b>,
+      paste the latest <b>Code.gs</b> over what's there, then
+      <b>Deploy ▸ Manage deployments ▸ ✏️ ▸ Version: New version ▸ Deploy</b>.</div>
+  </div>`;
 }
 
 function offlineChip() {

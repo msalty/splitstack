@@ -401,6 +401,26 @@ See *Updating the app* below — there's a button for this now.
 
 ---
 
+## Updating the backend script
+
+The app updates itself. **The Apps Script doesn't** — you pasted it in by hand, so you replace it by
+hand. Anything that needs a new backend action (reviews, for one) silently does nothing until you do.
+
+1. Open your spreadsheet ▸ **Extensions ▸ Apps Script**
+2. Select everything in `Code.gs` and paste the latest version over it. **Save.**
+3. **Deploy ▸ Manage deployments ▸ ✏️ (edit) ▸ Version: New version ▸ Deploy**
+
+> **Step 3 is the one people miss.** Saving the editor does not change what your `/exec` URL serves —
+> Apps Script keeps serving the deployed version until you publish a new one. Same URL, same setup
+> key, everyone stays logged in.
+
+New columns appear on their own; the script adds any it's missing the next time a phone syncs, and
+existing rows are left alone. If the app is talking to a backend too old for a feature, it now says
+so in a banner rather than failing quietly, and anything you marked in the meantime is held on the
+device and goes through once you've deployed.
+
+---
+
 ## Updating the app
 
 Installed PWAs are cached aggressively — that's what makes them work offline, and it's also what

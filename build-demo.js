@@ -106,7 +106,7 @@ const stub = `
     const {action,payload}=JSON.parse(opts.body);
     await new Promise(r=>setTimeout(r,180));      // a little latency, for realism
     let d;
-    if(action==='ping') d={version:1,ready:true,appName:'SplitStack',iterations:210000};
+    if(action==='ping') d={version:3,ready:true,appName:'SplitStack',iterations:210000};
     else if(action==='bootstrap') d=state;
     else if(action==='pull'){
       d={ledgers:{}};
