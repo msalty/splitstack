@@ -31,11 +31,12 @@ var LEDGER_COLS = ['LedgerId','Name','SheetName','Emoji','Color','InviteToken','
                    'CreatedBy','CreatedAt','UpdatedAt'];
 var MEMBER_COLS = ['LedgerId','UserId','JoinedAt'];
 var TXN_COLS    = ['TxnId','Type','Date','Name','Category','Amount','PaidBy','PaidTo',
-                   'EnteredBy','SplitPct','Notes','ReceiptId','Deleted','CreatedAt','UpdatedAt','Rev'];
+                   'EnteredBy','SplitPct','Notes','ReceiptId','Deleted','CreatedAt','UpdatedAt','Rev',
+                   'ReviewState','ReviewBy','ReviewNote','ReviewDone','ReviewWas'];
 
 var PBKDF2_ITERATIONS = 210000;
 var SESSION_DAYS      = 60;
-var API_VERSION       = 2;
+var API_VERSION       = 3;
 
 /* Brute-force protection. Failures are counted per username in the script
    cache, so the window expires on its own and nothing accumulates forever. */
@@ -163,6 +164,7 @@ function route(req) {
     case 'bootstrap':      return noteHome(me, p), bootstrap(me);
     case 'pull':           return pull(me, p);
     case 'push':           return push(me, p);
+    case 'reviewTxn':      return reviewTxn(me, p);
     case 'joinLedger':     return joinLedger(me, p);
     case 'setAvatar':      return setAvatar(me, p);
     case 'changePassword': return changePassword(me, p);
@@ -1074,8 +1076,21 @@ function rowToTxn(r) {
     deleted: r.Deleted === true || r.Deleted === 'TRUE',
     createdAt: r.CreatedAt ? new Date(r.CreatedAt).toISOString() : null,
     // Rev is authoritative. UpdatedAt is only a fallback for hand-typed rows.
-    updatedAt: Number(r.Rev) || (r.UpdatedAt ? new Date(r.UpdatedAt).getTime() : 0)
+    updatedAt: Number(r.Rev) || (r.UpdatedAt ? new Date(r.UpdatedAt).getTime() : 0),
+    reviewState: r.ReviewState || '',
+    reviewBy: r.ReviewBy || '',
+    reviewNote: r.ReviewNote || '',
+    reviewDone: splitIds(r.ReviewDone),
+    reviewWas: parseJson(r.ReviewWas)
   };
+}
+
+function splitIds(s) {
+  return String(s == null ? '' : s).split(',').map(function (x) { return x.trim(); })
+    .filter(function (x) { return !!x; });
+}
+function parseJson(s) {
+  try { return s ? JSON.parse(s) : null; } catch (e) { return null; }
 }
 
 /** Delta pull: only rows changed since `since` (epoch ms). */
@@ -1118,6 +1133,7 @@ function push(me, p) {
       validateTxn(t);
       var prior = existing[t.id];
       var stamp = revBase + applied.length; // strictly increasing, never reused
+      var rev = reviewForChange(me, t, prior);
       var vals = {
         TxnId: t.id,
         Type: t.type || 'expense',
@@ -1134,7 +1150,12 @@ function push(me, p) {
         Deleted: !!t.deleted,
         CreatedAt: prior ? prior.CreatedAt : new Date(t.createdAt || now),
         UpdatedAt: new Date(),
-        Rev: stamp
+        Rev: stamp,
+        ReviewState: rev.state,
+        ReviewBy: rev.by,
+        ReviewNote: rev.note,
+        ReviewDone: rev.done,
+        ReviewWas: rev.was
       };
       if (prior) updateRow(l.SheetName, TXN_COLS, prior.__row, vals);
       else       toAppend.push(vals);
@@ -1154,6 +1175,100 @@ function push(me, p) {
       if (x.updatedAt > since) txns.push(x);
     });
     return { applied: applied, txns: txns, cursor: max };
+  });
+}
+
+/* ------------------------------------------------------------------ review */
+/**
+ * Decides whether a change needs a human to look at it.
+ *
+ *   · someone other than the original author changed the row  -> 'edit'
+ *   · …and the row had already moved on since that person last
+ *     saw it, so the two of them collided                     -> 'conflict'
+ *   · the author touching their own row                       -> clears whatever
+ *     was open; they have plainly seen it
+ *
+ * The client supplies baseRev (the Rev its edit was built on) and a plain
+ * language summary of what it changed, because it is the side that knows the
+ * currency symbol and the old values. The server decides the state, so a
+ * client cannot talk its way out of being flagged.
+ */
+function reviewForChange(me, t, prior) {
+  var clear = { state: '', by: '', note: '', done: '', was: '' };
+  if (!prior) return clear;                      // brand new: nothing to review yet
+  var author = prior.EnteredBy || t.enteredBy || '';
+  if (!author || author === me.UserId) return clear;
+
+  var base = Number(t.baseRev) || 0;
+  var cur  = Number(prior.Rev) || 0;
+  return {
+    state: (base > 0 && cur > base) ? 'conflict' : 'edit',
+    by: me.UserId,
+    note: String(t.reviewNote || '').slice(0, 500),
+    done: '',
+    was: t.reviewWas ? JSON.stringify(t.reviewWas).slice(0, 8000) : ''
+  };
+}
+
+/** Who still has to sign a change off. Derived, never stored. */
+function reviewersOf(row) {
+  if (row.ReviewState === 'flag') {
+    // A manual flag asks everyone with money in it.
+    if (row.Type === 'settlement') return splitIds(row.PaidBy + ',' + row.PaidTo);
+    var split = parseJson(row.SplitPct) || {};
+    var ids = [];
+    for (var k in split) if (split.hasOwnProperty(k)) ids.push(k);
+    return ids;
+  }
+  return splitIds(row.EnteredBy);   // an edit is the author's to accept
+}
+
+/**
+ * Sign-off, raising a flag and withdrawing one. Deliberately its own action
+ * rather than a whole-row push: reviewing is not editing, and it must never
+ * overwrite someone's concurrent change to the amounts.
+ */
+function reviewTxn(me, p) {
+  return lock(function () {
+    var l = assertMember(me, p.ledgerId);
+    txnSheet(l);
+    var rows = readTab(l.SheetName, TXN_COLS), row = null;
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i].TxnId === p.txnId) { row = rows[i]; break; }
+    }
+    if (!row) throw new Error('NO_SUCH_TXN');
+
+    var clear = { ReviewState: '', ReviewBy: '', ReviewNote: '', ReviewDone: '', ReviewWas: '' };
+    var patch;
+
+    if (p.op === 'flag') {
+      patch = { ReviewState: 'flag', ReviewBy: me.UserId,
+                ReviewNote: String(p.note || '').slice(0, 500),
+                // Raising the flag counts as having looked at it yourself.
+                ReviewDone: me.UserId, ReviewWas: '' };
+    } else if (p.op === 'unflag') {
+      if (row.ReviewState !== 'flag') throw new Error('NOT_FLAGGED');
+      if (row.ReviewBy !== me.UserId && me.Role !== 'admin') throw new Error('FORBIDDEN');
+      patch = clear;
+    } else if (p.op === 'ack') {
+      if (!row.ReviewState) throw new Error('NOT_UNDER_REVIEW');
+      var need = reviewersOf(row);
+      if (need.indexOf(me.UserId) === -1 && me.Role !== 'admin') throw new Error('FORBIDDEN');
+      var done = splitIds(row.ReviewDone);
+      if (done.indexOf(me.UserId) === -1) done.push(me.UserId);
+      var outstanding = need.filter(function (u) { return done.indexOf(u) === -1; });
+      patch = outstanding.length ? { ReviewDone: done.join(',') } : clear;
+    } else {
+      throw new Error('BAD_REVIEW_OP');
+    }
+
+    patch.UpdatedAt = new Date();
+    patch.Rev = nextRev(1);
+    updateRow(l.SheetName, TXN_COLS, row.__row, patch);
+    SpreadsheetApp.flush();
+
+    for (var k in patch) if (patch.hasOwnProperty(k)) row[k] = patch[k];
+    return { txn: rowToTxn(row), cursor: patch.Rev };
   });
 }
 
