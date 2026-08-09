@@ -30,7 +30,7 @@ var USER_COLS   = ['UserId','Username','DisplayName','Email','Role','Salt','Iter
                    'Verifier','TokenVer','Avatar','Color','Emoji','Active','Notify','Kind',
                    'CreatedAt','UpdatedAt'];
 var LEDGER_COLS = ['LedgerId','Name','SheetName','Emoji','Color','InviteToken','Archived',
-                   'Presets','CreatedBy','CreatedAt','UpdatedAt'];
+                   'Presets','DefaultSplit','CreatedBy','CreatedAt','UpdatedAt'];
 var MEMBER_COLS = ['LedgerId','UserId','JoinedAt'];
 var TXN_COLS    = ['TxnId','Type','Date','Name','Category','Amount','PaidBy','PaidTo',
                    'EnteredBy','SplitPct','Notes','ReceiptId','Deleted','CreatedAt','UpdatedAt','Rev',
@@ -41,7 +41,7 @@ var RECUR_COLS  = ['RuleId','LedgerId','Name','Category','Amount','PaidBy','Spli
 
 var PBKDF2_ITERATIONS = 210000;
 var SESSION_DAYS      = 60;
-var API_VERSION       = 5;
+var API_VERSION       = 6;
 
 /* Recurring rules never run more than this many periods in one pass. A script
    whose trigger was off for a year should not wake up and post 365 rows. */
@@ -305,7 +305,7 @@ function nextRev(count) {
  * Script Properties — one cheap property read per request, and the actual
  * migration exactly once ever.
  */
-var SCHEMA_VERSION = '5';
+var SCHEMA_VERSION = '6';
 
 function ensureSchema() {
   var props = PropertiesService.getScriptProperties();
@@ -1066,6 +1066,9 @@ function publicLedger(l) {
     id: l.LedgerId, name: l.Name, emoji: l.Emoji || '💸', color: l.Color || PALETTE[0],
     invite: l.InviteToken, archived: l.Archived === true || l.Archived === 'TRUE',
     presets: parseJson(l.Presets) || [],
+    // null means "split new expenses evenly", which is what every ledger did
+    // before this existed and what most of them still want.
+    defaultSplit: parseJson(l.DefaultSplit) || null,
     createdAt: l.CreatedAt ? new Date(l.CreatedAt).toISOString() : null
   };
 }
@@ -1102,6 +1105,31 @@ function setPresets(me, p) {
   });
 }
 
+/* ═══════════════════════════════════════════════════════════ default split */
+/**
+ * How new expenses on this ledger start out. A house that always divides rent
+ * 60/40 shouldn't retype 60/40, and two people can't reach the saved-splits
+ * shortcut at all — a two-person ledger is exactly the case that had no relief.
+ *
+ * Stored as a plain split, or blank for "evenly", which is what every ledger
+ * did before this existed. Admin-only, because it is a statement of policy
+ * about how the household divides things rather than a shortcut for whoever is
+ * doing the typing — saved splits are the latter, and they stay open to
+ * everyone.
+ *
+ * A default naming somebody who has left is normalised down on the way in, so
+ * the stored value can never disagree with the membership beside it. Somebody
+ * who *joins* is a different matter and deliberately left alone: excluding one
+ * person on purpose is legitimate, so the app surfaces it in the ledger's
+ * settings instead of guessing.
+ */
+function defaultSplitFor(raw, memberIds) {
+  if (!raw || !Object.keys(raw).length) return '';        // blank means evenly
+  var split = normaliseSplit(raw, memberIds);
+  if (!split) throw new Error('SPLIT_REQUIRED');
+  return JSON.stringify(split);
+}
+
 function saveLedger(me, p) {
   return lock(function () {
     var now = new Date();
@@ -1118,8 +1146,13 @@ function saveLedger(me, p) {
       if (p.emoji !== undefined) patch.Emoji = p.emoji;
       if (p.color !== undefined) patch.Color = p.color;
       if (p.archived !== undefined) patch.Archived = !!p.archived;
-      updateRow(TAB_LEDGERS, LEDGER_COLS, l.__row, patch);
+      // Membership first: the default split has to be judged against who ends
+      // up on the ledger, not who was on it when the request was written.
       if (p.memberIds) setMembers({ ledgerId: p.id, userIds: p.memberIds });
+      if (p.defaultSplit !== undefined) {
+        patch.DefaultSplit = defaultSplitFor(p.defaultSplit, memberIdsOf(p.id));
+      }
+      updateRow(TAB_LEDGERS, LEDGER_COLS, l.__row, patch);
       return { ledger: publicLedger(ledgerById(p.id)) };
     }
 
@@ -1144,6 +1177,11 @@ function saveLedger(me, p) {
     var ids = (p.memberIds && p.memberIds.length) ? p.memberIds : [me.UserId];
     if (ids.indexOf(me.UserId) === -1) ids.push(me.UserId);
     setMembers({ ledgerId: l.LedgerId, userIds: ids });
+    if (p.defaultSplit !== undefined) {
+      updateRow(TAB_LEDGERS, LEDGER_COLS, ledgerById(l.LedgerId).__row, {
+        DefaultSplit: defaultSplitFor(p.defaultSplit, memberIdsOf(l.LedgerId))
+      });
+    }
     return { ledger: publicLedger(ledgerById(l.LedgerId)) };
   });
 }

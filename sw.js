@@ -20,7 +20,7 @@
    service worker itself update and gives Settings something to display.
    ========================================================================== */
 
-const SW_BUILD = '2026-08-09.4';
+const SW_BUILD = '2026-08-09.5';
 const CACHE    = 'splitstack-' + SW_BUILD;
 
 const SHELL = [

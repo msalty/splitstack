@@ -53,9 +53,13 @@ const stub = `
                E('e1','House Kitty','#E17055','🏺')];
   const ledgers=[
     {id:'l1',name:'Beach House',emoji:'🏝️',color:'#00B894',invite:'demoinvite1',archived:false,presets:[],createdAt:'2026-06-01T00:00:00Z'},
+    /* a house that always divides 40/30/30 — the case a default split exists for */
     {id:'l2',name:'Monthly Bills',emoji:'🏠',color:'#6C5CE7',invite:'demoinvite2',archived:false,createdAt:'2026-01-01T00:00:00Z',
-     presets:[{id:'p1',name:'Rent split',split:{u1:40,u2:30,u4:30}},{id:'p2',name:'Just me and Sam',split:{u1:50,u2:50}}]},
-    {id:'l3',name:'Ski Trip',emoji:'🎿',color:'#0984E3',invite:'demoinvite3',archived:false,presets:[],createdAt:'2026-02-01T00:00:00Z'}
+     presets:[{id:'p1',name:'Rent split',split:{u1:40,u2:30,u4:30}},{id:'p2',name:'Just me and Sam',split:{u1:50,u2:50}}],
+     defaultSplit:{u1:40,u2:30,u4:30}},
+    /* two people, 60/40 — no saved splits, and none possible before now */
+    {id:'l3',name:'Ski Trip',emoji:'🎿',color:'#0984E3',invite:'demoinvite3',archived:false,presets:[],
+     defaultSplit:{u1:60,u3:40},createdAt:'2026-02-01T00:00:00Z'}
   ];
   /* two standing orders on the bills ledger, so the demo shows the feature off */
   const recurring=[
@@ -121,7 +125,7 @@ const stub = `
     const {action,payload}=JSON.parse(opts.body);
     await new Promise(r=>setTimeout(r,180));      // a little latency, for realism
     let d;
-    if(action==='ping') d={version:5,ready:true,appName:'SplitStack',iterations:210000};
+    if(action==='ping') d={version:6,ready:true,appName:'SplitStack',iterations:210000};
     else if(action==='bootstrap') d=state;
     else if(action==='pull'){
       d={ledgers:{}};
@@ -163,12 +167,27 @@ const stub = `
     }
     else if(action==='adminSaveLedger'){
       const p=payload;
+      /* the real backend normalises the default against the FINAL member list,
+         so members are applied before it here too */
+      const norm=(s,ids)=>{ if(!s||!Object.keys(s).length) return null;
+        const kept={}; let sum=0;
+        Object.keys(s).forEach(k=>{ if(ids.indexOf(k)<0) return; const v=Number(s[k])||0; if(v<=0) return; kept[k]=v; sum+=v; });
+        const ks=Object.keys(kept); if(!ks.length) return null;
+        if(Math.abs(sum-100)<0.005) return kept;
+        const out={}; let acc=0;
+        ks.forEach((k,i)=>{ if(i===ks.length-1) out[k]=Math.round((100-acc)*100)/100;
+          else { const v=Math.round(kept[k]/sum*10000)/100; out[k]=v; acc=Math.round((acc+v)*100)/100; } });
+        return out; };
       if(p.id){ const l=ledgers.find(x=>x.id===p.id); Object.assign(l,{name:p.name||l.name,emoji:p.emoji||l.emoji,color:p.color||l.color,archived:!!p.archived});
         if(p.memberIds){ for(let i=members.length-1;i>=0;i--) if(members[i].ledgerId===p.id) members.splice(i,1);
           p.memberIds.forEach(u=>members.push({ledgerId:p.id,userId:u})); }
+        if(p.defaultSplit!==undefined)
+          l.defaultSplit=norm(p.defaultSplit,members.filter(m=>m.ledgerId===p.id).map(m=>m.userId));
         d={ledger:l};
-      } else { const l={id:'l'+(ledgers.length+1),name:p.name,emoji:p.emoji,color:p.color,invite:'demo'+Date.now(),archived:false,createdAt:new Date().toISOString()};
-        ledgers.push(l); data[l.id]=[]; (p.memberIds||['u1']).forEach(u=>members.push({ledgerId:l.id,userId:u})); d={ledger:l}; }
+      } else { const l={id:'l'+(ledgers.length+1),name:p.name,emoji:p.emoji,color:p.color,invite:'demo'+Date.now(),archived:false,presets:[],defaultSplit:null,createdAt:new Date().toISOString()};
+        ledgers.push(l); data[l.id]=[]; (p.memberIds||['u1']).forEach(u=>members.push({ledgerId:l.id,userId:u}));
+        if(p.defaultSplit!==undefined) l.defaultSplit=norm(p.defaultSplit,(p.memberIds||['u1']));
+        d={ledger:l}; }
     }
     else if(action==='adminSaveUser'){
       const p=payload;

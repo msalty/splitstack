@@ -6,7 +6,7 @@
 
 /* Shown in Settings ▸ App & updates. Bump this and SW_BUILD in sw.js together
    whenever you re-upload the app. */
-const APP_BUILD = '2026-08-09.4';
+const APP_BUILD = '2026-08-09.5';
 
 /* ────────────────────────────────────────────────────────────────  helpers */
 const $  = (s, r = document) => r.querySelector(s);
@@ -217,7 +217,7 @@ const S = {
 
 /* The backend API this build needs. The Apps Script is pasted in by hand, so
    it can lag the PWA — which updates itself — by any amount. */
-const NEEDS_API = 5;
+const NEEDS_API = 6;
 
 /** A member who isn't a person: an employer, a kitty, someone not using the app. */
 const isEntity = u => u && u.kind === 'entity';
@@ -1467,9 +1467,13 @@ function ruleSheet(ledger, rule, onDone) {
             <div class="grow"><div class="ttl" style="font-size:14px">${esc(userById(i).name)}</div></div>
             <div class="num mono" style="font-size:14px">${esc(money(st.amount * split[i] / 100))} · ${round2(split[i])}%</div>
           </div>`).join('')}</div>`
-          : `<p class="hint">Nobody in this split is on the ledger any more — edit it from a new expense instead.</p>`}
-        <p class="hint">Set from the expense you created it with. To change it, delete this and
-          repeat a fresh one.</p></div>
+          : `<p class="hint">Nobody in this split is on the ledger any more — pick a new one below.</p>`}
+        <div class="flex mt">
+          <button class="btn ghost sm grow" data-x="split">✏️ Edit the split</button>
+          ${defaultSplitOf(ledger) ? `<button class="btn ghost sm grow" data-x="usedefault">⭐ Use the default</button>` : ''}
+        </div>
+        <p class="hint">Changing the ledger's default never rewrites a rule that already exists —
+          a standing instruction about money shouldn't move on its own.</p></div>
 
       <button class="chip ${st.review ? 'on' : ''}" data-x="review">
         ${st.review ? '☑' : '☐'} 👀 Ask everyone to check each one</button>
@@ -1495,6 +1499,20 @@ function ruleSheet(ledger, rule, onDone) {
     if (el.dataset.freq) { st.freq = el.dataset.freq; haptic(); }
     else if (el.dataset.payer) { st.paidBy = el.dataset.payer; haptic(); }
     else if (el.dataset.x === 'review') { st.review = !st.review; haptic(); }
+    else if (el.dataset.x === 'usedefault') {
+      st.split = Object.assign({}, defaultSplitOf(ledger));
+      haptic(); toast('Using the ledger default');
+    }
+    else if (el.dataset.x === 'split') {
+      return splitEditorSheet({
+        title: 'Split',
+        subtitle: `How ${st.name || 'this'} divides each time it posts.`,
+        ids: ids.slice(),
+        split: st.split,
+        confirmLabel: 'Use this',
+        onSave: s => { st.split = s; haptic(25); draw(); }
+      });
+    }
     else if (el.dataset.x === 'pause') {
       st.active = !st.active;
       await queueRule(Object.assign({}, st, { anchor: Number(String(st.nextDate).slice(8, 10)) }));
@@ -1892,19 +1910,133 @@ function repeatBlurb(freq, date) {
   return `Posts ${when} — next on ${niceDate(next)}.`;
 }
 
+/** The ledger's starting split, or null for "evenly". */
+const defaultSplitOf = l => (l && l.defaultSplit) || null;
+
+/** Members the ledger's default split doesn't mention — usually people who joined later. */
+function notInDefault(split, ids) {
+  if (!split) return [];
+  return ids.filter(i => !(i in split));
+}
+
 /**
- * The saved-split chips above the member toggles. Only shown once a ledger has
- * presets or has enough people for one to be worth saving — an empty control
- * on a two-person ledger is just noise.
+ * Fold missing members into a split without throwing away the ratio between
+ * the people already in it. Newcomers take an even share of the whole; what is
+ * left is divided among the existing shares in their original proportions, so
+ * 60/40 plus a third person becomes 40/26.67/33.33 rather than a flat third
+ * each. The last share absorbs the rounding drift so it always totals 100.
+ */
+function includeEqually(split, ids) {
+  const missing = notInDefault(split, ids);
+  if (!missing.length) return Object.assign({}, split);
+  const existing = Object.keys(split || {}).filter(i => ids.includes(i));
+  if (!existing.length) {
+    const even = {}; ids.forEach(i => even[i] = 0);
+    return normaliseSplit(Object.keys(even).reduce((a, k) => (a[k] = 1, a), {}), ids);
+  }
+  const each = 100 / ids.length;
+  const forExisting = 100 - each * missing.length;
+  const oldTotal = existing.reduce((a, i) => a + (Number(split[i]) || 0), 0) || 1;
+  const out = {};
+  let acc = 0;
+  const order = existing.concat(missing);
+  order.forEach((i, n) => {
+    if (n === order.length - 1) { out[i] = round2(100 - acc); return; }
+    const v = existing.includes(i) ? round2((Number(split[i]) || 0) / oldTotal * forExisting) : round2(each);
+    out[i] = v; acc = round2(acc + v);
+  });
+  return out;
+}
+
+/**
+ * The chips above the member toggles: the ledger's default, then any saved
+ * splits, then the way to save one. Hidden entirely on a small ledger with
+ * nothing set up, where the row would be pure noise — but a default counts as
+ * something set up, which is what finally gives a two-person 60/40 ledger a
+ * one-tap way back to its own baseline.
  */
 function presetChips(ledger, ids) {
   const list = presetsOf(ledger);
-  if (!list.length && ids.length < 3) return '';
+  const def = defaultSplitOf(ledger);
+  if (!list.length && !def && ids.length < 3) return '';
   return `<div class="chips mb">
+    ${def ? `<button class="chip ghost" data-preset="__default" title="The ledger's default split">⭐ Default</button>` : ''}
     ${list.map(p => `<button class="chip ghost" data-preset="${esc(p.id)}" title="${esc(p.name)}">
       🔖 ${esc(p.name)}</button>`).join('')}
     <button class="chip ghost" data-preset="__save">${list.length ? '＋ Save / manage' : '＋ Save this split'}</button>
   </div>`;
+}
+
+/**
+ * Type percentages against a fixed set of people. Deliberately simpler than the
+ * splitter inside the expense sheet — there is no amount to allocate and no
+ * money to show, so it is percentages, a running total, and a way to even them
+ * out. Used for the ledger default and for a repeating rule's split.
+ */
+function splitEditorSheet({ title, subtitle, ids, split, confirmLabel = 'Save', allowEven = true, onSave }) {
+  const st = { parts: {} };
+  const even = () => {
+    const each = Math.floor((100 / ids.length) * 100) / 100;
+    st.parts = {};
+    ids.forEach(i => st.parts[i] = each);
+    const drift = round2(100 - each * ids.length);
+    if (Math.abs(drift) > 0.001) st.parts[ids[0]] = round2(st.parts[ids[0]] + drift);
+  };
+  const seeded = normaliseSplit(split || {}, ids);
+  if (seeded && !notInDefault(seeded, ids).length) ids.forEach(i => st.parts[i] = seeded[i]);
+  else if (seeded) ids.forEach(i => st.parts[i] = seeded[i] !== undefined ? seeded[i] : 0);
+  else even();
+
+  const total = () => round2(ids.reduce((a, i) => a + (Number(st.parts[i]) || 0), 0));
+  const sheet = openSheet('<div id="se-body"></div>');
+
+  const draw = () => {
+    const t = total(), ok = Math.abs(t - 100) < 0.05;
+    $('#se-body', sheet).innerHTML = `
+      <h2>${esc(title)}</h2>
+      <p class="sheet-sub">${esc(subtitle)}</p>
+      ${ids.map(i => { const u = userById(i);
+        return `<div class="split-row">${avatar(u, 's')}
+          <div class="grow"><div class="ttl" style="font-size:14.5px">${esc(u.name)}</div></div>
+          <div class="pctbox"><input type="text" inputmode="decimal" data-part="${esc(i)}"
+            value="${esc(String(round2(Number(st.parts[i]) || 0)))}"><span>%</span></div></div>`;
+      }).join('')}
+      <div class="total-bar ${ok ? 'ok' : 'bad'}"><span>Total</span><span class="mono">${t}%</span></div>
+      ${allowEven ? `<button class="btn ghost block mt" data-x="even">Split evenly</button>` : ''}
+      <div class="flex mt">
+        <button class="btn ghost grow" data-x="cancel">Cancel</button>
+        <button class="btn grow" data-x="save">${esc(confirmLabel)}</button></div>`;
+  };
+
+  const read = () => $$('[data-part]', sheet).forEach(el => {
+    const v = parseFloat(el.value || '0');
+    st.parts[el.dataset.part] = isNaN(v) ? 0 : Math.max(0, v);
+  });
+
+  sheet.addEventListener('input', e => {
+    if (!e.target.dataset || !e.target.dataset.part) return;
+    read();
+    const t = total(), ok = Math.abs(t - 100) < 0.05;
+    const bar = $('.total-bar', sheet);
+    if (bar) { bar.className = 'total-bar ' + (ok ? 'ok' : 'bad'); bar.lastElementChild.textContent = t + '%'; }
+  });
+
+  sheet.addEventListener('click', e => {
+    const el = e.target.closest('[data-x]'); if (!el) return;
+    read();
+    if (el.dataset.x === 'cancel') return sheet.close();
+    if (el.dataset.x === 'even') { even(); haptic(); return draw(); }
+    if (el.dataset.x === 'save') {
+      if (Math.abs(total() - 100) > 0.05) return toast('The split has to add up to 100%');
+      const out = {};
+      ids.forEach(i => { const v = round2(Number(st.parts[i]) || 0); if (v > 0) out[i] = v; });
+      if (!Object.keys(out).length) return toast('Somebody has to have a share');
+      sheet.close();
+      onSave(out);
+    }
+  });
+
+  draw();
 }
 
 /**
@@ -1996,7 +2128,13 @@ function expenseSheet(ledger, existing) {
     repeat: 'never', repeatReview: false
   };
   const fromRule = /^rec_/.test(t.id || '');
-  if (!Object.keys(ed.parts).length) ids.forEach(i => ed.on[i] = true);
+  // A new expense starts from the ledger's default split when it has one, and
+  // evenly when it doesn't. An existing expense always starts from its own.
+  const ledgerDefault = existing ? null : normaliseSplit(defaultSplitOf(ledger) || {}, ids);
+  if (ledgerDefault) {
+    Object.keys(ledgerDefault).forEach(i => { ed.on[i] = true; ed.parts[i] = ledgerDefault[i]; });
+    ed.mode = isEvenSplit(ledgerDefault) ? 'equal' : 'percent';
+  } else if (!Object.keys(ed.parts).length) ids.forEach(i => ed.on[i] = true);
   else ids.forEach(i => { if (ed.parts[i] !== undefined) ed.on[i] = true; });
   if (existing && Object.keys(t.split).length) {
     const eq = 100 / Object.keys(t.split).length;
@@ -2156,6 +2294,11 @@ function expenseSheet(ledger, existing) {
         const split = {}; on.forEach(i => split[i] = round2(Number(ed.parts[i]) || 0));
         presetSheet(ledger, split, () => draw());
         return;
+      }
+      if (el.dataset.preset === '__default') {
+        const d = defaultSplitOf(ledger);
+        if (d) applyPreset({ name: 'the ledger default', split: d });
+        return draw();
       }
       const p = presetsOf(ledger).find(x => x.id === el.dataset.preset);
       if (p) applyPreset(p);
@@ -2378,11 +2521,43 @@ const EMOJIS = ['💸', '🏠', '✈️', '🏝️', '🍕', '🎿', '🚗', '�
 function ledgerSheet(existing) {
   const st = existing ? {
     id: existing.id, name: existing.name, emoji: existing.emoji, color: existing.color,
-    archived: existing.archived, members: memberIdsOf(existing.id).slice()
-  } : { name: '', emoji: '💸', color: '#6C5CE7', archived: false, members: [S.me.id] };
+    archived: existing.archived, members: memberIdsOf(existing.id).slice(),
+    defaultSplit: defaultSplitOf(existing)
+  } : { name: '', emoji: '💸', color: '#6C5CE7', archived: false, members: [S.me.id], defaultSplit: null };
 
   const PAL = ['#6C5CE7', '#00B894', '#FF7675', '#FDCB6E', '#0984E3', '#E84393', '#00CEC9', '#E17055'];
   const sheet = openSheet('<div id="lg-body"></div>');
+
+  /**
+   * How new expenses here start out. Computed against the members currently
+   * ticked above rather than the saved ones, so ticking somebody on surfaces
+   * the "they aren't in it" warning immediately instead of after a save.
+   */
+  const defaultSplitField = () => {
+    const live = normaliseSplit(st.defaultSplit || {}, st.members);
+    const missing = live ? notInDefault(live, st.members) : [];
+    return `<div class="field"><label>Default split</label>
+      <div class="seg mb">
+        <button data-def="even" class="${live ? '' : 'on'}">Evenly</button>
+        <button data-def="custom" class="${live ? 'on' : ''}">Custom</button></div>
+      ${live ? `<div class="card" style="padding:12px">${Object.keys(live).map(i =>
+        `<div class="row-item" style="padding:5px 0">${avatar(userById(i), 's')}
+          <div class="grow"><div class="ttl" style="font-size:14px">${esc(userById(i).name)}</div></div>
+          <div class="num mono" style="font-size:14px">${round2(live[i])}%</div></div>`).join('')}
+        <button class="btn ghost block mt" data-def="edit">✏️ Edit the split</button></div>` : ''}
+      ${missing.length ? `<div class="card mt reviewnote"><div class="flex">
+        <span style="font-size:22px">⚠️</span><div class="grow">
+          <div class="ttl">${esc(missing.map(i => userById(i).name).join(' and '))}
+            ${missing.length === 1 ? "isn't" : "aren't"} in it</div>
+          <div class="sub" style="white-space:normal">New expenses will leave them out
+            unless you say otherwise.</div></div></div>
+        <button class="btn ghost block mt" data-def="include">Include ${missing.length === 1 ? 'them' : 'everyone'} equally</button>
+      </div>` : ''}
+      <p class="hint">${live
+        ? 'New expenses and repeating rules start this way. Anyone can still change any of them.'
+        : 'New expenses divide evenly between whoever is in them.'}</p></div>`;
+  };
+
   const draw = () => {
     $('#lg-body', sheet).innerHTML = `
       <h2>${existing ? 'Edit ledger' : 'New ledger'}</h2>
@@ -2400,6 +2575,8 @@ function ledgerSheet(existing) {
       <div class="field"><label>Who's in it</label><div class="chips">${S.users.filter(u => u.active).map(u =>
         `<button class="chip ${st.members.includes(u.id) ? 'on' : ''}" data-mem="${esc(u.id)}">${avatar(u, 's')}${esc(u.name)}</button>`).join('')}</div>
         <p class="hint">Anyone here can add expenses and see the whole ledger.</p></div>
+
+      ${defaultSplitField()}
       ${existing ? `<div class="field"><label>Status</label>
         <button class="chip ${st.archived ? 'on' : ''}" data-arch="1">${st.archived ? '📦 Archived' : '✅ Active'}</button></div>` : ''}
       <div class="flex mt">
@@ -2408,10 +2585,28 @@ function ledgerSheet(existing) {
         <button class="btn grow" data-act="save-ledger">${existing ? 'Save' : 'Create'}</button></div>`;
   };
   sheet.addEventListener('click', async e => {
-    const el = e.target.closest('[data-emoji],[data-color],[data-mem],[data-arch],[data-act]'); if (!el) return;
+    const el = e.target.closest('[data-emoji],[data-color],[data-mem],[data-arch],[data-def],[data-act]'); if (!el) return;
     st.name = ($('#lg-name', sheet) || {}).value || st.name;
     if (el.dataset.emoji) st.emoji = el.dataset.emoji;
     else if (el.dataset.color) st.color = el.dataset.color;
+    else if (el.dataset.def) {
+      const op = el.dataset.def;
+      if (op === 'even') st.defaultSplit = null;
+      else if (op === 'include') st.defaultSplit = includeEqually(st.defaultSplit, st.members);
+      else {
+        if (!st.members.length) return toast('Pick who is in it first');
+        // Opens on top; the ledger form underneath keeps everything typed so far.
+        return splitEditorSheet({
+          title: 'Default split',
+          subtitle: `How new expenses on ${st.name || 'this ledger'} start out.`,
+          ids: st.members.slice(),
+          split: st.defaultSplit,
+          confirmLabel: 'Use this',
+          onSave: s => { st.defaultSplit = isEvenSplit(s) ? null : s; haptic(25); draw(); }
+        });
+      }
+      haptic();
+    }
     else if (el.dataset.mem) {
       const id = el.dataset.mem;
       st.members = st.members.includes(id) ? st.members.filter(x => x !== id) : st.members.concat(id);
@@ -2438,7 +2633,8 @@ function ledgerSheet(existing) {
         syncBadge('<span class="spinner"></span>Saving…');
         const r = await api('adminSaveLedger', {
           id: st.id, name: st.name.trim(), emoji: st.emoji, color: st.color,
-          archived: st.archived, memberIds: st.members
+          archived: st.archived, memberIds: st.members,
+          defaultSplit: st.defaultSplit || {}      // {} clears it back to evenly
         });
         syncBadge('');
         toast(existing ? 'Saved ✓' : 'Ledger created 🎉');

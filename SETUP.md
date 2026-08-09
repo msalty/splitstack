@@ -318,6 +318,48 @@ actually fire — see *"Nothing is repeating"* in [Troubleshooting](#troubleshoo
 
 ---
 
+## The default split
+
+Not every ledger divides evenly. A couple whose rent goes 60/40, a house where one room is
+bigger — retyping that on every expense is the sort of thing an app should do for you.
+
+**Settings ▸ Ledgers ▸ tap the ledger ▸ Default split.** Choose *Evenly* (what every ledger did
+before, and still the default) or *Custom*, then type the percentages once. From then on:
+
+- **New expenses open already set that way**, in `%` mode rather than Equal.
+- **Repeating rules inherit it** through the expense you create them from — so a repeating rent
+  divides the way the house does, without being told again.
+- A **⭐ Default** chip appears above the member toggles, so one tap puts it back after you've
+  changed something for a one-off.
+
+Anyone can still change any split on any expense. The default only decides where you start.
+
+**It's admin-only**, because it's a statement of policy about how the household divides things
+rather than a shortcut for whoever happens to be typing — [saved splits](#saved-splits) are the
+latter, and those stay open to every member.
+
+### When somebody joins
+
+A default that names Mike and Sam says nothing about Ada. Rather than guess, the ledger's settings
+say so plainly the moment you tick her on:
+
+> ⚠️ **Ada isn't in it** — new expenses will leave her out unless you say otherwise.
+> **Include her equally**
+
+That button folds her in without throwing away the ratio between the people already there: 40/30/30
+plus a fourth becomes 30/22.5/22.5/25, not a flat quarter each. Leaving her out is a legitimate
+choice too — a house where one person pays their share separately — which is exactly why the app
+surfaces it instead of deciding for you.
+
+Somebody who *leaves* needs no decision, so there's no prompt: they drop out of the default and the
+remaining shares rescale to total 100.
+
+> Changing the default never rewrites a repeating rule that already exists — a standing instruction
+> about money shouldn't move on its own. To bring one in line, open it under **🔁 Repeating** and
+> tap **⭐ Use the default**.
+
+---
+
 ## Saved splits
 
 A house whose rent is 40/30/30 shouldn't have to type 40/30/30 every month.
@@ -367,7 +409,7 @@ nothing to send to, and everything else in the app behaves identically.
 | Tab | What it holds |
 |---|---|
 | `Users` | One row per member: username, display name, role, salt, iterations, verifier, avatar, colour, email preference, and whether it's a person or not |
-| `Ledgers` | One row per ledger: name, sheet tab name, icon, colour, invite token, archived flag, saved splits |
+| `Ledgers` | One row per ledger: name, sheet tab name, icon, colour, invite token, archived flag, saved splits, default split |
 | `Members` | Which people belong to which ledgers |
 | `Recurring` | One row per repeating expense: the template, the schedule, and when it next fires |
 | `Config` | App name, currency, symbol, receipt folder id, email schedule |
