@@ -6,7 +6,7 @@
 
 /* Shown in Settings ▸ App & updates. Bump this and SW_BUILD in sw.js together
    whenever you re-upload the app. */
-const APP_BUILD = '2026-08-09.5';
+const APP_BUILD = '2026-08-09.6';
 
 /* ────────────────────────────────────────────────────────────────  helpers */
 const $  = (s, r = document) => r.querySelector(s);
@@ -212,15 +212,51 @@ const S = {
   config: { symbol: '$', currency: 'USD', appName: 'SplitStack' },
   cursors: {}, txns: {}, pending: {}, online: navigator.onLine,
   view: 'boot', params: {}, tab: 'feed', syncing: false, lastError: '', updateReady: false,
-  searchOpen: false, search: '', reviewOnly: false, apiVersion: 0
+  searchOpen: false, search: '', reviewOnly: false, apiVersion: 0,
+  filterWho: '', filterCat: '', seen: {}, seenAt: {}
 };
 
 /* The backend API this build needs. The Apps Script is pasted in by hand, so
    it can lag the PWA — which updates itself — by any amount. */
-const NEEDS_API = 6;
+const NEEDS_API = 7;
 
 /** A member who isn't a person: an employer, a kitty, someone not using the app. */
 const isEntity = u => u && u.kind === 'entity';
+
+/* ─────────────────────────────────────────────────────────────── paying */
+/**
+ * Actually moving the money was the one step in settling up the app couldn't
+ * help with: you left, opened Venmo, retyped the amount, came back and logged
+ * it. A handle turns that into a link with the amount already in it.
+ *
+ * These are all documented web endpoints rather than private URL schemes, so
+ * they work on a desktop browser and hand off to the installed app on a phone,
+ * instead of dead-ending on whichever half of that isn't true.
+ */
+const PAY_SERVICES = {
+  venmo:   { label: 'Venmo',    hint: 'your-username', prefix: '@',
+             url: (h, a, n) => `https://venmo.com/${encodeURIComponent(h.replace(/^@/, ''))}?txn=pay&amount=${a}&note=${encodeURIComponent(n)}` },
+  paypal:  { label: 'PayPal.me', hint: 'your-name', prefix: '',
+             url: (h, a) => `https://paypal.me/${encodeURIComponent(h.replace(/^@/, ''))}/${a}` },
+  cashapp: { label: 'Cash App', hint: 'your-cashtag', prefix: '$',
+             url: (h, a) => `https://cash.app/$${encodeURIComponent(h.replace(/^\$/, ''))}/${a}` },
+  revolut: { label: 'Revolut',  hint: 'your-revtag', prefix: '@',
+             url: h => `https://revolut.me/${encodeURIComponent(h.replace(/^@/, ''))}` },
+  upi:     { label: 'UPI',      hint: 'you@bank', prefix: '',
+             url: (h, a, n) => `upi://pay?pa=${encodeURIComponent(h)}&am=${a}&cu=${encodeURIComponent(S.config.currency || 'INR')}&tn=${encodeURIComponent(n)}` },
+  link:    { label: 'Any link', hint: 'https://…', prefix: '',
+             url: h => h }
+};
+
+const canBePaid = u => !!(u && u.payType && u.payHandle && PAY_SERVICES[u.payType]);
+
+/** The deep link to pay someone, or '' if we don't know how to reach them. */
+function payLink(user, amount, note) {
+  if (!canBePaid(user)) return '';
+  const svc = PAY_SERVICES[user.payType];
+  try { return svc.url(user.payHandle, round2(amount).toFixed(2), note || (S.config.appName || 'SplitStack')); }
+  catch (e) { return ''; }
+}
 
 const userById = id => S.users.find(u => u.id === id) || { id, name: 'Unknown', color: '#8A84A6', emoji: '👤', avatar: '' };
 const ledgerById = id => S.ledgers.find(l => l.id === id);
@@ -331,6 +367,7 @@ async function loadCache() {
   if (st) { S.me = st.me; S.users = st.users; S.ledgers = st.ledgers; S.members = st.members;
             S.recurring = st.recurring || []; S.config = st.config || S.config; }
   S.cursors = (await DB.get('cursors')) || {};
+  S.seen = (await DB.get('seen')) || {};
   for (const l of S.ledgers) {
     const rows = await DB.allTxns(l.id);
     S.txns[l.id] = rows.map(r => { const c = Object.assign({}, r); delete c.key; return c; });
@@ -729,6 +766,37 @@ function myBalance(ledgerId) {
 }
 
 /**
+ * Who owes whom once every ledger is taken together.
+ *
+ * The per-ledger view answers "where do I stand here"; it can't tell you that
+ * Ada owes you $621 on the beach house while you owe her $40 from the ski trip.
+ * This sums the settle-up suggestions the app already shows, per counterparty,
+ * so the totals agree with the buttons on each Balances tab rather than being
+ * a second opinion computed a different way.
+ *
+ * Ledgers stay separate for settling — you don't pay one debt with another
+ * house's money — so this reports, and each row links back to where the money
+ * actually is.
+ */
+function overallByPerson() {
+  const by = new Map();
+  S.ledgers.filter(l => !l.archived).forEach(l => {
+    simplify(balancesFor(l.id)).forEach(d => {
+      if (d.from !== S.me.id && d.to !== S.me.id) return;
+      const other = d.from === S.me.id ? d.to : d.from;
+      const signed = d.to === S.me.id ? d.amount : -d.amount;   // + means they owe me
+      const row = by.get(other) || { id: other, net: 0, parts: [] };
+      row.net = round2(row.net + signed);
+      row.parts.push({ ledgerId: l.id, amount: signed });
+      by.set(other, row);
+    });
+  });
+  return [...by.values()]
+    .filter(r => Math.abs(r.net) > 0.005)
+    .sort((a, b) => b.net - a.net);
+}
+
+/**
  * Drop anyone no longer on the ledger and rescale the rest back to 100.
  * Mirrors normaliseSplit() in Code.gs — a saved split or a repeating rule
  * outlives the housemate who moved out, and the percentages have to still add
@@ -849,16 +917,69 @@ function avStack(ids, max = 5) {
   return `<div class="avstack">${shown.map(id => avatar(userById(id), 's')).join('')}` +
     (ids.length > max ? `<div class="av s" style="background:var(--ink-3)">+${ids.length - max}</div>` : '') + '</div>';
 }
-const CATEGORIES = [
+/* The list every instance starts with. An admin can replace it under
+   Settings ▸ Categories; leaving it alone keeps these, so the defaults can
+   improve later without being frozen into anybody's spreadsheet. */
+const CATEGORIES_DEFAULT = [
   ['🍕', 'Food'], ['🛒', 'Groceries'], ['🏠', 'Home'], ['💡', 'Utilities'], ['🚗', 'Transport'],
   ['✈️', 'Travel'], ['🏨', 'Lodging'], ['🎟️', 'Fun'], ['🍺', 'Drinks'], ['🧻', 'Supplies'],
   ['🩺', 'Health'], ['🎁', 'Gifts'], ['🐶', 'Pets'], ['📶', 'Internet'], ['💼', 'Other']
 ];
-const catEmoji = c => (CATEGORIES.find(x => x[1] === c) || ['🧾'])[0];
+const categories = () => {
+  const c = S.config.categories;
+  return (c && c.length) ? c.map(x => [x.emoji || '🧾', x.name]) : CATEGORIES_DEFAULT;
+};
+/* Removing a category never rewrites history, so a row can name one that is no
+   longer offered. It keeps the name and falls back to a generic icon. */
+const catEmoji = c => (categories().find(x => x[1] === c) || ['🧾'])[0];
+const firstCategory = () => (categories()[0] || ['🧾', 'Other'])[1];
+
+/**
+ * Guess a category from what the expense is called.
+ *
+ * Purely local, and deliberately only ever *pre*-selects — the moment somebody
+ * taps a chip themselves the guessing stops for that expense, because being
+ * quietly overruled by a keyword list is worse than typing it yourself. Each
+ * entry maps to a default category name; an instance that has renamed its
+ * categories away from those simply gets no guesses, which is the right
+ * failure.
+ */
+const CATEGORY_HINTS = [
+  [/\b(uber|lyft|taxi|cab|train|bus|metro|tube|fuel|petrol|gas station|parking|toll|mot|car park)\b/, 'Transport'],
+  [/\b(tesco|sainsbury|aldi|lidl|asda|waitrose|costco|trader joe|whole foods|safeway|kroger|walmart|grocer|supermarket|market)\b/, 'Groceries'],
+  [/\b(pizza|sushi|burger|takeaway|takeout|deliveroo|ubereats|just ?eat|doordash|grubhub|restaurant|dinner|lunch|brunch|breakfast|cafe|coffee|starbucks|costa|bakery)\b/, 'Food'],
+  [/\b(beer|wine|pub|bar|cocktail|brewery|booze|drinks|spirits)\b/, 'Drinks'],
+  [/\b(rent|mortgage|deposit|landlord|cleaner|cleaning|repair|plumber|electrician|furniture|ikea|garden)\b/, 'Home'],
+  [/\b(electric|electricity|power|gas bill|water|council tax|heating|energy|utility|utilities)\b/, 'Utilities'],
+  [/\b(wifi|broadband|internet|fibre|fiber|router|mobile|phone bill|data plan)\b/, 'Internet'],
+  [/\b(flight|airline|airfare|ryanair|easyjet|baggage|passport|visa fee|rail pass)\b/, 'Travel'],
+  [/\b(hotel|airbnb|hostel|motel|cabin|lodge|booking\.com|check-?in)\b/, 'Lodging'],
+  [/\b(cinema|movie|concert|ticket|museum|festival|game|golf|ski|surf|bowling|netflix|spotify|gig)\b/, 'Fun'],
+  [/\b(pharmacy|chemist|doctor|dentist|medicine|prescription|hospital|clinic|optician)\b/, 'Health'],
+  [/\b(gift|present|birthday|christmas|anniversary|wedding)\b/, 'Gifts'],
+  [/\b(vet|dog|cat|puppy|kitten|pet food|litter|kennel|groomer)\b/, 'Pets'],
+  [/\b(toilet|loo roll|detergent|soap|batteries|bin bags|light ?bulb|cleaning supplies|paper towel)\b/, 'Supplies'],
+];
+
+function guessCategory(name) {
+  const s = String(name || '').toLowerCase().trim();
+  if (s.length < 3) return '';
+  const available = categories().map(c => c[1]);
+  for (const [re, cat] of CATEGORY_HINTS) {
+    if (re.test(s) && available.includes(cat)) return cat;
+  }
+  return '';
+}
 
 /* ─────────────────────────────────────────────────────────────────── router */
 /** Feed filters are per-visit, not sticky — leaving a ledger drops them. */
-const resetFeedView = () => { S.searchOpen = false; S.search = ''; S.reviewOnly = false; };
+const resetFeedView = () => {
+  S.searchOpen = false; S.search = ''; S.reviewOnly = false;
+  S.filterWho = ''; S.filterCat = '';
+  // Leaving a ledger releases the frozen "last time", so the next visit
+  // measures from where this one left off.
+  S.seenAt = {};
+};
 
 function go(view, params = {}, replace = false) {
   resetFeedView();
@@ -874,7 +995,7 @@ addEventListener('popstate', e => {
   if (e.state && e.state.view) { S.view = e.state.view; S.params = e.state.params || {}; render(); }
   else routeFromHash();
 });
-const HASH_VIEWS = ['home', 'profile', 'admin', 'ledger'];
+const HASH_VIEWS = ['home', 'people', 'profile', 'admin', 'ledger'];
 function routeFromHash() {
   resetFeedView();
   const parts = (location.hash || '').replace(/^#\/?/, '').split('/').filter(Boolean);
@@ -990,6 +1111,7 @@ function render() {
     case 'invite': html = viewInvite(); break;
     case 'home': html = viewHome(); break;
     case 'ledger': html = viewLedger(); break;
+    case 'people': html = viewPeople(); break;
     case 'profile': html = viewProfile(); break;
     case 'admin': html = viewAdmin(); break;
     default: html = viewBoot();
@@ -1204,18 +1326,22 @@ function viewHome() {
   active.forEach(l => total += myBalance(l.id));
   total = round2(total);
 
+  const people = overallByPerson();
   const summary = `
-    <div class="card" style="background:linear-gradient(140deg,var(--violet),var(--pink));border:0;color:#fff">
+    <button class="card" ${people.length ? 'data-act="people"' : ''} style="display:block;width:100%;text-align:left;
+        background:linear-gradient(140deg,var(--violet),var(--pink));border:0;color:#fff;${people.length ? 'cursor:pointer' : ''}">
       <div class="flex">
         ${avatar(S.me, 'l')}
         <div class="grow">
           <div style="font-size:13px;font-weight:800;opacity:.85;text-transform:uppercase;letter-spacing:.07em">
             ${total > 0.005 ? 'You are owed' : total < -0.005 ? 'You owe' : 'All square'}</div>
           <div style="font-size:34px;font-weight:900;letter-spacing:-.03em" class="mono">${money(total)}</div>
+          ${people.length ? `<div style="font-size:12.5px;font-weight:750;opacity:.85;margin-top:2px">
+            across ${people.length} ${people.length === 1 ? 'person' : 'people'} · tap to see who</div>` : ''}
         </div>
         <div style="font-size:44px">${total > 0.005 ? '🤑' : total < -0.005 ? '😬' : '😎'}</div>
       </div>
-    </div>`;
+    </button>`;
 
   const cards = active.map(l => {
     const bal = myBalance(l.id);
@@ -1278,6 +1404,9 @@ function viewLedger() {
   const l = ledgerById(S.params.id);
   if (!l) return shell('Ledger', `<div class="empty"><span class="big">🫥</span><h3>Not found</h3>
     <p>This ledger isn't in your list.</p><button class="btn mt" data-act="home">Back home</button></div>`, { back: true });
+  // Freezes the comparison point on the first render of a visit and advances
+  // the stored marker; both are guarded, so repainting costs nothing.
+  markLedgerSeen(l.id);
 
   const tabs = `<div class="seg mb">
     <button data-tab="feed" class="${S.tab === 'feed' ? 'on' : ''}">Expenses</button>
@@ -1331,14 +1460,40 @@ function txnHaystack(t) {
 }
 const txnMatches = (t, toks) => { const h = txnHaystack(t); return toks.every(k => h.includes(k)); };
 
-function searchBar() {
+function searchBar(l) {
   return `<div class="searchbar mb${S.search ? '' : ' blank'}">
     <span class="ico" aria-hidden="true">🔍</span>
     <input id="q-search" type="search" autocomplete="off" spellcheck="false" enterkeyhint="search"
       placeholder="Name or amount…" aria-label="Search expenses" value="${esc(S.search)}">
     <button class="clear" data-act="clear-search" title="Clear" aria-label="Clear search">✕</button>
+  </div>${filterBar(l)}`;
+}
+
+/**
+ * Who paid, and what it was filed under — the two questions the text box can't
+ * answer on its own ("what did Ben pay for?"). Both are ANDed with whatever is
+ * typed, so they narrow rather than replace it.
+ *
+ * Only the payers and categories actually present in this ledger are offered.
+ * A row of fifteen category chips when the ledger uses four is a worse control
+ * than none.
+ */
+function filterBar(l) {
+  const live = liveTxns(l.id).filter(t => t.type !== 'settlement');
+  const payers = [...new Set(live.map(t => t.paidBy))].filter(Boolean);
+  const cats = [...new Set(live.map(t => t.category).filter(Boolean))];
+  if (payers.length < 2 && cats.length < 2) return '';
+  return `<div class="filterbar mb">
+    ${payers.length > 1 ? payers.map(id => { const u = userById(id);
+      return `<button class="chip ${S.filterWho === id ? 'on' : ''}" data-who="${esc(id)}"
+        title="Paid by ${esc(u.name)}">${avatar(u, 's')}${esc(u.name.split(' ')[0])}</button>`; }).join('') : ''}
+    ${cats.length > 1 ? cats.map(c =>
+      `<button class="chip ${S.filterCat === c ? 'on' : ''}" data-cat-filter="${esc(c)}">
+        ${esc(catEmoji(c))} ${esc(c)}</button>`).join('') : ''}
   </div>`;
 }
+
+const filtersActive = () => !!(S.filterWho || S.filterCat);
 
 function reviewBanner(l) {
   const n = myReviews(l.id).length;
@@ -1359,8 +1514,51 @@ function ledgerFeed(l) {
   if (S.reviewOnly && !myReviews(l.id).length) S.reviewOnly = false;
   if (!liveTxns(l.id).length) return recurringCard(l) + `<div class="empty"><span class="big">🧾</span>
     <h3>Nothing here yet</h3><p>Tap the + to log the first expense.</p></div>`;
-  return reviewBanner(l) + recurringCard(l) + (S.searchOpen ? searchBar() : '') +
+  return reviewBanner(l) + sinceCard(l) + recurringCard(l) + (S.searchOpen ? searchBar(l) : '') +
     `<div id="feed-list">${feedList(l)}</div>`;
+}
+
+/* ──────────────────────────────────────────────── since you last looked */
+/**
+ * Rev is already a strictly increasing counter that delta sync runs on, so
+ * "what has changed since I last opened this" is free: remember the highest
+ * one seen on the way out, compare on the way in.
+ *
+ * The comparison point is frozen for the duration of a visit (S.seenAt) rather
+ * than read live, so the banner doesn't vanish from under you the moment the
+ * background sync writes the new cursor.
+ */
+const maxRevOf = ledgerId => (S.txns[ledgerId] || []).reduce((m, t) => Math.max(m, t.updatedAt || 0), 0);
+
+/** Entering a ledger: freeze what "last time" meant, then move the marker on. */
+function markLedgerSeen(ledgerId) {
+  if (!ledgerId) return;
+  if (S.seenAt[ledgerId] === undefined) S.seenAt[ledgerId] = Number(S.seen[ledgerId] || 0);
+  const now = maxRevOf(ledgerId);
+  if (now > Number(S.seen[ledgerId] || 0)) {
+    S.seen = Object.assign({}, S.seen, { [ledgerId]: now });
+    DB.set('seen', S.seen);
+  }
+}
+
+/** Entries that landed since the visit before this one — mine excluded. */
+function newSinceSeen(ledgerId) {
+  const since = Number(S.seenAt[ledgerId] || 0);
+  if (!since) return [];                          // first ever visit: everything is "new", so nothing is
+  return (S.txns[ledgerId] || []).filter(t =>
+    (t.updatedAt || 0) > since && !t.deleted && t.enteredBy !== S.me.id);
+}
+
+function sinceCard(l) {
+  const fresh = newSinceSeen(l.id);
+  if (!fresh.length || S.searchOpen || S.reviewOnly) return '';
+  const who = [...new Set(fresh.map(t => t.enteredBy))].map(i => userById(i).name.split(' ')[0]);
+  const spent = round2(fresh.reduce((a, t) => a + (t.type === 'settlement' ? 0 : t.amount), 0));
+  return `<div class="card mb" style="border-color:var(--violet)">
+    <div class="flex"><span style="font-size:24px">✨</span>
+      <div class="grow"><div class="ttl">${fresh.length} new since you last looked</div>
+        <div class="sub">${esc(who.slice(0, 3).join(', '))}${who.length > 3 ? ' and others' : ''}${spent ? ' · ' + esc(money(spent)) : ''}</div></div>
+    </div></div>`;
 }
 
 /**
@@ -1552,16 +1750,19 @@ function feedList(l) {
   const toks = S.searchOpen ? prepQuery(S.search) : null;
   let all = liveTxns(l.id);
   if (S.reviewOnly) all = all.filter(needsMyReview);
+  if (S.searchOpen && S.filterWho) all = all.filter(t => t.paidBy === S.filterWho);
+  if (S.searchOpen && S.filterCat) all = all.filter(t => t.category === S.filterCat);
   const txns = toks ? all.filter(t => txnMatches(t, toks)) : all;
 
   if (!txns.length) return `<div class="empty"><span class="big">🔍</span><h3>No matches</h3>
-    <p>Nothing here is called that, or costs that.</p></div>`;
+    <p>${filtersActive() ? 'Nothing matches those filters.' : 'Nothing here is called that, or costs that.'}</p>
+    ${filtersActive() ? '<button class="btn ghost mt" data-act="clear-filters">Clear the filters</button>' : ''}</div>`;
 
   const groups = {};
   txns.forEach(t => (groups[t.date] = groups[t.date] || []).push(t));
 
   const spent = round2(txns.reduce((a, t) => a + (t.type === 'settlement' ? 0 : t.amount), 0));
-  const tally = toks ? `<div class="section-title" style="margin-top:2px">
+  const tally = (toks || filtersActive()) ? `<div class="section-title" style="margin-top:2px">
     ${txns.length} match${txns.length === 1 ? '' : 'es'}${spent ? ' · ' + money(spent) : ''}</div>` : '';
 
   return tally + Object.entries(groups).map(([date, list]) => `
@@ -1643,12 +1844,17 @@ function ledgerBalances(l) {
     // only when there is an address to send it to.
     const canNudge = d.to === S.me.id && !isEntity(f) && f.notify !== false && !!f.email
       && S.apiVersion >= NEEDS_API;
+    // Only offered on the row where I'm the one paying, and only when the
+    // person being paid has said how to reach them.
+    const iPay = d.from === S.me.id && canBePaid(t);
     return `<div class="row-item">
       ${avatar(f, 'm')}<div style="font-size:18px;color:var(--ink-3)">→</div>${avatar(t, 'm')}
       <div class="grow"><div class="ttl">${money(d.amount)}</div>
         <div class="sub">${esc(f.name)} pays ${esc(t.name)}</div></div>
       ${canNudge ? `<button class="btn sm ghost" data-nudge="${esc(d.from)}" title="Email a reminder">👋</button>` : ''}
-      <button class="btn sm ${involvesMe ? 'good' : 'ghost'}" data-settle='${esc(JSON.stringify(d))}'>Settle</button></div>`;
+      ${iPay ? `<button class="btn sm good" data-pay='${esc(JSON.stringify(d))}'
+        title="Pay with ${esc(PAY_SERVICES[t.payType].label)}">${esc(PAY_SERVICES[t.payType].label === 'Any link' ? 'Pay' : PAY_SERVICES[t.payType].label)}</button>` : ''}
+      <button class="btn sm ${involvesMe && !iPay ? 'good' : 'ghost'}" data-settle='${esc(JSON.stringify(d))}'>Settle</button></div>`;
   }).join('') : `<div class="empty" style="padding:26px"><span class="big" style="font-size:44px">🎉</span>
       <h3>Everyone's square</h3><p>Nothing owed in either direction.</p></div>`;
 
@@ -1754,6 +1960,56 @@ function ledgerCharts(l) {
   </div>`;
 }
 
+/* ─────────────────────────────────────────────────── everything at once */
+/**
+ * One row per person, netted across every active ledger, each opening out into
+ * the ledgers that make it up. Nothing is settled from here on purpose: a debt
+ * lives on a ledger, and paying one house's balance with another's would make
+ * both wrong.
+ */
+function viewPeople() {
+  const people = overallByPerson();
+  if (!people.length) return shell('Everyone', `<div class="empty"><span class="big">🎉</span>
+    <h3>Nothing outstanding</h3><p>You're square with everybody, everywhere.</p></div>`, { back: true });
+
+  const owedToMe = round2(people.filter(p => p.net > 0).reduce((a, p) => a + p.net, 0));
+  const iOwe = round2(-people.filter(p => p.net < 0).reduce((a, p) => a + p.net, 0));
+
+  return shell('Everyone', `
+    <div class="card"><div class="flex" style="gap:10px">
+      <div class="stat"><b class="mono" style="color:var(--good)">${money(owedToMe)}</b><span>owed to you</span></div>
+      <div class="stat"><b class="mono" style="color:var(--bad)">${money(iOwe)}</b><span>you owe</span></div>
+    </div></div>
+
+    ${people.map(p => {
+      const u = userById(p.id);
+      const them = p.net > 0;
+      return `<div class="card">
+        <div class="row-item" style="padding-top:0">${avatar(u, 'm')}
+          <div class="grow"><div class="ttl">${esc(u.name)}</div>
+            <div class="sub">${them ? 'owes you' : 'you owe them'}</div></div>
+          <div class="num ${them ? 'pos' : 'neg'} mono">${money(Math.abs(p.net))}</div></div>
+        ${p.parts.length > 1 ? p.parts.slice().sort((a, b) => b.amount - a.amount).map(part => {
+          const l = ledgerById(part.ledgerId);
+          if (!l) return '';
+          return `<div class="row-item tap" data-ledger="${esc(l.id)}" style="padding:7px 0">
+            <div class="av s" style="background:${esc(l.color)}">${esc(l.emoji)}</div>
+            <div class="grow"><div class="sub">${esc(l.name)}</div></div>
+            <div class="num ${part.amount > 0 ? 'pos' : 'neg'} mono" style="font-size:14px">
+              ${part.amount > 0 ? '+' : '−'}${money(Math.abs(part.amount))}</div></div>`;
+        }).join('')
+        : `<div class="row-item tap" data-ledger="${esc(p.parts[0].ledgerId)}" style="padding:7px 0">
+            <div class="av s" style="background:${esc((ledgerById(p.parts[0].ledgerId) || {}).color || '#888')}">
+              ${esc((ledgerById(p.parts[0].ledgerId) || {}).emoji || '💸')}</div>
+            <div class="grow"><div class="sub">on ${esc((ledgerById(p.parts[0].ledgerId) || {}).name || '—')}</div></div>
+            <div>›</div></div>`}
+      </div>`;
+    }).join('')}
+
+    <p class="hint center mt">Debts live on their own ledger — open one to settle up there.</p>`,
+    { back: true });
+}
+
 /* ─────────────────────────────────────────────────────────────── profile */
 function viewProfile() {
   const u = S.me;
@@ -1792,6 +2048,23 @@ function viewProfile() {
       <p class="hint">${u.email
         ? 'Summaries follow the schedule your admin sets. Nudges arrive when somebody you owe sends one.'
         : "Without an address there's nothing to send to — everything else works exactly the same."}</p>
+    </div>
+
+    <div class="section-title">Getting paid</div>
+    <div class="card">
+      <div class="field"><label>Pay me with</label>
+        <div class="chips">${Object.entries(PAY_SERVICES).map(([k, s]) =>
+          `<button class="chip ${u.payType === k ? 'on' : ''}" data-pt="${k}">${esc(s.label)}</button>`).join('')}
+          ${u.payType ? `<button class="chip ghost" data-pt="">✕ None</button>` : ''}</div></div>
+      ${u.payType ? `<div class="field"><label>${esc(PAY_SERVICES[u.payType].label)} ${u.payType === 'link' ? 'URL' : 'handle'}</label>
+        <input class="input" id="p-handle" inputmode="${u.payType === 'link' ? 'url' : 'text'}"
+          autocapitalize="off" autocorrect="off" spellcheck="false"
+          placeholder="${esc(PAY_SERVICES[u.payType].hint)}" value="${esc(u.payHandle || '')}"></div>
+        <button class="btn block" data-act="save-pay">Save</button>` : ''}
+      <p class="hint">${u.payHandle
+        ? "Anyone who owes you sees a one-tap button that opens " + esc(PAY_SERVICES[u.payType].label) +
+          " with the amount already filled in. It never moves money by itself — you both still confirm."
+        : "Add one and anybody settling up with you gets a button that opens it with the amount filled in."}</p>
     </div>
 
     <div class="section-title">App &amp; updates</div>
@@ -1862,6 +2135,14 @@ function viewAdmin() {
         <div class="grow"><div class="ttl">Brute-force protection</div>
           <div class="sub">8 wrong passwords locks an account for 15 minutes</div></div>
         <span class="pill ok">ON</span></div>
+    </div>
+
+    <div class="section-title">Categories</div>
+    <div class="card">
+      <div class="row-item tap" data-act="categories"><div class="av m" style="background:var(--sun)">🏷️</div>
+        <div class="grow"><div class="ttl">Expense categories</div>
+          <div class="sub">${categories().length} in use${S.config.categories ? '' : ' · the built-in set'}</div></div>
+        <div>›</div></div>
     </div>
 
     <div class="section-title">Notifications</div>
@@ -2111,12 +2392,12 @@ function presetSheet(ledger, currentSplit, onDone) {
 function expenseSheet(ledger, existing) {
   const ids = memberIdsOf(ledger.id);
   const t = existing || {
-    id: uuid(), type: 'expense', date: todayISO(), name: '', category: 'Food', amount: 0,
+    id: uuid(), type: 'expense', date: todayISO(), name: '', category: firstCategory(), amount: 0,
     paidBy: S.me.id, enteredBy: S.me.id, notes: '', split: {}, receiptId: ''
   };
   // editor state
   const ed = {
-    id: t.id, date: t.date, name: t.name, category: t.category || 'Food',
+    id: t.id, date: t.date, name: t.name, category: t.category || firstCategory(),
     amount: t.amount || 0, paidBy: t.paidBy || S.me.id, notes: t.notes || '',
     mode: 'equal', receiptId: t.receiptId || '', receiptLocal: t._receiptLocal || '',
     receiptPreview: '',
@@ -2182,7 +2463,7 @@ function expenseSheet(ledger, existing) {
         <input class="input" id="f-name" placeholder="Pizza night" value="${esc(ed.name)}"></div>
 
       <div class="field"><label>Category</label>
-        <div class="chips">${CATEGORIES.map(([e, n]) =>
+        <div class="chips" id="cat-chips">${categories().map(([e, n]) =>
           `<button class="chip ${ed.category === n ? 'on' : ''}" data-cat="${esc(n)}">${e} ${esc(n)}</button>`).join('')}</div></div>
 
       <div class="field"><label>Date</label><input class="input" id="f-date" type="date" value="${esc(ed.date)}"></div>
@@ -2283,7 +2564,9 @@ function expenseSheet(ledger, existing) {
     const el = e.target.closest('[data-cat],[data-paid],[data-tog],[data-mode],[data-lock],[data-rep],[data-repreview],[data-preset],[data-act]');
     if (!el) return;
     readFields();
-    if (el.dataset.cat) { ed.category = el.dataset.cat; haptic(); }
+    // Picking one yourself ends the guessing for this expense — being quietly
+    // overruled by a keyword list is worse than typing it in.
+    if (el.dataset.cat) { ed.category = el.dataset.cat; ed.catTouched = true; haptic(); }
     else if (el.dataset.rep) { ed.repeat = el.dataset.rep; haptic(); }
     else if (el.dataset.repreview) { ed.repeatReview = !ed.repeatReview; haptic(); }
     else if (el.dataset.preset) {
@@ -2392,6 +2675,18 @@ function expenseSheet(ledger, existing) {
 
   sheet.addEventListener('input', e => {
     const t = e.target;
+    /* Guess the category as they type the name, repainting only the chip row
+       so the caret never leaves the field they're in. */
+    if (t.id === 'f-name' && !ed.catTouched && !existing) {
+      const guess = guessCategory(t.value);
+      if (guess && guess !== ed.category) {
+        ed.category = guess;
+        const box = $('#cat-chips', sheet);
+        if (box) $$('[data-cat]', box).forEach(c =>
+          c.classList.toggle('on', c.dataset.cat === guess));
+      }
+      return;
+    }
     if (t.id === 'f-amount') {
       const a = parseFloat(t.value || '0'); ed.amount = isNaN(a) ? 0 : Math.max(0, a);
       const sh = liveShares();
@@ -2427,19 +2722,24 @@ function expenseSheet(ledger, existing) {
 }
 
 /* ─────────────────────────────────────────────────────────── settle sheet */
-function settleSheet(ledger, preset) {
+function settleSheet(ledger, preset, opts = {}) {
   const ids = memberIdsOf(ledger.id);
+  const payee = preset ? userById(preset.to) : null;
   const st = {
     from: preset ? preset.from : S.me.id,
     to: preset ? preset.to : (ids.find(i => i !== S.me.id) || ids[0]),
     amount: preset ? preset.amount : 0,
-    date: todayISO(), notes: ''
+    date: todayISO(),
+    // Arriving here straight from a payment link, the method is already known.
+    notes: opts.paid && payee && PAY_SERVICES[payee.payType] ? PAY_SERVICES[payee.payType].label : ''
   };
   const sheet = openSheet('<div id="st-body"></div>');
   const draw = () => {
     $('#st-body', sheet).innerHTML = `
       <h2>Record a payment 🤝</h2>
-      <p class="sheet-sub">Someone handed over real money — log it so balances update.</p>
+      <p class="sheet-sub">${opts.paid
+        ? 'Once it has gone through, record it here so the balances catch up.'
+        : 'Someone handed over real money — log it so balances update.'}</p>
       <div class="amount-wrap mb"><span class="cur">${esc(S.config.symbol || '$')}</span>
         <input id="f-amount" type="text" inputmode="decimal" placeholder="0.00" value="${st.amount ? esc(String(st.amount)) : ''}"></div>
       <div class="field"><label>Who paid</label><div class="chips">${ids.map(i => { const u = userById(i);
@@ -2478,6 +2778,79 @@ function settleSheet(ledger, preset) {
     }
     draw();
   });
+  draw();
+}
+
+/* ────────────────────────────────────────────────────── categories sheet */
+/**
+ * Rename, remove and add the chips people pick from. Categories are stored on
+ * transactions as plain strings, so removing one never rewrites history — old
+ * rows keep the name and simply lose their icon.
+ */
+function categorySheet() {
+  const st = { list: categories().map(([emoji, name]) => ({ emoji, name })) };
+  const sheet = openSheet('<div id="ct-body"></div>');
+
+  const draw = () => {
+    $('#ct-body', sheet).innerHTML = `
+      <h2>Expense categories</h2>
+      <p class="sheet-sub">What everyone picks from when they log something.</p>
+      <div class="card mb">${st.list.map((c, i) => `<div class="row-item" style="padding:6px 0">
+        <input class="input" data-cemoji="${i}" value="${esc(c.emoji)}" maxlength="4"
+          style="width:58px;text-align:center;flex:0 0 auto">
+        <input class="input grow" data-cname="${i}" value="${esc(c.name)}" maxlength="24">
+        <button class="iconbtn" data-cdel="${i}" title="Remove">🗑</button></div>`).join('')
+        || '<p class="hint">None left — add at least one.</p>'}
+        <button class="btn ghost block mt" data-x="add">+ Add a category</button></div>
+      <p class="hint">Removing one leaves past expenses alone — they keep the name they were
+        filed under. ${S.config.categories ? '' : "You're on the built-in set; saving makes your own copy."}</p>
+      <div class="flex mt">
+        <button class="btn ghost" data-x="reset" title="Back to the built-in list">↩️</button>
+        <button class="btn ghost grow" data-x="cancel">Cancel</button>
+        <button class="btn grow" data-x="save">Save</button></div>`;
+  };
+
+  const read = () => {
+    $$('[data-cname]', sheet).forEach(el => { const i = +el.dataset.cname; if (st.list[i]) st.list[i].name = el.value; });
+    $$('[data-cemoji]', sheet).forEach(el => { const i = +el.dataset.cemoji; if (st.list[i]) st.list[i].emoji = el.value; });
+  };
+
+  sheet.addEventListener('click', async e => {
+    const el = e.target.closest('[data-x],[data-cdel]'); if (!el) return;
+    read();
+    if (el.dataset.cdel !== undefined) { st.list.splice(+el.dataset.cdel, 1); haptic(); return draw(); }
+    if (el.dataset.x === 'cancel') return sheet.close();
+    if (el.dataset.x === 'add') {
+      if (st.list.length >= 40) return toast('Forty is the limit');
+      st.list.push({ emoji: '🧾', name: '' }); return draw();
+    }
+    if (el.dataset.x === 'reset') {
+      if (!await confirmSheet('Back to the built-in list?',
+        'Your own list is discarded. Past expenses keep whatever they were filed under.',
+        'Use the built-in list', false)) return;
+      try {
+        await api('adminSetConfig', { categories: CATEGORIES_DEFAULT.map(([emoji, name]) => ({ emoji, name })) });
+        // The server stores the list it is given; clearing locally is what makes
+        // "no override" visible until the next sync confirms it.
+        S.config = Object.assign({}, S.config, { categories: null });
+        sheet.close(); toast('Back to the built-in list'); await sync({ silent: true }); render();
+      } catch (err) { toast(errMsg(err)); }
+      return;
+    }
+    if (el.dataset.x === 'save') {
+      const list = st.list.map(c => ({ emoji: c.emoji.trim() || '🧾', name: c.name.trim() })).filter(c => c.name);
+      if (!list.length) return toast('Keep at least one category');
+      const names = list.map(c => c.name.toLowerCase());
+      if (new Set(names).size !== names.length) return toast('Two categories share a name');
+      try {
+        await api('adminSetConfig', { categories: list });
+        S.config = Object.assign({}, S.config, { categories: list });
+        sheet.close(); toast('Saved ✓'); await sync({ silent: true }); render();
+      } catch (err) { toast(errMsg(err)); }
+      return;
+    }
+  });
+
   draw();
 }
 
@@ -3041,6 +3414,22 @@ function wire() {
     const tabBtn = t.closest('[data-tab]');
     if (tabBtn) { S.tab = tabBtn.dataset.tab; haptic(); return render(); }
 
+    const who = t.closest('[data-who]');
+    if (who) { S.filterWho = S.filterWho === who.dataset.who ? '' : who.dataset.who; haptic(); return render(); }
+
+    const cf = t.closest('[data-cat-filter]');
+    if (cf) { S.filterCat = S.filterCat === cf.dataset.catFilter ? '' : cf.dataset.catFilter; haptic(); return render(); }
+
+    const pt = t.closest('[data-pt]');
+    if (pt) {
+      const type = pt.dataset.pt;
+      if (!type) {
+        try { const r = await api('setProfile', { payType: '', payHandle: '' }); S.me = r.me; toast('Removed'); }
+        catch (err) { return toast(errMsg(err)); }
+      } else S.me = Object.assign({}, S.me, { payType: type });
+      haptic(); return render();
+    }
+
     const dg = t.closest('[data-digest]');
     if (dg) {
       const mode = dg.dataset.digest;
@@ -3067,6 +3456,20 @@ function wire() {
 
     const ndg = t.closest('[data-nudge]');
     if (ndg) { nudgeSheet(ledgerById(S.params.id), userById(ndg.dataset.nudge)); return; }
+
+    const pay = t.closest('[data-pay]');
+    if (pay) {
+      const d = JSON.parse(pay.dataset.pay);
+      const l = ledgerById(S.params.id), to = userById(d.to);
+      const url = payLink(to, d.amount, `${l.emoji} ${l.name}`);
+      if (!url) return toast("Couldn't build a payment link for them");
+      // Opened straight from the tap so the popup blocker doesn't eat it, then
+      // the settle sheet is waiting behind it to log what just happened.
+      window.open(url, '_blank', 'noopener');
+      haptic(20);
+      settleSheet(l, d, { paid: true });
+      return;
+    }
 
     const usr = t.closest('[data-user]');
     if (usr) { userSheet(S.users.find(u => u.id === usr.dataset.user)); return; }
@@ -3111,6 +3514,7 @@ async function handle(act, el) {
     case 'back': return history.length > 1 ? history.back() : go('home', {}, true);
     case 'home': return go('home', {}, true);
     case 'profile': return go('profile');
+    case 'people': return go('people');
     case 'admin': return go('admin');
     case 'sync': haptic(); return sync({ full: false });
     case 'check-update': {
@@ -3189,12 +3593,13 @@ async function handle(act, el) {
     case 'share-invite': return inviteSheet(ledgerById(S.params.id));
     case 'toggle-search': {
       S.searchOpen = !S.searchOpen;
-      if (!S.searchOpen) S.search = '';
+      if (!S.searchOpen) { S.search = ''; S.filterWho = ''; S.filterCat = ''; }
       haptic(); render();
       const box = $('#q-search'); if (box) box.focus();
       return;
     }
     case 'toggle-reviews': { S.reviewOnly = !S.reviewOnly; haptic(); return render(); }
+    case 'clear-filters': { S.filterWho = ''; S.filterCat = ''; haptic(); return render(); }
     case 'clear-search': {
       S.search = '';
       const box = $('#q-search');
@@ -3216,6 +3621,17 @@ async function handle(act, el) {
         S.me = r.me;
         await applyState({ me: S.me, users: S.users, ledgers: S.ledgers, members: S.members, config: S.config });
         toast('Saved ✓'); render();
+      } catch (err) { toast(errMsg(err)); }
+      return;
+    }
+    case 'categories': return categorySheet();
+    case 'save-pay': {
+      const handle = ($('#p-handle') || {}).value.trim();
+      try {
+        const r = await api('setProfile', { payType: S.me.payType || '', payHandle: handle });
+        S.me = r.me;
+        await applyState({ me: S.me, users: S.users, ledgers: S.ledgers, members: S.members, config: S.config });
+        toast(handle ? 'Saved ✓' : 'Removed'); render();
       } catch (err) { toast(errMsg(err)); }
       return;
     }

@@ -28,7 +28,7 @@ var TAB_RECURRING = 'Recurring';
 
 var USER_COLS   = ['UserId','Username','DisplayName','Email','Role','Salt','Iterations',
                    'Verifier','TokenVer','Avatar','Color','Emoji','Active','Notify','Kind',
-                   'CreatedAt','UpdatedAt'];
+                   'PayType','PayHandle','CreatedAt','UpdatedAt'];
 var LEDGER_COLS = ['LedgerId','Name','SheetName','Emoji','Color','InviteToken','Archived',
                    'Presets','DefaultSplit','CreatedBy','CreatedAt','UpdatedAt'];
 var MEMBER_COLS = ['LedgerId','UserId','JoinedAt'];
@@ -41,7 +41,7 @@ var RECUR_COLS  = ['RuleId','LedgerId','Name','Category','Amount','PaidBy','Spli
 
 var PBKDF2_ITERATIONS = 210000;
 var SESSION_DAYS      = 60;
-var API_VERSION       = 6;
+var API_VERSION       = 7;
 
 /* Recurring rules never run more than this many periods in one pass. A script
    whose trigger was off for a year should not wake up and post 365 rows. */
@@ -305,7 +305,7 @@ function nextRev(count) {
  * Script Properties — one cheap property read per request, and the actual
  * migration exactly once ever.
  */
-var SCHEMA_VERSION = '6';
+var SCHEMA_VERSION = '7';
 
 function ensureSchema() {
   var props = PropertiesService.getScriptProperties();
@@ -367,7 +367,37 @@ function setConfig(p) {
     if (DIGEST_MODES.indexOf(p.digest) === -1) throw new Error('BAD_DIGEST_MODE');
     setCfg('digest', p.digest);
   }
+  if (p.categories !== undefined) setCfg('categories', encodeCategories(p.categories));
   return { ok: true };
+}
+
+/**
+ * The expense categories this instance offers. Blank means "use the built-in
+ * list", which is what every instance did before this was configurable — the
+ * defaults live in the client, so an empty setting keeps them there rather
+ * than freezing today's list into the spreadsheet.
+ *
+ * Category names are stored on transactions as plain strings, so removing one
+ * never rewrites history: old rows keep the name and fall back to a generic
+ * icon.
+ */
+var CATEGORY_MAX = 40;
+
+function encodeCategories(list) {
+  if (!list || !list.length) return '';
+  var seen = {};
+  var out = [];
+  list.slice(0, CATEGORY_MAX).forEach(function (c) {
+    var emoji = String((c && c.emoji) || '').trim().slice(0, 4);
+    var name  = String((c && c.name)  || '').trim().slice(0, 24);
+    if (!name) return;
+    var key = name.toLowerCase();
+    if (seen[key]) return;                       // two chips with one name is a trap
+    seen[key] = 1;
+    out.push({ emoji: emoji || '🧾', name: name });
+  });
+  if (!out.length) throw new Error('CATEGORIES_REQUIRED');
+  return JSON.stringify(out);
 }
 
 var _pepper = null;
@@ -901,9 +931,17 @@ function publicUser(u) {
     color: u.Color || pickColor(0), emoji: u.Emoji || '', active: u.Active !== false && u.Active !== 'FALSE',
     notify: notifyOn(u),
     kind: isEntity(u) ? 'entity' : 'person',
+    payType: u.PayType || '', payHandle: u.PayHandle || '',
     hasPassword: !!u.Verifier
   };
 }
+
+/* Where money can actually be sent. The app turns these into a deep link that
+   opens the relevant app with the amount already filled in — the one step in
+   settling up that SplitStack could never help with before.
+
+   'link' is the escape hatch: anything else, pasted as a plain https URL. */
+var PAY_TYPES = ['venmo', 'paypal', 'cashapp', 'revolut', 'upi', 'link'];
 
 /** Email is opt-out: a blank cell on an existing sheet means "yes, please". */
 function notifyOn(u) { return String(u.Notify == null ? '' : u.Notify).toLowerCase() !== 'off'; }
@@ -927,6 +965,18 @@ function setProfile(me, p) {
       patch.Email = email;
     }
     if (p.notify !== undefined) patch.Notify = p.notify ? 'on' : 'off';
+    if (p.payType !== undefined || p.payHandle !== undefined) {
+      var type = String(p.payType || '').toLowerCase();
+      var handle = String(p.payHandle || '').trim().slice(0, 200);
+      if (!handle) { type = ''; handle = ''; }               // clearing one clears both
+      else if (PAY_TYPES.indexOf(type) === -1) throw new Error('BAD_PAY_TYPE');
+      // A free-form link is the only value that becomes a URL verbatim, so it
+      // is the only one that has to be checked. The rest are interpolated into
+      // a scheme the client controls.
+      else if (type === 'link' && !/^https:\/\/[^\s"'<>]{4,200}$/.test(handle)) throw new Error('BAD_PAY_LINK');
+      patch.PayType = type;
+      patch.PayHandle = handle;
+    }
     updateRow(TAB_USERS, USER_COLS, me.__row, patch);
     return { me: publicUser(findUser('UserId', me.UserId)) };
   });
@@ -1344,6 +1394,7 @@ function bootstrap(me) {
     config:   { currency: cfg('currency', 'USD'), symbol: cfg('currencySymbol', '$'),
                 appName: cfg('appName', 'SplitStack'), gated: gateEnabled(),
                 digest: cfg('digest', 'weekly'),
+                categories: parseJson(cfg('categories', '')) || null,
                 // Repeating expenses and email both ride on the daily triggers.
                 // The app says so plainly rather than looking broken.
                 jobs: jobsInstalled() },

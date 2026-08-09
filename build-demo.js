@@ -44,13 +44,18 @@ const stub = `
   try { Object.defineProperty(navigator,'serviceWorker',{configurable:true,value:undefined}); } catch(e){}
 
   const U=(id,n,role,color,emoji,email)=>({id,username:n.toLowerCase(),name:n,email:email||'',role:role||'member',
-    avatar:'',color,emoji:emoji||'',active:true,notify:true,kind:'person',hasPassword:true});
+    avatar:'',color,emoji:emoji||'',active:true,notify:true,kind:'person',
+    payType:'',payHandle:'',hasPassword:true});
   /* A member who isn't a person: holds a balance, can't log in, never emailed. */
   const E=(id,n,color,emoji)=>({id,username:n.toLowerCase().replace(/[^a-z0-9]+/g,'-'),name:n,email:'',
     role:'member',avatar:'',color,emoji,active:true,notify:false,kind:'entity',hasPassword:false});
   const users=[U('u1','Mike','admin','#6C5CE7','👑','mike@example.com'),U('u2','Sam',null,'#00B894','🦊','sam@example.com'),
                U('u3','Ada',null,'#E84393','🐙','ada@example.com'),U('u4','Ben',null,'#0984E3','🐢','ben@example.com'),
                E('e1','House Kitty','#E17055','🏺')];
+  /* somewhere to actually send the money */
+  users[0].payType='venmo';   users[0].payHandle='mike-demo';
+  users[2].payType='paypal';  users[2].payHandle='adademo';
+  users[3].payType='cashapp'; users[3].payHandle='bendemo';
   const ledgers=[
     {id:'l1',name:'Beach House',emoji:'🏝️',color:'#00B894',invite:'demoinvite1',archived:false,presets:[],createdAt:'2026-06-01T00:00:00Z'},
     /* a house that always divides 40/30/30 — the case a default split exists for */
@@ -118,14 +123,14 @@ const stub = `
     ]
   };
   const state={me:users[0],users,ledgers,members,recurring,
-    config:{currency:'USD',symbol:'$',appName:'SplitStack',digest:'weekly',jobs:true},
+    config:{currency:'USD',symbol:'$',appName:'SplitStack',digest:'weekly',jobs:true,categories:null},
     serverTime:new Date().toISOString()};
 
   window.fetch = async function(url, opts){
     const {action,payload}=JSON.parse(opts.body);
     await new Promise(r=>setTimeout(r,180));      // a little latency, for realism
     let d;
-    if(action==='ping') d={version:6,ready:true,appName:'SplitStack',iterations:210000};
+    if(action==='ping') d={version:7,ready:true,appName:'SplitStack',iterations:210000};
     else if(action==='bootstrap') d=state;
     else if(action==='pull'){
       d={ledgers:{}};
@@ -206,12 +211,15 @@ const stub = `
     else if(action==='adminSetConfig'){
       if(payload.appName!==undefined) Object.assign(state.config,{appName:payload.appName,currency:payload.currency,symbol:payload.currencySymbol});
       if(payload.digest!==undefined) state.config.digest=payload.digest;
+      if(payload.categories!==undefined) state.config.categories=payload.categories;
       d={ok:true};
     }
     else if(action==='setProfile'){
       const u=users[0];
       if(payload.email!==undefined) u.email=payload.email;
       if(payload.notify!==undefined) u.notify=!!payload.notify;
+      if(payload.payType!==undefined) u.payType=payload.payType;
+      if(payload.payHandle!==undefined) u.payHandle=payload.payHandle;
       d={me:u};
     }
     else if(action==='setPresets'){

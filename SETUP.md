@@ -282,6 +282,68 @@ copy already on your phone, so it works offline too.
 
 ---
 
+## Getting paid
+
+**Profile ▸ Getting paid.** Pick Venmo, PayPal.me, Cash App, Revolut, UPI — or paste any link —
+and add your handle.
+
+From then on, anyone who owes you sees a button on the Balances tab that opens that app **with the
+amount already filled in**, then drops them straight into *Record a payment* so the ledger catches
+up. It never moves money by itself; you both still confirm, in the app that actually holds it.
+
+These are ordinary web links, so they work on a desktop browser and hand off to the installed app
+on a phone.
+
+---
+
+## Everyone, at a glance
+
+The purple card on the home screen totals what you're owed across every ledger. **Tap it** and you
+get it broken down per person instead: *Ada owes you $466.35* — made of *+$621.35* on the beach
+house and *−$155.00* from the ski trip.
+
+The numbers are the same settle-up suggestions each ledger's Balances tab already shows, added up,
+so the two can never disagree. **Nothing settles from here on purpose** — a debt lives on its
+ledger, and paying one house's balance with another's would leave both wrong. Each line links back
+to where the money actually is.
+
+---
+
+## What's changed since you last looked
+
+Open a ledger and, if anything landed since your last visit, a line at the top says so:
+*"3 new since you last looked — Sam, Ada · $184.20"*.
+
+Your own entries never count — you know about those. It's driven by the same revision counter the
+sync engine runs on, so it's accurate even if you were offline for a week, and it clears itself
+once you've been.
+
+---
+
+## Finding things
+
+Tap 🔍 in a ledger's header and, alongside the text box, you get filter chips for **who paid** and
+**which category**. They narrow whatever you've typed rather than replacing it, so *Ben · Groceries
+· "wine"* is a valid question. Only the payers and categories actually used on that ledger are
+offered, so the row stays short.
+
+---
+
+## Categories
+
+**Settings ▸ Categories ▸ Expense categories** — rename them, change the icons, remove the ones
+your household never uses, add the ones it does. Up to forty.
+
+Removing one never rewrites history: past expenses keep the name they were filed under and just
+fall back to a generic 🧾. There's a one-tap way back to the built-in list if you change your mind.
+
+**The app also guesses.** Type "Uber to the airport" and it picks Transport; "Big Tesco shop" picks
+Groceries. It only ever *pre*-selects — the moment you tap a category yourself it stops guessing
+for that expense, because being quietly overruled by a keyword list is worse than choosing it
+yourself. The matching runs entirely on your phone; nothing is sent anywhere.
+
+---
+
 ## Expenses that repeat
 
 Rent, the internet bill, the cleaner — the things somebody would otherwise retype every month.
@@ -408,11 +470,11 @@ nothing to send to, and everything else in the app behaves identically.
 
 | Tab | What it holds |
 |---|---|
-| `Users` | One row per member: username, display name, role, salt, iterations, verifier, avatar, colour, email preference, and whether it's a person or not |
+| `Users` | One row per member: username, display name, role, salt, iterations, verifier, avatar, colour, email preference, pay handle, and whether it's a person or not |
 | `Ledgers` | One row per ledger: name, sheet tab name, icon, colour, invite token, archived flag, saved splits, default split |
 | `Members` | Which people belong to which ledgers |
 | `Recurring` | One row per repeating expense: the template, the schedule, and when it next fires |
-| `Config` | App name, currency, symbol, receipt folder id, email schedule |
+| `Config` | App name, currency, symbol, receipt folder id, email schedule, category list |
 | *(one per ledger)* | The actual transactions |
 
 Each ledger tab has these columns:
