@@ -215,6 +215,11 @@ select.input{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xml
 .chip:active{transform:scale(.92)}
 .chip.on{background:var(--violet);border-color:var(--violet);color:#fff}
 .chip.on .av{box-shadow:none}
+/* Saved splits and "save this" sit in the same row as the people toggles but
+   do something rather than toggle something — the dashed outline is what tells
+   you which of the two a chip is before you tap it. */
+.chip.ghost{background:transparent;border-style:dashed;color:var(--ink-3)}
+.chip.ghost:hover{border-color:var(--violet);color:var(--violet)}
 
 /* ══════════════════════════════════════════════════════════════════ sheets */
 .scrim{position:fixed;inset:0;z-index:60;background:rgba(20,10,50,.55);backdrop-filter:blur(4px);

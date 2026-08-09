@@ -20,23 +20,31 @@
 
 /* ---------------------------------------------------------------- constants */
 
-var TAB_USERS    = 'Users';
-var TAB_LEDGERS  = 'Ledgers';
-var TAB_MEMBERS  = 'Members';
-var TAB_CONFIG   = 'Config';
+var TAB_USERS     = 'Users';
+var TAB_LEDGERS   = 'Ledgers';
+var TAB_MEMBERS   = 'Members';
+var TAB_CONFIG    = 'Config';
+var TAB_RECURRING = 'Recurring';
 
 var USER_COLS   = ['UserId','Username','DisplayName','Email','Role','Salt','Iterations',
-                   'Verifier','TokenVer','Avatar','Color','Emoji','Active','CreatedAt','UpdatedAt'];
+                   'Verifier','TokenVer','Avatar','Color','Emoji','Active','Notify','CreatedAt','UpdatedAt'];
 var LEDGER_COLS = ['LedgerId','Name','SheetName','Emoji','Color','InviteToken','Archived',
-                   'CreatedBy','CreatedAt','UpdatedAt'];
+                   'Presets','CreatedBy','CreatedAt','UpdatedAt'];
 var MEMBER_COLS = ['LedgerId','UserId','JoinedAt'];
 var TXN_COLS    = ['TxnId','Type','Date','Name','Category','Amount','PaidBy','PaidTo',
                    'EnteredBy','SplitPct','Notes','ReceiptId','Deleted','CreatedAt','UpdatedAt','Rev',
                    'ReviewState','ReviewBy','ReviewNote','ReviewDone','ReviewWas'];
+var RECUR_COLS  = ['RuleId','LedgerId','Name','Category','Amount','PaidBy','SplitPct','Notes',
+                   'Freq','Every','Anchor','NextDate','LastRun','Active','Review',
+                   'CreatedBy','CreatedAt','UpdatedAt'];
 
 var PBKDF2_ITERATIONS = 210000;
 var SESSION_DAYS      = 60;
-var API_VERSION       = 3;
+var API_VERSION       = 4;
+
+/* Recurring rules never run more than this many periods in one pass. A script
+   whose trigger was off for a year should not wake up and post 365 rows. */
+var RECUR_CATCHUP_MAX = 24;
 
 /* Brute-force protection. Failures are counted per username in the script
    cache, so the window expires on its own and nothing accumulates forever. */
@@ -147,6 +155,7 @@ function route(req) {
   }
 
   requireGate(req);
+  ensureSchema();
 
   // --- unauthenticated -----------------------------------------------------
   switch (action) {
@@ -171,6 +180,11 @@ function route(req) {
     case 'signOutEverywhere': return signOutEverywhere(me);
     case 'putReceipt':     return putReceipt(me, p);
     case 'getReceipt':     return getReceipt(me, p);
+    case 'setProfile':     return setProfile(me, p);
+    case 'setPresets':     return setPresets(me, p);
+    case 'recurringSave':  return recurringSave(me, p);
+    case 'recurringDelete':return recurringDelete(me, p);
+    case 'nudge':          return nudge(me, p);
 
     /* ---- admin only ---- */
     case 'adminUsers':       return requireAdmin(me), listUsers();
@@ -184,6 +198,7 @@ function route(req) {
     case 'adminSetConfig':   return requireAdmin(me), setConfig(p);
     case 'adminSetGate':     return requireAdmin(me), setGate(me, p);
     case 'adminUnlock':      return requireAdmin(me), adminUnlock(p);
+    case 'adminTestDigest':  return requireAdmin(me), testDigest(me);
   }
   throw new Error('UNKNOWN_ACTION:' + action);
 }
@@ -279,6 +294,28 @@ function nextRev(count) {
   return base;
 }
 
+/**
+ * The columns this version needs, added to a spreadsheet built by an older one.
+ *
+ * Upgrading is a copy-paste of Code.gs, and expecting people to also remember
+ * to run setup() is how a feature ends up silently doing nothing: writes to a
+ * column that doesn't exist are dropped without complaint, because rows are
+ * addressed by header name. So the check runs itself, guarded by a stamp in
+ * Script Properties — one cheap property read per request, and the actual
+ * migration exactly once ever.
+ */
+var SCHEMA_VERSION = '4';
+
+function ensureSchema() {
+  var props = PropertiesService.getScriptProperties();
+  if (props.getProperty('SCHEMA') === SCHEMA_VERSION) return;
+  ensureColumns(tab(TAB_USERS,     USER_COLS),  USER_COLS);
+  ensureColumns(tab(TAB_LEDGERS,   LEDGER_COLS), LEDGER_COLS);
+  ensureColumns(tab(TAB_MEMBERS,   MEMBER_COLS), MEMBER_COLS);
+  ensureColumns(tab(TAB_RECURRING, RECUR_COLS),  RECUR_COLS);
+  props.setProperty('SCHEMA', SCHEMA_VERSION);
+}
+
 /** Make sure a sheet has every column we expect, adding any that are missing. */
 function ensureColumns(sheet, cols) {
   var width = Math.max(1, sheet.getLastColumn());
@@ -319,10 +356,16 @@ function setCfg(key, value) {
   _cfg = null;
 }
 
+var DIGEST_MODES = ['off', 'daily', 'weekly'];
+
 function setConfig(p) {
   ['appName', 'currency', 'currencySymbol'].forEach(function (k) {
     if (p[k] !== undefined) setCfg(k, p[k]);
   });
+  if (p.digest !== undefined) {
+    if (DIGEST_MODES.indexOf(p.digest) === -1) throw new Error('BAD_DIGEST_MODE');
+    setCfg('digest', p.digest);
+  }
   return { ok: true };
 }
 
@@ -352,6 +395,7 @@ function onOpen() {
       .addItem('🔑  Show setup key', 'menuKey')
       .addSeparator()
       .addItem('🛠  Run setup / repair', 'menuSetup')
+      .addItem('⏰  Check background jobs', 'menuJobs')
       .addItem('🔓  Unlock a locked account', 'menuUnlock')
       .addItem('♻️  Reset the admin account', 'menuResetAdmin')
       .addToUi();
@@ -360,7 +404,13 @@ function onOpen() {
 
 function menuSetup() {
   setup(true);
-  ui().alert('SplitStack', 'Tabs checked and repaired. Everything is in place.', ui().ButtonSet.OK);
+  ui().alert('SplitStack',
+    'Tabs checked and repaired. Everything is in place.\n\n' +
+    'Background jobs: ' + (jobsInstalled()
+      ? 'on — repeating expenses post daily and email summaries go out in the morning.'
+      : "NOT running. Open Extensions ▸ Apps Script, run setup() once and accept the permission " +
+        'prompt. Everything else works without them.'),
+    ui().ButtonSet.OK);
 }
 
 function ui() { return SpreadsheetApp.getUi(); }
@@ -399,6 +449,29 @@ function menuLinks() {
   ui().alert('SplitStack links', msg, ui().ButtonSet.OK);
 }
 
+/**
+ * Repeating expenses and email summaries both depend on two daily triggers.
+ * If those are missing the app looks broken in a way nothing else explains, so
+ * give it a button that says what is wrong and fixes it.
+ */
+function menuJobs() {
+  var on = jobsInstalled();
+  if (on) {
+    var res = ui().alert('Background jobs are on',
+      'Repeating expenses post at about 3am and email summaries go out at about 8am, ' +
+      'in ' + tz() + '.\n\nRe-install them? (Harmless — it just replaces the two triggers.)',
+      ui().ButtonSet.YES_NO);
+    if (res !== ui().Button.YES) return;
+  }
+  var r = installTriggers();
+  ui().alert(r.ok ? 'Background jobs are on' : "Couldn't install them",
+    r.ok ? 'Repeating expenses will post daily, and email summaries follow the schedule ' +
+           'you set under Settings ▸ Notifications in the app.'
+         : r.error + '\n\nThis usually means the script needs re-authorising. In the Apps Script ' +
+           'editor, run setup() once and accept the permission prompt.',
+    ui().ButtonSet.OK);
+}
+
 function menuUnlock() {
   var res = ui().prompt('Unlock an account',
     'Username to unlock (clears the 15-minute lockout):', ui().ButtonSet.OK_CANCEL);
@@ -427,14 +500,19 @@ function menuResetAdmin() {
  * Pass true to skip the dialog (the spreadsheet menu shows its own).
  */
 function setup(silent) {
-  tab(TAB_USERS,   USER_COLS);
-  tab(TAB_LEDGERS, LEDGER_COLS);
-  tab(TAB_MEMBERS, MEMBER_COLS);
+  // Columns are looked up by header name, never by position, so a sheet made
+  // by an older version just gains the new ones on the end. Forced rather than
+  // stamp-guarded here, because "repair" is exactly what this button promises.
+  PropertiesService.getScriptProperties().deleteProperty('SCHEMA');
+  ensureSchema();
   tab(TAB_CONFIG,  ['Key', 'Value']);
 
   if (!cfg('currency'))       setCfg('currency', 'USD');
   if (!cfg('currencySymbol')) setCfg('currencySymbol', '$');
   if (!cfg('appName'))        setCfg('appName', 'SplitStack');
+  if (!cfg('digest'))         setCfg('digest', 'weekly');
+
+  var jobs = installTriggers();
 
   var key = cfg('setupKey');
   if (!key) { key = randomHex(6).toUpperCase(); setCfg('setupKey', key); }
@@ -449,6 +527,10 @@ function setup(silent) {
       '  SETUP KEY:  ' + key + '\n' +
       '  Use it once in the app to create your admin account.\n' +
       '=================================================\n';
+  msg += '\n\nBackground jobs: ' + (jobs.ok
+    ? 'on (repeating expenses post daily, email summaries go out in the morning).'
+    : 'NOT installed — ' + jobs.error + '\nRepeating expenses and email summaries need them. ' +
+      'Run setup again from the Apps Script editor and accept the extra permission.');
   Logger.log(msg);
   if (!silent) {
     try { SpreadsheetApp.getUi().alert('SplitStack', msg, SpreadsheetApp.getUi().ButtonSet.OK); } catch (e) {}
@@ -458,6 +540,59 @@ function setup(silent) {
 
 /** Convenience: re-print the setup key. */
 function showSetupKey() { Logger.log(cfg('setupKey')); return cfg('setupKey'); }
+
+/* ══════════════════════════════════════════════════════════ background jobs */
+/**
+ * Two daily time-driven triggers do all the unattended work:
+ *
+ *   rollRecurring  — posts repeating expenses that have come due
+ *   sendDigests    — emails everyone their balances and anything awaiting them
+ *
+ * Both are safe to run more often than needed (they no-op when there is
+ * nothing to do), and both are idempotent within a day, so a double
+ * installation cannot double-post. Even so, this clears its own triggers
+ * before creating them, so running setup repeatedly never stacks them up.
+ *
+ * Creating triggers needs a scope the original script did not ask for, so an
+ * instance upgraded from an older version has to re-authorise once. Failing
+ * that is not fatal — everything else keeps working, and setup() says so.
+ */
+var JOB_HANDLERS = ['rollRecurring', 'sendDigests'];
+
+function installTriggers() {
+  try {
+    ScriptApp.getProjectTriggers().forEach(function (t) {
+      if (JOB_HANDLERS.indexOf(t.getHandlerFunction()) !== -1) ScriptApp.deleteTrigger(t);
+    });
+    // 3am: expenses are dated and posted before anybody looks at the app.
+    ScriptApp.newTrigger('rollRecurring').timeBased().atHour(3).everyDays(1).create();
+    // 8am: the summary lands with the morning email, after the 3am rows exist.
+    ScriptApp.newTrigger('sendDigests').timeBased().atHour(8).everyDays(1).create();
+    try { CacheService.getScriptCache().remove('jobs'); } catch (e) {}
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  }
+}
+
+/**
+ * Listing triggers is not free and bootstrap runs on every sync, so the answer
+ * is cached. Installing them clears the cache, and the worst case for a stale
+ * "no" is a banner that lingers five minutes.
+ */
+function jobsInstalled() {
+  var c = CacheService.getScriptCache();
+  var hit = c.get('jobs');
+  if (hit !== null) return hit === '1';
+  var on = false;
+  try {
+    on = ScriptApp.getProjectTriggers().some(function (t) {
+      return JOB_HANDLERS.indexOf(t.getHandlerFunction()) !== -1;
+    });
+  } catch (e) { on = false; }
+  c.put('jobs', on ? '1' : '0', 300);
+  return on;
+}
 
 /** Nuke the admin verifier so a new admin account can be claimed. */
 function resetAdminClaim() {
@@ -718,8 +853,36 @@ function publicUser(u) {
     id: u.UserId, username: u.Username, name: u.DisplayName || u.Username,
     email: u.Email || '', role: u.Role || 'member', avatar: u.Avatar || '',
     color: u.Color || pickColor(0), emoji: u.Emoji || '', active: u.Active !== false && u.Active !== 'FALSE',
+    notify: notifyOn(u),
     hasPassword: !!u.Verifier
   };
+}
+
+/** Email is opt-out: a blank cell on an existing sheet means "yes, please". */
+function notifyOn(u) { return String(u.Notify == null ? '' : u.Notify).toLowerCase() !== 'off'; }
+
+/**
+ * Your own name, email and email preference. Admins can already edit anyone
+ * through adminSaveUser; this is the door that does not need to be an admin to
+ * walk through, so people can fix their own address and switch email off.
+ */
+function setProfile(me, p) {
+  return lock(function () {
+    var patch = { UpdatedAt: new Date() };
+    if (p.name !== undefined) {
+      var name = String(p.name).trim().slice(0, 60);
+      if (!name) throw new Error('NAME_REQUIRED');
+      patch.DisplayName = name;
+    }
+    if (p.email !== undefined) {
+      var email = String(p.email).trim().slice(0, 160);
+      if (email && !/^[^@\s]+@[^@\s.]+\.[^@\s]+$/.test(email)) throw new Error('BAD_EMAIL');
+      patch.Email = email;
+    }
+    if (p.notify !== undefined) patch.Notify = p.notify ? 'on' : 'off';
+    updateRow(TAB_USERS, USER_COLS, me.__row, patch);
+    return { me: publicUser(findUser('UserId', me.UserId)) };
+  });
 }
 
 var PALETTE = ['#6C5CE7','#00B894','#FF7675','#FDCB6E','#0984E3','#E84393','#00CEC9','#E17055','#A29BFE','#55EFC4'];
@@ -829,8 +992,41 @@ function publicLedger(l) {
   return {
     id: l.LedgerId, name: l.Name, emoji: l.Emoji || '💸', color: l.Color || PALETTE[0],
     invite: l.InviteToken, archived: l.Archived === true || l.Archived === 'TRUE',
+    presets: parseJson(l.Presets) || [],
     createdAt: l.CreatedAt ? new Date(l.CreatedAt).toISOString() : null
   };
+}
+
+/* ═══════════════════════════════════════════════════════════ split presets */
+/**
+ * A named split saved on the ledger — "Rent split", "Everyone but Ben" — so a
+ * house whose rent is 40/30/30 sets those percentages once instead of every
+ * month.
+ *
+ * Deliberately NOT admin-only. Presets are a convenience for whoever enters
+ * expenses, and the person who enters the rent is not necessarily the person
+ * who created the ledger. Membership is the right bar, same as pushing a
+ * transaction.
+ */
+var PRESET_MAX = 12;
+
+function setPresets(me, p) {
+  return lock(function () {
+    assertMember(me, p.ledgerId);
+    var l = ledgerById(p.ledgerId);
+    var members = memberIdsOf(p.ledgerId);
+    var list = (p.presets || []).slice(0, PRESET_MAX).map(function (x) {
+      var name = String(x.name || '').trim().slice(0, 40);
+      if (!name) throw new Error('NAME_REQUIRED');
+      var split = normaliseSplit(x.split, members);
+      if (!split) throw new Error('SPLIT_REQUIRED');
+      return { id: String(x.id || uid('pst')).slice(0, 40), name: name, split: split };
+    });
+    updateRow(TAB_LEDGERS, LEDGER_COLS, l.__row, {
+      Presets: JSON.stringify(list), UpdatedAt: new Date()
+    });
+    return { presets: list };
+  });
 }
 
 function saveLedger(me, p) {
@@ -1028,8 +1224,13 @@ function bootstrap(me) {
     users:    visible.map(publicUser),
     ledgers:  ledgers.map(publicLedger),
     members:  members.map(function (m) { return { ledgerId: m.LedgerId, userId: m.UserId }; }),
+    recurring: myRecurring(me),
     config:   { currency: cfg('currency', 'USD'), symbol: cfg('currencySymbol', '$'),
-                appName: cfg('appName', 'SplitStack'), gated: gateEnabled() },
+                appName: cfg('appName', 'SplitStack'), gated: gateEnabled(),
+                digest: cfg('digest', 'weekly'),
+                // Repeating expenses and email both ride on the daily triggers.
+                // The app says so plainly rather than looking broken.
+                jobs: jobsInstalled() },
     serverTime: new Date().toISOString()
   };
 }
@@ -1289,6 +1490,302 @@ function validateTxn(t) {
   }
 }
 
+/* ════════════════════════════════════════════════════ repeating expenses */
+/**
+ * Rent, the internet bill, the cleaner — the entries somebody would otherwise
+ * retype every month. A rule is a template plus a schedule; a daily trigger
+ * turns due rules into ordinary transactions and steps the schedule on.
+ *
+ * The generated rows are ordinary rows in every respect. Nothing downstream —
+ * sync, balances, reviews, editing, deletion — knows or cares that a rule put
+ * them there, which is what keeps this feature from leaking into the rest of
+ * the app.
+ */
+
+/** The sheet's own timezone is the one the user thinks in. */
+function tz() {
+  try { return ss().getSpreadsheetTimeZone() || Session.getScriptTimeZone() || 'UTC'; }
+  catch (e) { return 'UTC'; }
+}
+function todayStr() { return Utilities.formatDate(new Date(), tz(), 'yyyy-MM-dd'); }
+
+/**
+ * Cells hand back either a string or a Date depending on how Sheets decided to
+ * store what was written. Both have to come out as a plain YYYY-MM-DD, and a
+ * Date has to be read in the sheet's timezone or it slides a day.
+ */
+function dateStr(v) {
+  if (!v && v !== 0) return '';
+  if (Object.prototype.toString.call(v) === '[object Date]') return Utilities.formatDate(v, tz(), 'yyyy-MM-dd');
+  return String(v).slice(0, 10);
+}
+
+function daysInMonth(y, m) { return new Date(Date.UTC(y, m, 0)).getUTCDate(); }
+function pad2(n) { return (n < 10 ? '0' : '') + n; }
+function ymd(y, m, d) { return y + '-' + pad2(m) + '-' + pad2(d); }
+
+/**
+ * Step a date on by one period.
+ *
+ * `anchor` is the day of the month the rule was created on, and it is why this
+ * takes a parameter instead of reading the day off `from`: a monthly rule
+ * starting on the 31st has to become the 28th in February and then go back to
+ * the 31st in March, not stay on the 28th forever. All arithmetic is on the
+ * numbers themselves — no Date objects, so no timezone can shift a day.
+ */
+function addPeriod(from, freq, every, anchor) {
+  var p = String(from).split('-');
+  var y = Number(p[0]), m = Number(p[1]), d = Number(p[2]);
+  var n = Math.max(1, Math.min(52, Number(every) || 1));
+
+  if (freq === 'weekly') {
+    var t = new Date(Date.UTC(y, m - 1, d));
+    t.setUTCDate(t.getUTCDate() + 7 * n);
+    return ymd(t.getUTCFullYear(), t.getUTCMonth() + 1, t.getUTCDate());
+  }
+  if (freq === 'yearly') {
+    y += n;
+    return ymd(y, m, Math.min(anchor || d, daysInMonth(y, m)));
+  }
+  m += n;                                  // monthly
+  y += Math.floor((m - 1) / 12);
+  m = ((m - 1) % 12) + 1;
+  return ymd(y, m, Math.min(anchor || d, daysInMonth(y, m)));
+}
+
+var RECUR_FREQS = ['weekly', 'monthly', 'yearly'];
+
+function rowToRule(r) {
+  return {
+    id: r.RuleId,
+    ledgerId: r.LedgerId,
+    name: r.Name || '',
+    category: r.Category || '',
+    amount: Number(r.Amount) || 0,
+    paidBy: r.PaidBy || '',
+    split: parseJson(r.SplitPct) || {},
+    notes: r.Notes || '',
+    freq: r.Freq || 'monthly',
+    every: Number(r.Every) || 1,
+    anchor: Number(r.Anchor) || 0,
+    nextDate: dateStr(r.NextDate),
+    lastRun: dateStr(r.LastRun),
+    active: !(r.Active === false || r.Active === 'FALSE'),
+    review: r.Review === true || r.Review === 'TRUE',
+    createdBy: r.CreatedBy || ''
+  };
+}
+
+function allRules() { return readTab(TAB_RECURRING, RECUR_COLS).filter(function (r) { return !!r.RuleId; }); }
+
+function myRecurring(me) {
+  var ids = myLedgers(me).map(function (l) { return l.LedgerId; });
+  return allRules()
+    .filter(function (r) { return ids.indexOf(r.LedgerId) !== -1; })
+    .map(rowToRule);
+}
+
+/**
+ * Drop anyone who is no longer on the ledger and rescale what is left back to
+ * 100. A rule outlives the housemate who moved out, and posting a split that
+ * pays out to a non-member would leave balances that no longer sum to zero.
+ */
+function normaliseSplit(split, memberIds) {
+  var kept = {}, sum = 0;
+  Object.keys(split || {}).forEach(function (k) {
+    if (memberIds.indexOf(k) === -1) return;
+    var v = Number(split[k]) || 0;
+    if (v <= 0) return;
+    kept[k] = v; sum += v;
+  });
+  var ids = Object.keys(kept);
+  if (!ids.length || sum <= 0) return null;
+  if (Math.abs(sum - 100) < 0.005) return kept;
+
+  var out = {}, acc = 0;
+  ids.forEach(function (k, i) {
+    if (i === ids.length - 1) out[k] = Math.round((100 - acc) * 100) / 100;
+    else { var v = Math.round(kept[k] / sum * 10000) / 100; out[k] = v; acc += v; }
+  });
+  return out;
+}
+
+function memberIdsOf(ledgerId) {
+  return readTab(TAB_MEMBERS, MEMBER_COLS)
+    .filter(function (m) { return m.LedgerId === ledgerId; })
+    .map(function (m) { return m.UserId; });
+}
+
+function validateRule(p, memberIds) {
+  var name = String(p.name || '').trim();
+  if (!name) throw new Error('NAME_REQUIRED');
+  if (!(Number(p.amount) > 0)) throw new Error('BAD_AMOUNT');
+  if (Number(p.amount) > 100000000) throw new Error('AMOUNT_TOO_LARGE');
+  if (RECUR_FREQS.indexOf(p.freq) === -1) throw new Error('BAD_FREQUENCY');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(p.nextDate || ''))) throw new Error('BAD_DATE');
+  if (memberIds.indexOf(p.paidBy) === -1) throw new Error('PAYER_NOT_A_MEMBER');
+  var split = normaliseSplit(p.split, memberIds);
+  if (!split) throw new Error('SPLIT_REQUIRED');
+  return { name: name.slice(0, 120), split: split };
+}
+
+function recurringSave(me, p) {
+  return lock(function () {
+    assertMember(me, p.ledgerId);
+    tab(TAB_RECURRING, RECUR_COLS);
+    var members = memberIdsOf(p.ledgerId);
+    var v = validateRule(p, members);
+    var now = new Date();
+    var anchor = Number(String(p.nextDate).slice(8, 10));
+
+    var vals = {
+      LedgerId: p.ledgerId,
+      Name: v.name,
+      Category: String(p.category || '').slice(0, 40),
+      Amount: Math.round(Number(p.amount) * 100) / 100,
+      PaidBy: p.paidBy,
+      SplitPct: JSON.stringify(v.split),
+      Notes: String(p.notes || '').slice(0, 500),
+      Freq: p.freq,
+      Every: Math.max(1, Math.min(52, Number(p.every) || 1)),
+      Anchor: anchor,
+      NextDate: p.nextDate,
+      Active: p.active !== false,
+      Review: !!p.review,
+      UpdatedAt: now
+    };
+
+    // Ids come from the client so a rule created on a plane can be replayed
+    // without becoming two rules — the same idempotency transactions get.
+    var id = String(p.id || uid('rec')).slice(0, 60);
+    var found = null;
+    allRules().forEach(function (r) { if (r.RuleId === id) found = r; });
+
+    if (found) {
+      if (found.LedgerId !== p.ledgerId) throw new Error('FORBIDDEN');
+      // LastRun is the engine's to write, and CreatedBy says whose entry the
+      // posted rows are — neither is the editor's to overwrite.
+      updateRow(TAB_RECURRING, RECUR_COLS, found.__row, vals);
+    } else {
+      vals.RuleId = id;
+      vals.CreatedBy = me.UserId;
+      vals.CreatedAt = now;
+      vals.LastRun = '';
+      appendRow(TAB_RECURRING, RECUR_COLS, vals);
+    }
+
+    var fresh = null;
+    allRules().forEach(function (r) { if (r.RuleId === id) fresh = r; });
+    return { rule: rowToRule(fresh) };
+  });
+}
+
+function recurringDelete(me, p) {
+  return lock(function () {
+    var rows = allRules(), found = null;
+    for (var i = 0; i < rows.length; i++) if (rows[i].RuleId === p.id) { found = rows[i]; break; }
+    if (!found) return { ok: true };            // already gone; nothing to argue about
+    assertMember(me, found.LedgerId);
+    tab(TAB_RECURRING, RECUR_COLS).deleteRow(found.__row);
+    return { ok: true };
+  });
+}
+
+/**
+ * The daily job. Posts every occurrence a rule owes, oldest first, then leaves
+ * NextDate pointing at the next one that has not happened yet.
+ *
+ * Transaction ids are derived from the rule and the date, so a rule that runs
+ * twice in a day — or a script that was off for a week and catches up — can
+ * never post the same occurrence twice. That is the same idempotency the
+ * offline outbox relies on, reused.
+ */
+function rollRecurring() {
+  return lock(function () {
+    var today = todayStr();
+    var rules = allRules();
+    if (!rules.length) return { posted: 0 };
+
+    var ledgers = {};
+    readTab(TAB_LEDGERS, LEDGER_COLS).forEach(function (l) { ledgers[l.LedgerId] = l; });
+
+    var posted = 0;
+    rules.forEach(function (r) {
+      var rule = rowToRule(r);
+      if (!rule.active || !rule.nextDate || rule.nextDate > today) return;
+      var ledger = ledgers[rule.ledgerId];
+      if (!ledger) return;
+
+      var members = memberIdsOf(rule.ledgerId);
+      var split = normaliseSplit(rule.split, members);
+      var payer = members.indexOf(rule.paidBy) !== -1 ? rule.paidBy : null;
+      if (!split || !payer) {
+        // The people it was written for are gone. Park it rather than post
+        // something wrong; the ledger still shows the rule, switched off.
+        updateRow(TAB_RECURRING, RECUR_COLS, r.__row, { Active: false, UpdatedAt: new Date() });
+        return;
+      }
+
+      txnSheet(ledger);                       // make sure the tab and columns exist
+      var existing = {};
+      readTab(ledger.SheetName, TXN_COLS).forEach(function (x) { if (x.TxnId) existing[x.TxnId] = true; });
+
+      var due = [], cursor = rule.nextDate, guard = 0;
+      while (cursor <= today && guard++ < RECUR_CATCHUP_MAX) {
+        due.push(cursor);
+        cursor = addPeriod(cursor, rule.freq, rule.every, rule.anchor);
+      }
+      // A rule left unattended for longer than the catch-up window skips the
+      // backlog rather than dumping two years of rent into the feed at once.
+      if (guard >= RECUR_CATCHUP_MAX) {
+        while (cursor <= today) cursor = addPeriod(cursor, rule.freq, rule.every, rule.anchor);
+      }
+
+      var fresh = due.filter(function (d) { return !existing['rec_' + rule.id + '_' + d]; });
+      if (fresh.length) {
+        var base = nextRev(fresh.length);
+        var rows = fresh.map(function (d, i) {
+          return {
+            TxnId: 'rec_' + rule.id + '_' + d,
+            Type: 'expense',
+            Date: d,
+            Name: rule.name,
+            Category: rule.category,
+            Amount: rule.amount,
+            PaidBy: payer,
+            PaidTo: '',
+            EnteredBy: rule.createdBy || payer,
+            SplitPct: JSON.stringify(split),
+            Notes: rule.notes,
+            ReceiptId: '',
+            Deleted: false,
+            CreatedAt: new Date(),
+            UpdatedAt: new Date(),
+            Rev: base + i,
+            // Opted-in rules land marked for review, so a rent rise gets seen
+            // rather than quietly accruing. Whoever set the rule up counts as
+            // having looked already.
+            ReviewState: rule.review ? 'flag' : '',
+            ReviewBy: rule.review ? (rule.createdBy || payer) : '',
+            ReviewNote: rule.review ? 'Posted automatically — check the amount is still right' : '',
+            ReviewDone: rule.review ? (rule.createdBy || payer) : '',
+            ReviewWas: ''
+          };
+        });
+        appendRows(ledger.SheetName, TXN_COLS, rows);
+        posted += rows.length;
+      }
+
+      updateRow(TAB_RECURRING, RECUR_COLS, r.__row, {
+        NextDate: cursor, LastRun: today, UpdatedAt: new Date()
+      });
+    });
+
+    SpreadsheetApp.flush();
+    return { posted: posted };
+  });
+}
+
 /* ----------------------------------------------------------------- receipts */
 
 function receiptFolder() {
@@ -1316,6 +1813,319 @@ function getReceipt(me, p) {
   var f = DriveApp.getFileById(p.receiptId);
   var b = f.getBlob();
   return { dataUrl: 'data:' + b.getContentType() + ';base64,' + Utilities.base64Encode(b.getBytes()) };
+}
+
+/* ══════════════════════════════════════════════════════════════════ email */
+/**
+ * The one piece of infrastructure this app gets for free. The script runs as
+ * you, inside your Google account, so it can send mail through your own quota
+ * with no third-party service, no API key and no data leaving the account that
+ * already holds the spreadsheet.
+ *
+ * Two things go out:
+ *   · a digest, on a schedule the admin picks — where you stand, what is new,
+ *     and anything waiting on you
+ *   · a nudge, on demand — one person asking another for money they are owed
+ *
+ * Everything is opt-out per person (Users ▸ Notify) and gated on there being
+ * an address to send to. Nobody is emailed twice about the same thing: the
+ * digest only reports transactions newer than the last one that went out.
+ */
+
+/* ---- money, exactly as the client computes it ---------------------------- */
+/* These mirror allocate() / balancesFor() / simplify() in app.js. An email
+   that disagreed with the screen would be worse than no email, so the
+   largest-remainder rounding and the id tie-break are reproduced precisely. */
+
+function round2(n) { return Math.round((Number(n) || 0) * 100) / 100; }
+
+function allocateSrv(amount, split) {
+  var ids = Object.keys(split || {}).sort();
+  var out = {};
+  if (!ids.length) return out;
+  var total = Math.round(round2(amount) * 100);
+  var raw = ids.map(function (id) { return round2(amount) * (Number(split[id]) || 0) / 100 * 100; });
+  var cents = raw.map(function (v) { return Math.floor(v); });
+  var residual = total - cents.reduce(function (a, b) { return a + b; }, 0);
+  var order = ids.map(function (id, i) { return { i: i, id: id, frac: raw[i] - cents[i] }; })
+    .sort(function (a, b) { return (b.frac - a.frac) || (a.id < b.id ? -1 : 1); });
+  for (var k = 0; residual > 0 && k < 10000; k++, residual--) cents[order[k % ids.length].i]++;
+  for (var j = 0; residual < 0 && j < 10000; j++, residual++) cents[order[order.length - 1 - (j % ids.length)].i]--;
+  ids.forEach(function (id, i) { out[id] = cents[i] / 100; });
+  return out;
+}
+
+function balancesOf(ledger, memberIds) {
+  var net = {};
+  memberIds.forEach(function (i) { net[i] = 0; });
+  readTab(ledger.SheetName, TXN_COLS).forEach(function (r) {
+    if (!r.TxnId) return;
+    var t = rowToTxn(r);
+    if (t.deleted) return;
+    if (t.type === 'settlement') {
+      net[t.paidBy] = round2((net[t.paidBy] || 0) + t.amount);
+      net[t.paidTo] = round2((net[t.paidTo] || 0) - t.amount);
+    } else {
+      net[t.paidBy] = round2((net[t.paidBy] || 0) + t.amount);
+      var shares = allocateSrv(t.amount, t.split);
+      Object.keys(shares).forEach(function (u) { net[u] = round2((net[u] || 0) - shares[u]); });
+    }
+  });
+  Object.keys(net).forEach(function (k) { net[k] = round2(net[k]); });
+  return net;
+}
+
+function fmtMoney(n) {
+  var sym = cfg('currencySymbol', '$');
+  var v = Math.abs(round2(n)).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return (n < 0 ? '−' : '') + sym + v;
+}
+
+/* ---- plumbing ------------------------------------------------------------ */
+
+function appUrl() {
+  var home = cfg('appHomeUrl', '');
+  return home || deploymentUrl();
+}
+
+/** Never let a scheduled job burn the whole daily allowance in one pass. */
+function mailQuota() {
+  try { return MailApp.getRemainingDailyQuota(); } catch (e) { return 0; }
+}
+
+function sendMail(to, subject, html) {
+  MailApp.sendEmail({
+    to: to,
+    subject: subject,
+    htmlBody: html,
+    body: html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(),
+    name: cfg('appName', 'SplitStack')
+  });
+}
+
+function mailShell(title, intro, blocks, ctaLabel) {
+  var url = appUrl();
+  return '' +
+    '<div style="margin:0;padding:24px 12px;background:#EFEBFF;font-family:-apple-system,BlinkMacSystemFont,' +
+    '\'Segoe UI\',Roboto,Helvetica,Arial,sans-serif;color:#1B1435">' +
+    '<div style="max-width:520px;margin:0 auto;background:#fff;border-radius:22px;padding:28px;' +
+    'box-shadow:0 18px 44px -22px rgba(46,25,110,.45)">' +
+    '<div style="font-size:13px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#8A84A6">' +
+    escapeHtml(cfg('appName', 'SplitStack')) + '</div>' +
+    '<h1 style="margin:6px 0 10px;font-size:23px;line-height:1.25">' + escapeHtml(title) + '</h1>' +
+    (intro ? '<p style="margin:0 0 18px;font-size:15px;line-height:1.55;color:#4A4368">' + intro + '</p>' : '') +
+    blocks +
+    (url ? '<a href="' + escapeHtml(url) + '" style="display:block;margin-top:22px;background:#6C5CE7;color:#fff;' +
+      'text-decoration:none;padding:14px;border-radius:15px;font-weight:800;text-align:center">' +
+      escapeHtml(ctaLabel || 'Open the app') + '</a>' : '') +
+    '<p style="margin:20px 0 0;padding-top:16px;border-top:1px solid #EAE6F8;font-size:12px;line-height:1.5;color:#8A84A6">' +
+    'You are getting this because you are on a shared ledger. Turn it off any time under ' +
+    'your profile in the app.</p>' +
+    '</div></div>';
+}
+
+function mailRow(left, right, colour) {
+  return '<tr>' +
+    '<td style="padding:9px 0;border-bottom:1px solid #F0EDFB;font-size:14.5px;font-weight:600">' + left + '</td>' +
+    '<td style="padding:9px 0;border-bottom:1px solid #F0EDFB;font-size:15px;font-weight:800;text-align:right;' +
+    'white-space:nowrap;color:' + (colour || '#1B1435') + '">' + right + '</td></tr>';
+}
+function mailTable(rows) {
+  return '<table style="width:100%;border-collapse:collapse;margin:6px 0 2px">' + rows + '</table>';
+}
+
+/* ---- the digest ---------------------------------------------------------- */
+
+/**
+ * Daily job. Decides for itself whether today is a sending day, so the
+ * schedule can change without touching the trigger.
+ */
+function sendDigests() {
+  var mode = String(cfg('digest', 'weekly'));
+  if (mode === 'off') return { sent: 0, reason: 'off' };
+  // Day-of-week via the date string rather than a locale-sensitive format
+  // pattern: today in the sheet's timezone, read back as UTC, is unambiguous.
+  if (mode === 'weekly' && new Date(todayStr() + 'T00:00:00Z').getUTCDay() !== 1) {
+    return { sent: 0, reason: 'not-monday' };
+  }
+  return runDigest(null);
+}
+
+/**
+ * Build and send. `only` restricts it to a single user, which is what the
+ * admin's "send me one now" button uses.
+ *
+ * The since-cursor is a Rev, the same strictly increasing counter delta sync
+ * runs on, so "new since the last digest" means exactly what it says even if a
+ * run was missed or fired late.
+ */
+function runDigest(only) {
+  var since = Number(cfg('lastDigestRev', 0)) || 0;
+  // On the very first run every row in the sheet is technically "new". Report
+  // reviews and balances, seed the cursor, and start reporting changes next
+  // time — nobody wants their whole history in an email.
+  var firstRun = since === 0;
+  var users = readTab(TAB_USERS, USER_COLS);
+  var ledgers = readTab(TAB_LEDGERS, LEDGER_COLS);
+  var members = readTab(TAB_MEMBERS, MEMBER_COLS);
+  var nameOf = {};
+  users.forEach(function (u) { nameOf[u.UserId] = u.DisplayName || u.Username; });
+
+  // One read per ledger, reused for everybody on it.
+  var facts = {}, maxRev = since;
+  ledgers.forEach(function (l) {
+    if (l.Archived === true || l.Archived === 'TRUE') return;
+    var ids = members.filter(function (m) { return m.LedgerId === l.LedgerId; })
+                     .map(function (m) { return m.UserId; });
+    if (!ids.length) return;
+    var fresh = [], open = [];
+    readTab(l.SheetName, TXN_COLS).forEach(function (r) {
+      if (!r.TxnId) return;
+      var t = rowToTxn(r);
+      if (t.updatedAt > maxRev) maxRev = t.updatedAt;
+      if (t.reviewState) open.push({ txn: t, need: reviewersOf(r) });
+      if (!firstRun && !t.deleted && t.updatedAt > since) fresh.push(t);
+    });
+    facts[l.LedgerId] = { ledger: l, ids: ids, net: balancesOf(l, ids), fresh: fresh, open: open };
+  });
+
+  var quota = mailQuota();
+  var sent = 0, skipped = 0;
+  users.forEach(function (u) {
+    if (only && u.UserId !== only) return;
+    if (!u.Email || !notifyOn(u)) return;
+    if (u.Active === false || u.Active === 'FALSE') return;
+    if (sent >= quota - 1) { skipped++; return; }
+
+    var mine = Object.keys(facts).filter(function (id) { return facts[id].ids.indexOf(u.UserId) !== -1; });
+    if (!mine.length) return;
+
+    var total = 0, balRows = '', newRows = '', reviewRows = '', newCount = 0, reviewCount = 0;
+    mine.forEach(function (id) {
+      var f = facts[id];
+      var v = f.net[u.UserId] || 0;
+      total = round2(total + v);
+      balRows += mailRow(
+        escapeHtml((f.ledger.Emoji || '💸') + '  ' + f.ledger.Name),
+        (Math.abs(v) < 0.005 ? 'settled' : (v > 0 ? '+' : '') + fmtMoney(v)),
+        Math.abs(v) < 0.005 ? '#8A84A6' : (v > 0 ? '#00B894' : '#FF7675'));
+
+      f.fresh.forEach(function (t) {
+        newCount++;
+        if (newCount > 12) return;
+        newRows += mailRow(
+          escapeHtml(t.type === 'settlement'
+            ? (nameOf[t.paidBy] || '?') + ' paid ' + (nameOf[t.paidTo] || '?')
+            : t.name + ' · ' + (nameOf[t.paidBy] || '?')),
+          escapeHtml(fmtMoney(t.amount)));
+      });
+
+      f.open.forEach(function (o) {
+        if (o.need.indexOf(u.UserId) === -1) return;
+        if ((o.txn.reviewDone || []).indexOf(u.UserId) !== -1) return;
+        reviewCount++;
+        if (reviewCount > 8) return;
+        reviewRows += mailRow(escapeHtml(o.txn.name || 'Settle up'), escapeHtml(fmtMoney(o.txn.amount)), '#F79F1F');
+      });
+    });
+
+    // Nothing moved and nothing is waiting: say nothing. An inbox that only
+    // hears from you when there is something to hear is one people keep on.
+    if (!newCount && !reviewCount) return;
+
+    var blocks = '';
+    if (reviewCount) {
+      blocks += '<div style="background:#FFF6E6;border-radius:15px;padding:14px 16px;margin-bottom:16px">' +
+        '<div style="font-weight:800;font-size:15px">👀 ' + reviewCount +
+        (reviewCount === 1 ? ' entry needs' : ' entries need') + ' your sign-off</div>' +
+        mailTable(reviewRows) + '</div>';
+    }
+    blocks += '<div style="font-size:12.5px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;' +
+      'color:#8A84A6;margin-top:8px">Where you stand</div>' + mailTable(balRows);
+    if (newCount) {
+      blocks += '<div style="font-size:12.5px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;' +
+        'color:#8A84A6;margin-top:20px">' + newCount + (newCount === 1 ? ' new or changed entry' : ' new or changed entries') + '</div>' +
+        mailTable(newRows) +
+        (newCount > 12 ? '<p style="margin:8px 0 0;font-size:13px;color:#8A84A6">…and ' + (newCount - 12) + ' more.</p>' : '');
+    }
+
+    var headline = Math.abs(total) < 0.005 ? 'You are all square'
+      : total > 0 ? 'You are owed ' + fmtMoney(total)
+                  : 'You owe ' + fmtMoney(Math.abs(total));
+    try {
+      sendMail(u.Email, headline, mailShell(headline,
+        'Across ' + mine.length + (mine.length === 1 ? ' ledger.' : ' ledgers.'), blocks, 'Open the app'));
+      sent++;
+    } catch (e) { skipped++; }
+  });
+
+  // Only move the cursor on a full run — a single test send must not eat
+  // everybody else's "what's new".
+  if (!only && maxRev > since) setCfg('lastDigestRev', String(maxRev));
+  return { sent: sent, skipped: skipped };
+}
+
+/** Admin button: send just me one, right now, whatever the schedule says. */
+function testDigest(me) {
+  if (!me.Email) throw new Error('NO_EMAIL_ON_FILE');
+  if (mailQuota() < 1) throw new Error('MAIL_QUOTA_EXHAUSTED');
+  var r = runDigest(me.UserId);
+  return { sent: r.sent, quiet: r.sent === 0 };
+}
+
+/* ---- nudges -------------------------------------------------------------- */
+
+/* Six hours between nudges to the same person on the same ledger — also the
+   longest the script cache will hold a key, which is why it is not a day. */
+var NUDGE_COOLDOWN_SEC = 21600;
+
+/**
+ * "You owe me money." Sent by a person, not the system, so it carries their
+ * name and is rate-limited per pair per ledger — a reminder that can be fired
+ * twenty times in a row is harassment, not a reminder.
+ *
+ * The amount is recomputed here rather than trusted from the client, so nobody
+ * can email a housemate a number they made up.
+ */
+function nudge(me, p) {
+  var l = assertMember(me, p.ledgerId);
+  var target = findUser('UserId', p.userId || '');
+  if (!target) throw new Error('NO_SUCH_USER');
+  if (target.UserId === me.UserId) throw new Error('CANNOT_NUDGE_SELF');
+
+  var ids = memberIdsOf(p.ledgerId);
+  if (ids.indexOf(target.UserId) === -1) throw new Error('NOT_A_MEMBER');
+  if (!target.Email) throw new Error('NO_EMAIL_ON_FILE');
+  if (!notifyOn(target)) throw new Error('NOTIFY_OFF');
+
+  var net = balancesOf(l, ids);
+  var owed = round2(-(net[target.UserId] || 0));       // positive: they are in the red
+  var mine = round2(net[me.UserId] || 0);
+  if (owed < 0.01) throw new Error('NOTHING_OWED');
+  if (mine < 0.01) throw new Error('YOU_ARE_NOT_OWED');
+  var amount = round2(Math.min(owed, mine));           // never ask for more than you are owed
+
+  var cache = CacheService.getScriptCache();
+  var key = 'nudge:' + me.UserId + ':' + target.UserId + ':' + p.ledgerId;
+  if (cache.get(key)) throw new Error('NUDGE_TOO_SOON');
+  if (mailQuota() < 1) throw new Error('MAIL_QUOTA_EXHAUSTED');
+
+  var from = me.DisplayName || me.Username;
+  var title = from + ' nudged you about ' + l.Name;
+  var body = mailShell(
+    'Settling up on ' + (l.Emoji || '💸') + ' ' + l.Name,
+    escapeHtml(from) + ' sent you a friendly reminder.',
+    '<div style="background:#F6F4FF;border-radius:15px;padding:18px;text-align:center">' +
+    '<div style="font-size:13px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;color:#8A84A6">You owe</div>' +
+    '<div style="font-size:34px;font-weight:900;margin-top:4px">' + escapeHtml(fmtMoney(amount)) + '</div>' +
+    '<div style="font-size:14px;color:#4A4368;margin-top:6px">to ' + escapeHtml(from) + '</div></div>' +
+    (p.note ? '<p style="margin:16px 0 0;font-size:15px;line-height:1.55;font-weight:600">“' +
+      escapeHtml(String(p.note).slice(0, 300)) + '”</p>' : ''),
+    'Settle up in the app');
+
+  sendMail(target.Email, title, body);
+  cache.put(key, '1', NUDGE_COOLDOWN_SEC);
+  return { ok: true, amount: amount, to: target.DisplayName || target.Username };
 }
 
 /* -------------------------------------------------------------------- utils */

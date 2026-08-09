@@ -53,9 +53,13 @@ Google will ask for permission the first time:
 - *"Google hasn't verified this app"* → click **Advanced** → **Go to (your project name)**
 - Then **Allow**
 
-This is normal. You're authorising *your own* script to edit *your own* sheet.
+This is normal. You're authorising *your own* script to edit *your own* sheet, plus two things
+that follow from that: permission to run on a timer (repeating expenses post themselves at about
+3am) and permission to send mail as you (the email summaries). Both are switched on for you here.
 
-When it finishes, a dialog shows your **SETUP KEY** — six characters like `A3F91C`.
+When it finishes, a dialog shows your **SETUP KEY** — six characters like `A3F91C`, and a line
+confirming background jobs are on. If it says they aren't, run `setup()` again and accept the
+permission prompt — everything else works without them, but nothing repeats and no email goes out.
 
 Now go back to your spreadsheet tab and **reload the page**. A new **SplitStack** menu appears in
 the menu bar, next to Help. That's where everything lives from now on — you shouldn't need the
@@ -253,14 +257,95 @@ copy already on your phone, so it works offline too.
 
 ---
 
+## Expenses that repeat
+
+Rent, the internet bill, the cleaner — the things somebody would otherwise retype every month.
+
+**Setting one up** is part of logging it the first time. Fill in the expense as usual, and under
+**Repeats** pick *Weekly*, *Monthly* or *Yearly*. The app tells you in plain words what it will
+do — *"Posts on the 1st of each month — next on Sep 1"* — and the entry you just logged counts as
+the first one, so the rule starts from the one after it.
+
+From then on the ledger carries a **🔁 Repeating** card above the feed showing how many there are
+and what lands next. Tap it to see them all; tap any one to change the amount, the payer, the
+schedule or the date, to **pause** it, or to stop it entirely. Stopping a rule never touches the
+entries it already posted — it just stops adding new ones.
+
+**Tick "Ask everyone to check each one"** and every posted entry arrives marked for review, so a
+rent rise gets noticed instead of quietly accruing. This uses the same sign-off flow as any other
+[review](#when-someone-changes-your-expense).
+
+A few things worth knowing:
+
+- **The 31st behaves.** A monthly rule starting on the 31st posts on the 28th in February and goes
+  back to the 31st in March. It doesn't drift.
+- **Posted entries are ordinary entries.** You can edit them, delete them, attach a receipt,
+  search them. Nothing downstream knows a rule put them there.
+- **It can't double-post.** Each occurrence has an id derived from the rule and the date, so a job
+  that runs twice — or catches up after the script was off for a week — still produces one row.
+- **A long gap is capped.** If nothing ran for more than 24 periods, it skips the backlog rather
+  than dumping two years of rent into your feed, and resumes from now.
+- **If everyone in the split leaves the ledger**, the rule pauses itself instead of posting
+  something wrong. It stays visible, switched off.
+
+Rules are stored on a `Recurring` tab in your spreadsheet, and they need the daily trigger to
+actually fire — see *"Nothing is repeating"* in [Troubleshooting](#troubleshooting).
+
+---
+
+## Saved splits
+
+A house whose rent is 40/30/30 shouldn't have to type 40/30/30 every month.
+
+In the expense sheet, set the split up however you like, then tap **＋ Save this split** under
+*Split between* and give it a name. It becomes a chip — *🔖 Rent split* — that any member can tap
+to load those percentages in one go. Twelve per ledger.
+
+They're saved on the ledger, not on you, so everybody in the house gets them. Anyone on the ledger
+can add and delete them; you don't have to be an admin. Saving over a name you've already used
+replaces it rather than making a second chip that looks identical.
+
+If somebody in a saved split leaves the ledger, the split still works — their share is dropped and
+the rest is rescaled to add back up to 100.
+
+---
+
+## Email
+
+Your Google account is already the server, so it can also be the mail server. No third-party
+service, no API key, nothing leaves the account that holds the spreadsheet.
+
+**The summary.** **Settings ▸ Notifications** sets it to *Off*, *Weekly* (Monday mornings) or
+*Daily*. Everyone with an address on file gets where they stand across every ledger, what's
+changed since the last one, and anything waiting on their sign-off. **A quiet week sends nothing
+at all** — if nothing moved and nothing is waiting, there's no email, which is what stops it
+becoming something people filter away. **Send me one now** does exactly that, to you only.
+
+**Nudges.** On the Balances tab, anyone who owes *you* money gets a 👋 next to their line. It
+emails them a friendly reminder with the amount and, if you want, a line of your own. Limited to
+one per person per ledger every six hours, so it can't turn into pestering. The amount is
+recomputed on the server from the ledger itself, so nobody can email a housemate a number they
+made up.
+
+**Everyone controls their own.** **Profile ▸ Email** is where you set your address and switch the
+whole thing off. Off means no summaries *and* nobody can nudge you. No address on file means
+nothing to send to, and everything else in the app behaves identically.
+
+> Sending uses your Google account's own daily mail quota — 100 recipients a day on a personal
+> account, 1,500 on Workspace. A household will never come close. If it ever runs out, the jobs
+> stop for the day and pick up tomorrow rather than failing loudly.
+
+---
+
 ## What's in the spreadsheet
 
 | Tab | What it holds |
 |---|---|
-| `Users` | One row per person: username, display name, role, salt, iterations, verifier, avatar, colour |
-| `Ledgers` | One row per ledger: name, sheet tab name, icon, colour, invite token, archived flag |
+| `Users` | One row per person: username, display name, role, salt, iterations, verifier, avatar, colour, email preference |
+| `Ledgers` | One row per ledger: name, sheet tab name, icon, colour, invite token, archived flag, saved splits |
 | `Members` | Which people belong to which ledgers |
-| `Config` | App name, currency, symbol, receipt folder id |
+| `Recurring` | One row per repeating expense: the template, the schedule, and when it next fires |
+| `Config` | App name, currency, symbol, receipt folder id, email schedule |
 | *(one per ledger)* | The actual transactions |
 
 Each ledger tab has these columns:
@@ -388,6 +473,22 @@ In the Apps Script editor, open the `Config` tab of your spreadsheet and delete 
 Check the page is on `https://`. Password hashing needs a secure context, and it silently has
 nothing to work with on `http://`.
 
+**Nothing is repeating, and no email is arriving.**
+Both run off two daily triggers, and a script upgraded from an older version has to be
+re-authorised before it can create them. In your spreadsheet: **SplitStack ▸ Check background
+jobs**. If that reports a problem, open **Extensions ▸ Apps Script**, run `setup()` once, and
+accept the permission prompt. Rules and settings you made in the meantime are kept — they just
+start firing.
+
+**A repeating expense posted the wrong amount.**
+Edit the entry it posted like any other expense (that fixes this month), then open **🔁 Repeating**
+on the ledger and fix the rule (that fixes every month after). The two are deliberately separate.
+
+**The email says a different number from the app.**
+It shouldn't — the balance code is the same on both sides, down to how the leftover pennies are
+handed out. If they really disagree, the app is probably holding changes that haven't synced:
+tap **Sync now** and compare again.
+
 **Someone's changes aren't showing up.**
 Have them tap **Sync now** on the home screen. If it's still off,
 **Profile ▸ Rebuild local data** re-downloads everything from the sheet.
@@ -418,6 +519,12 @@ New columns appear on their own; the script adds any it's missing the next time 
 existing rows are left alone. If the app is talking to a backend too old for a feature, it now says
 so in a banner rather than failing quietly, and anything you marked in the meantime is held on the
 device and goes through once you've deployed.
+
+> **One extra step the first time you upgrade to a version with repeating expenses and email.**
+> Those need permission to run on a timer and to send mail, which the older script never asked for.
+> After step 3, run `setup()` once from the editor and accept the prompt — or use
+> **SplitStack ▸ Check background jobs** in the spreadsheet, which does the same thing and tells you
+> where it stands. The app shows a warning under Settings ▸ Notifications until this is done.
 
 ---
 
@@ -470,6 +577,7 @@ to go back into the Apps Script editor.
 | **🔗 Show app links** | Your backend URL, plus a one-tap link that configures any new device |
 | **🔑 Show setup key** | The key for creating the admin account (refuses once one exists) |
 | **🛠 Run setup / repair** | Rebuilds any missing tab or column. Safe to run any time; never touches data |
+| **⏰ Check background jobs** | Says whether repeating expenses and email summaries are actually scheduled, and re-installs them if not |
 | **🔓 Unlock a locked account** | Clears someone's 15-minute lockout immediately |
 | **♻️ Reset the admin account** | Clears the admin password and issues a fresh setup key. Ledgers untouched |
 
@@ -496,8 +604,12 @@ own web app and run through Part 3 — no pasting code, and roughly three minute
 
 ## Things worth knowing
 
-- **Google's quotas** are generous for this: 20,000 URL-fetch-free script calls/day and
-  90 minutes of runtime. A household of five won't come close.
+- **Google's quotas** are generous for this: 20,000 URL-fetch-free script calls/day, 90 minutes of
+  runtime, and 100 email recipients a day (1,500 on Workspace). A household of five won't come
+  close to any of them.
+- **The two daily jobs** run at roughly 3am and 8am in your spreadsheet's timezone
+  (**File ▸ Settings ▸ Time zone**). Google decides the exact minute; "roughly" is as precise as
+  time-driven triggers get, and nothing depends on the precision.
 - **Receipts** are stored in a Drive folder called *SplitStack Receipts — (your sheet name)*,
   not inside the spreadsheet, so the sheet stays fast.
 - **Avatars** are stored as small compressed images directly in the `Users` tab.

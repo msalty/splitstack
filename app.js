@@ -6,7 +6,7 @@
 
 /* Shown in Settings ▸ App & updates. Bump this and SW_BUILD in sw.js together
    whenever you re-upload the app. */
-const APP_BUILD = '2026-08-09.2';
+const APP_BUILD = '2026-08-09.3';
 
 /* ────────────────────────────────────────────────────────────────  helpers */
 const $  = (s, r = document) => r.querySelector(s);
@@ -18,6 +18,31 @@ const round2 = n => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 const todayISO = () => { const d = new Date(); d.setMinutes(d.getMinutes() - d.getTimezoneOffset()); return d.toISOString().slice(0, 10); };
 const uuid = () => 'txn_' + Date.now().toString(36) + '_' +
   ([...crypto.getRandomValues(new Uint8Array(6))].map(b => b.toString(16).padStart(2, '0')).join(''));
+const ruleId = () => 'rec_' + Date.now().toString(36) + '_' +
+  ([...crypto.getRandomValues(new Uint8Array(5))].map(b => b.toString(16).padStart(2, '0')).join(''));
+
+/**
+ * Step a YYYY-MM-DD on by one period. Mirrors addPeriod() in Code.gs, and for
+ * the same reason it takes an anchor: a monthly rule starting on the 31st has
+ * to become the 28th in February and then go back to the 31st in March. All
+ * arithmetic is on the numbers, so no timezone can shift a day underneath it.
+ */
+function addPeriodISO(from, freq, every = 1, anchor = 0) {
+  const [y0, m0, d0] = String(from).split('-').map(Number);
+  const n = clamp(Number(every) || 1, 1, 52);
+  const dim = (y, m) => new Date(Date.UTC(y, m, 0)).getUTCDate();
+  const fmt = (y, m, d) => `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+  if (freq === 'weekly') {
+    const t = new Date(Date.UTC(y0, m0 - 1, d0));
+    t.setUTCDate(t.getUTCDate() + 7 * n);
+    return fmt(t.getUTCFullYear(), t.getUTCMonth() + 1, t.getUTCDate());
+  }
+  if (freq === 'yearly') return fmt(y0 + n, m0, Math.min(anchor || d0, dim(y0 + n, m0)));
+  let m = m0 + n;
+  const y = y0 + Math.floor((m - 1) / 12);
+  m = ((m - 1) % 12) + 1;
+  return fmt(y, m, Math.min(anchor || d0, dim(y, m)));
+}
 const hexBytes = n => [...crypto.getRandomValues(new Uint8Array(n))].map(b => b.toString(16).padStart(2, '0')).join('');
 
 function money(n, withSign = false) {
@@ -183,7 +208,8 @@ const LS = {
 
 const S = {
   api: LS.api, token: LS.token, gate: LS.gate,
-  me: null, users: [], ledgers: [], members: [], config: { symbol: '$', currency: 'USD', appName: 'SplitStack' },
+  me: null, users: [], ledgers: [], members: [], recurring: [],
+  config: { symbol: '$', currency: 'USD', appName: 'SplitStack' },
   cursors: {}, txns: {}, pending: {}, online: navigator.onLine,
   view: 'boot', params: {}, tab: 'feed', syncing: false, lastError: '', updateReady: false,
   searchOpen: false, search: '', reviewOnly: false, apiVersion: 0
@@ -191,7 +217,7 @@ const S = {
 
 /* The backend API this build needs. The Apps Script is pasted in by hand, so
    it can lag the PWA — which updates itself — by any amount. */
-const NEEDS_API = 3;
+const NEEDS_API = 4;
 
 const userById = id => S.users.find(u => u.id === id) || { id, name: 'Unknown', color: '#8A84A6', emoji: '👤', avatar: '' };
 const ledgerById = id => S.ledgers.find(l => l.id === id);
@@ -254,7 +280,24 @@ const ERRORS = {
   GATE_REQUIRED: 'This server needs an access phrase.',
   GATE_INVALID: 'That access phrase is not right.',
   GATE_TOO_SHORT: 'Use at least 6 characters.',
-  BAD_RESPONSE: 'The server sent something unexpected. Is the deployment URL right?'
+  BAD_RESPONSE: 'The server sent something unexpected. Is the deployment URL right?',
+  BAD_EMAIL: "That doesn't look like an email address.",
+  NO_EMAIL_ON_FILE: 'No email address on file for them yet.',
+  NOTIFY_OFF: "They've turned email off.",
+  NUDGE_TOO_SOON: 'You nudged them recently — give it a few hours.',
+  NOTHING_OWED: "They don't owe anything right now.",
+  YOU_ARE_NOT_OWED: "You're not owed anything on this ledger.",
+  CANNOT_NUDGE_SELF: "You can't nudge yourself.",
+  MAIL_QUOTA_EXHAUSTED: "Your Google account's daily email limit is used up. Try tomorrow.",
+  NOT_A_MEMBER: "They're not on this ledger.",
+  PAYER_NOT_A_MEMBER: "Whoever pays it has to be on the ledger.",
+  BAD_FREQUENCY: 'Pick weekly, monthly or yearly.',
+  BAD_DATE: 'That date is not valid.',
+  BAD_AMOUNT: 'Add an amount first.',
+  AMOUNT_TOO_LARGE: "That's larger than this app will store.",
+  NAME_REQUIRED: 'Give it a name.',
+  SPLIT_REQUIRED: 'Pick who splits it.',
+  NO_SUCH_RULE: 'That repeating expense is gone.'
 };
 const errMsg = e => ERRORS[e && e.code] || (e && e.message) || 'Something went wrong.';
 
@@ -269,13 +312,18 @@ function syncBadge(text, cls) {
 async function applyState(st) {
   S.me = st.me; S.users = st.users; S.ledgers = st.ledgers; S.members = st.members;
   S.config = st.config || S.config;
-  await DB.set('state', { me: st.me, users: st.users, ledgers: st.ledgers, members: st.members, config: st.config });
+  // A backend too old to know about rules sends nothing rather than an empty
+  // list — keep what we had instead of blanking the screen.
+  if (st.recurring) S.recurring = st.recurring;
+  await DB.set('state', { me: st.me, users: st.users, ledgers: st.ledgers, members: st.members,
+                          recurring: S.recurring, config: st.config });
   document.title = (S.config.appName || 'SplitStack');
 }
 
 async function loadCache() {
   const st = await DB.get('state');
-  if (st) { S.me = st.me; S.users = st.users; S.ledgers = st.ledgers; S.members = st.members; S.config = st.config || S.config; }
+  if (st) { S.me = st.me; S.users = st.users; S.ledgers = st.ledgers; S.members = st.members;
+            S.recurring = st.recurring || []; S.config = st.config || S.config; }
   S.cursors = (await DB.get('cursors')) || {};
   for (const l of S.ledgers) {
     const rows = await DB.allTxns(l.id);
@@ -360,6 +408,23 @@ async function sync({ silent = false, full = false } = {}) {
         }
         await DB.unqueue(it.seq);
       }
+
+      /* repeating-expense rules and saved splits — small, rare, and safe to
+         replay, so they drain the same way everything else does */
+      for (const it of ob.filter(o => o.kind === 'rule' || o.kind === 'preset')) {
+        try {
+          if (it.kind === 'preset') await api('setPresets', it.payload);
+          else if (it.payload.op === 'delete') await api('recurringDelete', { id: it.payload.id });
+          else await api('recurringSave', it.payload);
+        } catch (e) {
+          if (e.code === 'OFFLINE') throw e;
+          // An old backend can't store either of these yet. Hold the queue so
+          // they land the moment the script is updated, exactly like reviews.
+          if (/^UNKNOWN_ACTION/.test(e.code || '')) { S.apiVersion = Math.min(S.apiVersion || 3, 3); break; }
+          toast(errMsg(e));    // rejected on its merits — say so rather than retry forever
+        }
+        await DB.unqueue(it.seq);
+      }
       await refreshPending();
 
       /* Once per session, check the backend is new enough to store reviews at
@@ -426,6 +491,45 @@ async function queueReview(ledgerId, txnId, op, note = '') {
   }
   await DB.queue({ kind: 'review', ledgerId, payload: { ledgerId, txnId, op, note }, ts: Date.now() });
   render();
+  sync({ silent: true });
+}
+
+/* ────────────────────────────────────────────── repeating rules & presets */
+/**
+ * Both live on the server rather than in the transaction stream, but both are
+ * things you reach for while standing in a shop with no signal, so both go
+ * through the outbox. The local copy updates immediately and the server's
+ * version replaces it on the next sync.
+ */
+const rulesFor = ledgerId => S.recurring.filter(r => r.ledgerId === ledgerId);
+const ruleById = id => S.recurring.find(r => r.id === id);
+const presetsOf = l => (l && l.presets) || [];
+
+async function queueRule(rule) {
+  const i = S.recurring.findIndex(r => r.id === rule.id);
+  if (i >= 0) S.recurring[i] = rule; else S.recurring.push(rule);
+  await DB.set('state', { me: S.me, users: S.users, ledgers: S.ledgers, members: S.members,
+                          recurring: S.recurring, config: S.config });
+  await DB.queue({ kind: 'rule', payload: rule, ts: Date.now() });
+  render();
+  sync({ silent: true });
+}
+
+async function queueRuleDelete(id) {
+  S.recurring = S.recurring.filter(r => r.id !== id);
+  await DB.set('state', { me: S.me, users: S.users, ledgers: S.ledgers, members: S.members,
+                          recurring: S.recurring, config: S.config });
+  await DB.queue({ kind: 'rule', payload: { id, op: 'delete' }, ts: Date.now() });
+  render();
+  sync({ silent: true });
+}
+
+async function queuePresets(ledgerId, presets) {
+  const l = ledgerById(ledgerId);
+  if (l) l.presets = presets;
+  await DB.set('state', { me: S.me, users: S.users, ledgers: S.ledgers, members: S.members,
+                          recurring: S.recurring, config: S.config });
+  await DB.queue({ kind: 'preset', payload: { ledgerId, presets }, ts: Date.now() });
   sync({ silent: true });
 }
 
@@ -618,6 +722,41 @@ function myBalance(ledgerId) {
   return S.me ? (b[S.me.id] || 0) : 0;
 }
 
+/**
+ * Drop anyone no longer on the ledger and rescale the rest back to 100.
+ * Mirrors normaliseSplit() in Code.gs — a saved split or a repeating rule
+ * outlives the housemate who moved out, and the percentages have to still add
+ * up when it does. Returns null when nobody named in it is left.
+ */
+function normaliseSplit(split, memberIds) {
+  const kept = {};
+  let sum = 0;
+  Object.keys(split || {}).forEach(k => {
+    if (!memberIds.includes(k)) return;
+    const v = Number(split[k]) || 0;
+    if (v <= 0) return;
+    kept[k] = v; sum += v;
+  });
+  const ids = Object.keys(kept);
+  if (!ids.length || sum <= 0) return null;
+  if (Math.abs(sum - 100) < 0.005) return kept;
+  const out = {};
+  let acc = 0;
+  ids.forEach((k, i) => {
+    if (i === ids.length - 1) out[k] = round2(100 - acc);
+    else { const v = round2(kept[k] / sum * 100); out[k] = v; acc = round2(acc + v); }
+  });
+  return out;
+}
+
+/** True when a split is just "everyone in it, evenly". */
+function isEvenSplit(split) {
+  const vals = Object.values(split || {});
+  if (!vals.length) return false;
+  const eq = 100 / vals.length;
+  return vals.every(v => Math.abs(v - eq) < 0.02);
+}
+
 /* ─────────────────────────────────────────────────────────────────── review */
 /**
  * Three ways a row ends up wanting a second pair of eyes:
@@ -739,16 +878,26 @@ function routeFromHash() {
 }
 
 /* ──────────────────────────────────────────────────────────────────── sheets */
+/* Sheets stack — saving a split from inside the expense editor opens a second
+   one on top of the first. Counting them keeps the body scroll lock balanced,
+   so closing the inner sheet doesn't unlock the page behind the outer one. */
+let sheetDepth = 0;
+
 function openSheet(html, opts = {}) {
   const scrim = document.createElement('div');
   scrim.className = 'scrim';
   scrim.innerHTML = `<div class="sheet"><div class="grip"></div>${html}</div>`;
   document.body.appendChild(scrim);
+  sheetDepth++;
   document.body.style.overflow = 'hidden';
   requestAnimationFrame(() => scrim.classList.add('on'));
+  let closed = false;
   const close = () => {
+    if (closed) return;
+    closed = true;
     scrim.classList.remove('on');
-    document.body.style.overflow = '';
+    sheetDepth = Math.max(0, sheetDepth - 1);
+    if (!sheetDepth) document.body.style.overflow = '';
     setTimeout(() => scrim.remove(), 340);
     opts.onClose && opts.onClose();
   };
@@ -874,8 +1023,9 @@ function backendBanner() {
   return `<div class="card mb reviewnote">
     <div class="flex"><span style="font-size:26px">🔌</span>
       <div class="grow"><div class="ttl">Your backend script is out of date</div>
-        <div class="sub" style="white-space:normal">Reviews and flags can't sync until it's updated.
-          Anything you've marked is saved on this device and will go through afterwards.</div></div></div>
+        <div class="sub" style="white-space:normal">Reviews, repeating expenses, saved splits and
+          email can't sync until it's updated. Anything you set up meanwhile is saved on this
+          device and goes through afterwards.</div></div></div>
     <div class="tiny mt" style="line-height:1.5">Open your spreadsheet ▸ <b>Extensions ▸ Apps Script</b>,
       paste the latest <b>Code.gs</b> over what's there, then
       <b>Deploy ▸ Manage deployments ▸ ✏️ ▸ Version: New version ▸ Deploy</b>.</div>
@@ -1197,9 +1347,177 @@ function ledgerFeed(l) {
   // Signing off the last one takes the banner away with it, so the filter must
   // not be able to outlive the control that turns it off.
   if (S.reviewOnly && !myReviews(l.id).length) S.reviewOnly = false;
-  if (!liveTxns(l.id).length) return `<div class="empty"><span class="big">🧾</span><h3>Nothing here yet</h3>
-    <p>Tap the + to log the first expense.</p></div>`;
-  return reviewBanner(l) + (S.searchOpen ? searchBar() : '') + `<div id="feed-list">${feedList(l)}</div>`;
+  if (!liveTxns(l.id).length) return recurringCard(l) + `<div class="empty"><span class="big">🧾</span>
+    <h3>Nothing here yet</h3><p>Tap the + to log the first expense.</p></div>`;
+  return reviewBanner(l) + recurringCard(l) + (S.searchOpen ? searchBar() : '') +
+    `<div id="feed-list">${feedList(l)}</div>`;
+}
+
+/**
+ * The standing orders on this ledger. Only appears once there is one — the way
+ * in is the Repeats field on a new expense, so an empty ledger isn't wearing a
+ * control for a thing it doesn't have.
+ */
+function recurringCard(l) {
+  const rules = rulesFor(l.id);
+  if (!rules.length || S.searchOpen) return '';
+  const on = rules.filter(r => r.active);
+  const next = on.map(r => r.nextDate).filter(Boolean).sort()[0];
+  // What actually lands on that date — summing every rule regardless of
+  // frequency would quote a total that never occurs.
+  const due = round2(on.filter(r => r.nextDate === next).reduce((a, r) => a + (Number(r.amount) || 0), 0));
+  return `<button class="card mb" data-act="recurring" style="display:block;width:100%;text-align:left;cursor:pointer">
+    <div class="flex"><span style="font-size:24px">🔁</span>
+      <div class="grow"><div class="ttl">${on.length || 'No'} repeating ${on.length === 1 ? 'expense' : 'expenses'}
+        ${rules.length > on.length ? `<span class="pill">${rules.length - on.length} paused</span>` : ''}</div>
+        <div class="sub">${next ? `Next: ${esc(niceDate(next))}${due ? ' · ' + esc(money(due)) : ''}`
+          : 'All paused'}</div></div>
+      <div>›</div></div>
+  </button>`;
+}
+
+/** The list of rules, and the way into editing any one of them. */
+function recurringSheet(ledger) {
+  const sheet = openSheet('<div id="rc-body"></div>');
+  const draw = () => {
+    const rules = rulesFor(ledger.id).slice()
+      .sort((a, b) => Number(b.active) - Number(a.active) || (a.nextDate || '').localeCompare(b.nextDate || ''));
+    $('#rc-body', sheet).innerHTML = `
+      <h2>Repeating expenses</h2>
+      <p class="sheet-sub">${esc(ledger.emoji)} ${esc(ledger.name)} — rent, bills, the cleaner.
+        They post themselves and split the way you set them.</p>
+      ${S.config.jobs === false ? `<div class="card mb reviewnote"><div class="flex">
+        <span style="font-size:22px">⏰</span><div class="grow">
+        <div class="ttl">Automatic posting is switched off</div>
+        <div class="sub" style="white-space:normal">In your spreadsheet, choose
+          <b>SplitStack ▸ Check background jobs</b>. Rules are saved either way, but nothing
+          posts until that is on.</div></div></div></div>` : ''}
+      ${rules.length ? `<div class="card">${rules.map(r => {
+        const u = userById(r.paidBy);
+        // Three facts in one line runs out of room on a narrow phone, and the
+        // one that gets cut is the date — the thing you opened this to see.
+        return `<div class="row-item tap" data-rule="${esc(r.id)}">
+          <div class="av m" style="background:${r.active ? esc(ledger.color) : 'var(--ink-3)'}">${esc(catEmoji(r.category))}</div>
+          <div class="grow"><div class="ttl">${esc(r.name)}${r.review ? ' 👀' : ''}</div>
+            <div class="sub" style="white-space:normal">${esc(REPEAT_LABEL[r.freq] || r.freq)} ·
+              ${esc(u.name.split(' ')[0])} pays ·
+              ${r.active ? 'next ' + esc(niceDate(r.nextDate)) : '<b>paused</b>'}</div></div>
+          <div class="num mono">${money(r.amount)}</div><div>›</div></div>`;
+      }).join('')}</div>`
+        : `<div class="empty" style="padding:26px"><span class="big" style="font-size:44px">🔁</span>
+            <h3>Nothing repeats yet</h3>
+            <p>Tick <b>Repeats</b> when you log an expense and it lands here.</p></div>`}
+      <button class="btn ghost block mt" data-x="close">Done</button>`;
+  };
+  sheet.addEventListener('click', e => {
+    const el = e.target.closest('[data-x],[data-rule]');
+    if (!el) return;
+    if (el.dataset.x === 'close') return sheet.close();
+    const r = ruleById(el.dataset.rule);
+    if (r) ruleSheet(ledger, r, () => draw());
+  });
+  draw();
+}
+
+/** Edit one rule: amount, payer, schedule, pause, delete. */
+function ruleSheet(ledger, rule, onDone) {
+  const ids = memberIdsOf(ledger.id);
+  const st = Object.assign({}, rule, { split: Object.assign({}, rule.split) });
+  const sheet = openSheet('<div id="rr-body"></div>', { onClose: () => onDone && onDone() });
+
+  const draw = () => {
+    const split = normaliseSplit(st.split, ids);
+    $('#rr-body', sheet).innerHTML = `
+      <h2>${esc(st.name)}</h2>
+      <p class="sheet-sub">${st.active
+        ? esc(repeatBlurb(st.freq, st.nextDate))
+        : 'Paused — nothing posts until you resume it.'}</p>
+
+      <div class="amount-wrap mb"><span class="cur">${esc(S.config.symbol || '$')}</span>
+        <input id="r-amount" type="text" inputmode="decimal" placeholder="0.00" value="${esc(String(st.amount || ''))}"></div>
+
+      <div class="field"><label>What it's called</label>
+        <input class="input" id="r-name" maxlength="120" value="${esc(st.name)}"></div>
+
+      <div class="field"><label>How often</label>
+        <div class="chips">${['weekly', 'monthly', 'yearly'].map(f =>
+          `<button class="chip ${st.freq === f ? 'on' : ''}" data-freq="${f}">${REPEAT_LABEL[f]}</button>`).join('')}</div></div>
+
+      <div class="field"><label>Next one lands</label>
+        <input class="input" id="r-next" type="date" value="${esc(st.nextDate)}"></div>
+
+      <div class="field"><label>Who pays it</label>
+        <div class="chips">${ids.map(i => { const u = userById(i);
+          return `<button class="chip ${st.paidBy === i ? 'on' : ''}" data-payer="${esc(i)}">${avatar(u, 's')}${esc(u.name)}</button>`;
+        }).join('')}</div></div>
+
+      <div class="field"><label>Split</label>
+        ${split ? `<div class="card" style="padding:12px">${Object.keys(split).map(i =>
+          `<div class="row-item" style="padding:5px 0">${avatar(userById(i), 's')}
+            <div class="grow"><div class="ttl" style="font-size:14px">${esc(userById(i).name)}</div></div>
+            <div class="num mono" style="font-size:14px">${esc(money(st.amount * split[i] / 100))} · ${round2(split[i])}%</div>
+          </div>`).join('')}</div>`
+          : `<p class="hint">Nobody in this split is on the ledger any more — edit it from a new expense instead.</p>`}
+        <p class="hint">Set from the expense you created it with. To change it, delete this and
+          repeat a fresh one.</p></div>
+
+      <button class="chip ${st.review ? 'on' : ''}" data-x="review">
+        ${st.review ? '☑' : '☐'} 👀 Ask everyone to check each one</button>
+
+      <div class="flex mt">
+        <button class="btn ghost" data-x="delete">🗑</button>
+        <button class="btn ghost grow" data-x="pause">${st.active ? 'Pause' : 'Resume'}</button>
+        <button class="btn grow" data-x="save">Save</button>
+      </div>`;
+  };
+
+  const read = () => {
+    const a = parseFloat(($('#r-amount', sheet) || {}).value || '0');
+    st.amount = isNaN(a) ? 0 : Math.max(0, a);
+    st.name = (($('#r-name', sheet) || {}).value || '').trim();
+    st.nextDate = ($('#r-next', sheet) || {}).value || st.nextDate;
+  };
+
+  sheet.addEventListener('click', async e => {
+    const el = e.target.closest('[data-x],[data-freq],[data-payer]');
+    if (!el) return;
+    read();
+    if (el.dataset.freq) { st.freq = el.dataset.freq; haptic(); }
+    else if (el.dataset.payer) { st.paidBy = el.dataset.payer; haptic(); }
+    else if (el.dataset.x === 'review') { st.review = !st.review; haptic(); }
+    else if (el.dataset.x === 'pause') {
+      st.active = !st.active;
+      await queueRule(Object.assign({}, st, { anchor: Number(String(st.nextDate).slice(8, 10)) }));
+      toast(st.active ? 'Resumed 🔁' : 'Paused');
+      sheet.close();
+      return;
+    }
+    else if (el.dataset.x === 'delete') {
+      sheet.close();
+      if (await confirmSheet('Stop repeating this?',
+        'Entries it has already posted stay exactly where they are. It just stops adding new ones.',
+        'Stop repeating')) {
+        await queueRuleDelete(st.id);
+        toast('Stopped');
+      }
+      return;
+    }
+    else if (el.dataset.x === 'save') {
+      if (!st.name) return toast('Give it a name');
+      if (!(st.amount > 0)) return toast('Add an amount');
+      if (!normaliseSplit(st.split, ids)) return toast('Nobody in that split is on the ledger');
+      await queueRule(Object.assign({}, st, {
+        amount: round2(st.amount),
+        anchor: Number(String(st.nextDate).slice(8, 10))
+      }));
+      haptic(25); toast('Saved ✓');
+      sheet.close();
+      return;
+    }
+    draw();
+  });
+
+  draw();
 }
 
 function feedList(l) {
@@ -1293,10 +1611,14 @@ function ledgerBalances(l) {
   const settleList = debts.length ? debts.map(d => {
     const f = userById(d.from), t = userById(d.to);
     const involvesMe = d.from === S.me.id || d.to === S.me.id;
+    // Only the person actually owed the money gets to send the reminder, and
+    // only when there is an address to send it to.
+    const canNudge = d.to === S.me.id && f.notify !== false && !!f.email && S.apiVersion >= NEEDS_API;
     return `<div class="row-item">
       ${avatar(f, 'm')}<div style="font-size:18px;color:var(--ink-3)">→</div>${avatar(t, 'm')}
       <div class="grow"><div class="ttl">${money(d.amount)}</div>
         <div class="sub">${esc(f.name)} pays ${esc(t.name)}</div></div>
+      ${canNudge ? `<button class="btn sm ghost" data-nudge="${esc(d.from)}" title="Email a reminder">👋</button>` : ''}
       <button class="btn sm ${involvesMe ? 'good' : 'ghost'}" data-settle='${esc(JSON.stringify(d))}'>Settle</button></div>`;
   }).join('') : `<div class="empty" style="padding:26px"><span class="big" style="font-size:44px">🎉</span>
       <h3>Everyone's square</h3><p>Nothing owed in either direction.</p></div>`;
@@ -1425,6 +1747,24 @@ function viewProfile() {
         <div class="grow"><div class="ttl">Sign out</div><div class="sub">Clears this device</div></div><div>›</div></div>
     </div>
 
+    <div class="section-title">Email</div>
+    <div class="card">
+      <div class="field"><label>Where to reach you</label>
+        <input class="input" id="p-email" type="email" inputmode="email" autocomplete="email"
+          placeholder="you@example.com" value="${esc(u.email || '')}"></div>
+      <div class="row-item tap" data-act="toggle-notify">
+        <div class="av m" style="background:${u.notify === false ? 'var(--ink-3)' : 'var(--good)'}">${u.notify === false ? '🔕' : '🔔'}</div>
+        <div class="grow"><div class="ttl">Email me updates</div>
+          <div class="sub">${u.notify === false
+            ? 'Off — no summaries, and nobody can nudge you'
+            : 'Where you stand, what changed, and anything waiting on you'}</div></div>
+        <span class="pill ${u.notify === false ? 'no' : 'ok'}">${u.notify === false ? 'OFF' : 'ON'}</span></div>
+      <button class="btn block mt" data-act="save-profile">Save</button>
+      <p class="hint">${u.email
+        ? 'Summaries follow the schedule your admin sets. Nudges arrive when somebody you owe sends one.'
+        : "Without an address there's nothing to send to — everything else works exactly the same."}</p>
+    </div>
+
     <div class="section-title">App &amp; updates</div>
     <div class="card">
       <div class="row-item">
@@ -1493,6 +1833,23 @@ function viewAdmin() {
         <span class="pill ok">ON</span></div>
     </div>
 
+    <div class="section-title">Notifications</div>
+    <div class="card">
+      ${S.config.jobs === false ? `<div class="card mb reviewnote"><div class="flex">
+        <span style="font-size:22px">⏰</span><div class="grow">
+          <div class="ttl">Background jobs aren't running</div>
+          <div class="sub" style="white-space:normal">Repeating expenses and email summaries both need them.
+            Open your spreadsheet and choose <b>SplitStack ▸ Check background jobs</b>.</div></div></div></div>` : ''}
+      <div class="field"><label>Email summary</label>
+        <div class="seg">${[['off', 'Off'], ['weekly', 'Weekly'], ['daily', 'Daily']].map(([v, lbl]) =>
+          `<button data-digest="${v}" class="${(S.config.digest || 'weekly') === v ? 'on' : ''}">${lbl}</button>`).join('')}</div>
+        <p class="hint">Sent in the morning${(S.config.digest || 'weekly') === 'weekly' ? ' on Mondays' : ''} to
+          everyone with an address on file. Quiet weeks send nothing at all.</p></div>
+      <div class="row-item tap" data-act="test-digest"><div class="av m" style="background:var(--sky)">✉️</div>
+        <div class="grow"><div class="ttl">Send me one now</div>
+          <div class="sub">A real summary, to your address only</div></div><div>›</div></div>
+    </div>
+
     <div class="section-title">App</div>
     <div class="card">
       <div class="field"><label>App name</label><input class="input" id="a-name" value="${esc(S.config.appName || 'SplitStack')}"></div>
@@ -1502,6 +1859,107 @@ function viewAdmin() {
       </div>
       <button class="btn block" data-act="save-config">Save</button>
     </div>`, { back: true });
+}
+
+/* ═══════════════════════════════════════════════ saved splits & repeats */
+const REPEATS = [['never', "Doesn't repeat"], ['weekly', 'Weekly'], ['monthly', 'Monthly'], ['yearly', 'Yearly']];
+const REPEAT_LABEL = { weekly: 'Weekly', monthly: 'Monthly', yearly: 'Yearly' };
+const REPEAT_ADVERB = { weekly: 'weekly', monthly: 'monthly', yearly: 'yearly' };
+
+const ORDINAL = n => n + (['th', 'st', 'nd', 'rd'][(n % 100 - 20) % 10] || ['th', 'st', 'nd', 'rd'][n % 100] || 'th');
+
+/** Plain English for what a schedule will actually do. */
+function repeatBlurb(freq, date) {
+  if (!freq || freq === 'never' || !date) return '';
+  const d = new Date(date + 'T00:00:00');
+  const next = addPeriodISO(date, freq, 1, Number(date.slice(8, 10)));
+  const when = freq === 'weekly' ? `every ${d.toLocaleDateString(undefined, { weekday: 'long' })}`
+    : freq === 'yearly' ? `every year on ${d.toLocaleDateString(undefined, { month: 'long', day: 'numeric' })}`
+    : `on the ${ORDINAL(Number(date.slice(8, 10)))} of each month`;
+  return `Posts ${when} — next on ${niceDate(next)}.`;
+}
+
+/**
+ * The saved-split chips above the member toggles. Only shown once a ledger has
+ * presets or has enough people for one to be worth saving — an empty control
+ * on a two-person ledger is just noise.
+ */
+function presetChips(ledger, ids) {
+  const list = presetsOf(ledger);
+  if (!list.length && ids.length < 3) return '';
+  return `<div class="chips mb">
+    ${list.map(p => `<button class="chip ghost" data-preset="${esc(p.id)}" title="${esc(p.name)}">
+      🔖 ${esc(p.name)}</button>`).join('')}
+    <button class="chip ghost" data-preset="__save">${list.length ? '＋ Save / manage' : '＋ Save this split'}</button>
+  </div>`;
+}
+
+/**
+ * Name the split you have set up, and tidy up the ones you saved before.
+ * Membership is the bar, not admin: the person who enters the rent is not
+ * necessarily the person who made the ledger.
+ */
+function presetSheet(ledger, currentSplit, onDone) {
+  const ids = memberIdsOf(ledger.id);
+  const usable = normaliseSplit(currentSplit, ids);
+  const sheet = openSheet('<div id="ps-body"></div>', { onClose: () => onDone && onDone() });
+
+  const draw = () => {
+    const list = presetsOf(ledger);
+    $('#ps-body', sheet).innerHTML = `
+      <h2>Saved splits</h2>
+      <p class="sheet-sub">Rent 40/30/30, or everyone-but-Ben. Save it once, tap it after that.</p>
+
+      ${usable ? `<div class="field"><label>Save what you have now</label>
+        <div class="card mb" style="padding:12px">
+          ${Object.keys(usable).map(i => `<div class="row-item" style="padding:5px 0">
+            ${avatar(userById(i), 's')}<div class="grow"><div class="ttl" style="font-size:14px">${esc(userById(i).name)}</div></div>
+            <div class="num mono" style="font-size:14px">${round2(usable[i])}%</div></div>`).join('')}
+        </div>
+        <div class="flex"><input class="input grow" id="ps-name" maxlength="40" placeholder="Rent split">
+          <button class="btn" data-x="save">Save</button></div></div>`
+        : `<p class="hint">Pick who splits it first, then come back to save that as a preset.</p>`}
+
+      ${list.length ? `<div class="section-title">Saved on this ledger</div>
+        <div class="card">${list.map(p => `<div class="row-item">
+          <div class="av m" style="background:${esc(ledger.color)}">🔖</div>
+          <div class="grow"><div class="ttl">${esc(p.name)}</div>
+            <div class="sub">${Object.keys(p.split).map(i => esc(userById(i).name.split(' ')[0]) +
+              ' ' + round2(p.split[i]) + '%').join(' · ')}</div></div>
+          <button class="iconbtn" data-del="${esc(p.id)}" title="Delete">🗑</button></div>`).join('')}</div>` : ''}
+
+      <button class="btn ghost block mt" data-x="close">Done</button>`;
+  };
+
+  sheet.addEventListener('click', async e => {
+    const el = e.target.closest('[data-x],[data-del]');
+    if (!el) return;
+    if (el.dataset.x === 'close') return sheet.close();
+    if (el.dataset.del) {
+      const next = presetsOf(ledger).filter(p => p.id !== el.dataset.del);
+      await queuePresets(ledger.id, next);
+      haptic(); toast('Deleted');
+      return draw();
+    }
+    if (el.dataset.x === 'save') {
+      const name = ($('#ps-name', sheet) || {}).value.trim();
+      if (!name) return toast('Give it a name');
+      if (!usable) return toast('Pick who splits it first');
+      const list = presetsOf(ledger);
+      if (list.length >= 12) return toast('Twelve saved splits is the limit');
+      // Saving over a name you already used replaces it rather than making a
+      // second chip that looks identical.
+      const at = list.findIndex(p => p.name.toLowerCase() === name.toLowerCase());
+      const entry = { id: at >= 0 ? list[at].id : 'pst_' + Date.now().toString(36), name, split: usable };
+      const next = list.slice();
+      if (at >= 0) next[at] = entry; else next.push(entry);
+      await queuePresets(ledger.id, next);
+      haptic(25); toast(`Saved “${name}” ✓`);
+      return draw();
+    }
+  });
+
+  draw();
 }
 
 /* ══════════════════════════════════════════════════════ sheets: expense */
@@ -1518,8 +1976,13 @@ function expenseSheet(ledger, existing) {
     mode: 'equal', receiptId: t.receiptId || '', receiptLocal: t._receiptLocal || '',
     receiptPreview: '',
     parts: Object.assign({}, t.split),
-    on: {}, locked: {}
+    on: {}, locked: {},
+    // Repeating is offered on the way in only. Turning an entry that already
+    // exists into a rule would need the row to remember which rule it made, or
+    // every re-save would spawn another one.
+    repeat: 'never', repeatReview: false
   };
+  const fromRule = /^rec_/.test(t.id || '');
   if (!Object.keys(ed.parts).length) ids.forEach(i => ed.on[i] = true);
   else ids.forEach(i => { if (ed.parts[i] !== undefined) ed.on[i] = true; });
   if (existing && Object.keys(t.split).length) {
@@ -1573,11 +2036,23 @@ function expenseSheet(ledger, existing) {
 
       <div class="field"><label>Date</label><input class="input" id="f-date" type="date" value="${esc(ed.date)}"></div>
 
+      ${existing ? (fromRule ? `<div class="field"><div class="hint" style="margin:0">
+          🔁 This one was posted by a repeating rule. Editing it here changes this month only —
+          use <b>Repeating</b> on the ledger to change the rule itself.</div></div>` : '')
+        : `<div class="field"><label>Repeats</label>
+        <div class="chips">${REPEATS.map(([v, lbl]) =>
+          `<button class="chip ${ed.repeat === v ? 'on' : ''}" data-rep="${esc(v)}">${lbl}</button>`).join('')}</div>
+        ${ed.repeat !== 'never' ? `<div class="hint" style="margin:8px 0 0">
+          ${esc(repeatBlurb(ed.repeat, ed.date))}</div>
+          <button class="chip mt ${ed.repeatReview ? 'on' : ''}" data-repreview="1">
+            ${ed.repeatReview ? '☑' : '☐'} Ask everyone to check each one</button>` : ''}</div>`}
+
       <div class="field"><label>Who paid</label>
         <div class="chips">${ids.map(i => { const u = userById(i);
           return `<button class="chip ${ed.paidBy === i ? 'on' : ''}" data-paid="${esc(i)}">${avatar(u, 's')}${esc(u.name)}</button>`; }).join('')}</div></div>
 
       <div class="field"><label>Split between</label>
+        ${presetChips(ledger, ids)}
         <div class="chips mb">${ids.map(i => { const u = userById(i);
           return `<button class="chip ${ed.on[i] ? 'on' : ''}" data-tog="${esc(i)}">${avatar(u, 's')}${esc(u.name)}</button>`; }).join('')}</div>
         <div class="seg mb">
@@ -1642,11 +2117,36 @@ function expenseSheet(ledger, existing) {
     if (Math.abs(drift) > 0.001) ed.parts[free[0]] = round2(ed.parts[free[0]] + drift);
   }
 
+  /** Load a saved split into the editor, keeping only people still on the ledger. */
+  function applyPreset(p) {
+    const split = normaliseSplit(p.split, ids);
+    if (!split) return toast('Nobody in that split is on this ledger any more');
+    ed.on = {}; ed.locked = {}; ed.parts = {};
+    Object.keys(split).forEach(i => { ed.on[i] = true; ed.parts[i] = split[i]; });
+    ed.mode = isEvenSplit(split) ? 'equal' : 'percent';
+    if (ed.mode === 'equal') equalise();
+    haptic(); toast(`Split: ${p.name}`);
+  }
+
   sheet.addEventListener('click', async e => {
-    const el = e.target.closest('[data-cat],[data-paid],[data-tog],[data-mode],[data-lock],[data-act]');
+    const el = e.target.closest('[data-cat],[data-paid],[data-tog],[data-mode],[data-lock],[data-rep],[data-repreview],[data-preset],[data-act]');
     if (!el) return;
     readFields();
     if (el.dataset.cat) { ed.category = el.dataset.cat; haptic(); }
+    else if (el.dataset.rep) { ed.repeat = el.dataset.rep; haptic(); }
+    else if (el.dataset.repreview) { ed.repeatReview = !ed.repeatReview; haptic(); }
+    else if (el.dataset.preset) {
+      if (el.dataset.preset === '__save') {
+        // Opens on top rather than replacing this sheet — a half-filled
+        // expense must not be lost to a detour through a settings screen.
+        const on = ids.filter(i => ed.on[i]);
+        const split = {}; on.forEach(i => split[i] = round2(Number(ed.parts[i]) || 0));
+        presetSheet(ledger, split, () => draw());
+        return;
+      }
+      const p = presetsOf(ledger).find(x => x.id === el.dataset.preset);
+      if (p) applyPreset(p);
+    }
     else if (el.dataset.paid) { ed.paidBy = el.dataset.paid; haptic(); }
     else if (el.dataset.tog) {
       const i = el.dataset.tog; ed.on[i] = !ed.on[i];
@@ -1707,10 +2207,26 @@ function expenseSheet(ledger, existing) {
         Object.assign(txn, reviewPatch(existing, txn));
         sheet.close();
         await queueTxn(ledger.id, txn);
+
+        // The entry just logged is the first occurrence, so the rule starts
+        // from the one after it.
+        if (!existing && ed.repeat !== 'never') {
+          const anchor = Number(txn.date.slice(8, 10));
+          await queueRule({
+            id: ruleId(), ledgerId: ledger.id, name: txn.name, category: txn.category,
+            amount: txn.amount, paidBy: txn.paidBy, split, notes: txn.notes,
+            freq: ed.repeat, every: 1, anchor,
+            nextDate: addPeriodISO(txn.date, ed.repeat, 1, anchor),
+            active: true, review: ed.repeatReview, createdBy: S.me.id, lastRun: ''
+          });
+        }
+
         haptic(25);
         toast(existing
           ? (txn.reviewNote ? `Saved · ${userById(existing.enteredBy).name} will review it` : 'Saved ✓')
-          : `${money(txn.amount)} added ✓`);
+          : ed.repeat !== 'never'
+            ? `${money(txn.amount)} added · repeats ${REPEAT_ADVERB[ed.repeat]} 🔁`
+            : `${money(txn.amount)} added ✓`);
         if (!existing) confetti(50);
         return;
       }
@@ -1807,6 +2323,41 @@ function settleSheet(ledger, preset) {
     draw();
   });
   draw();
+}
+
+/* ─────────────────────────────────────────────────────────── nudge sheet */
+/**
+ * A reminder is a message from a person, not a system alert, so it gets a
+ * confirmation step and an optional line of your own. The amount is worked out
+ * on the server from the ledger itself — this screen shows what it will say,
+ * it doesn't decide it.
+ */
+function nudgeSheet(ledger, target) {
+  const net = balancesFor(ledger.id);
+  const owed = round2(Math.min(-(net[target.id] || 0), net[S.me.id] || 0));
+  const sheet = openSheet(`
+    <div class="center mb">${avatar(target, 'xl')}
+      <h2 class="mt">Nudge ${esc(target.name)}?</h2>
+      <p class="hint">We'll email them a friendly reminder that they owe you
+        <b>${esc(money(owed))}</b> on ${esc(ledger.emoji)} ${esc(ledger.name)}.</p></div>
+    <div class="field"><label>Add a line (optional)</label>
+      <input class="input" id="n-note" maxlength="300" placeholder="No rush — whenever you get a chance"></div>
+    <p class="hint">One nudge per person per ledger every six hours, so this can't turn into pestering.</p>
+    <div class="flex mt"><button class="btn ghost grow" data-x="no">Cancel</button>
+      <button class="btn grow" data-x="go">👋 Send it</button></div>`);
+
+  sheet.addEventListener('click', async e => {
+    const b = e.target.closest('[data-x]'); if (!b) return;
+    if (b.dataset.x === 'no') return sheet.close();
+    const note = ($('#n-note', sheet) || {}).value.trim();
+    sheet.close();
+    try {
+      syncBadge('<span class="spinner"></span>Sending…');
+      const r = await api('nudge', { ledgerId: ledger.id, userId: target.id, note });
+      syncBadge('');
+      haptic(25); toast(`Nudged ${r.to} for ${money(r.amount)} 👋`);
+    } catch (err) { syncBadge(''); toast(errMsg(err)); }
+  });
 }
 
 /* ───────────────────────────────────────────────────── ledger edit sheet */
@@ -2241,6 +2792,16 @@ function wire() {
     const tabBtn = t.closest('[data-tab]');
     if (tabBtn) { S.tab = tabBtn.dataset.tab; haptic(); return render(); }
 
+    const dg = t.closest('[data-digest]');
+    if (dg) {
+      const mode = dg.dataset.digest;
+      S.config = Object.assign({}, S.config, { digest: mode });
+      haptic(); render();
+      try { await api('adminSetConfig', { digest: mode }); toast(mode === 'off' ? 'Summaries off' : `Summaries: ${mode}`); }
+      catch (err) { toast(errMsg(err)); await sync({ silent: true }); }
+      return;
+    }
+
     const led = t.closest('[data-ledger]');
     if (led) { S.tab = 'feed'; return go('ledger', { id: led.dataset.ledger }); }
 
@@ -2254,6 +2815,9 @@ function wire() {
 
     const set = t.closest('[data-settle]');
     if (set) { settleSheet(ledgerById(S.params.id), JSON.parse(set.dataset.settle)); return; }
+
+    const ndg = t.closest('[data-nudge]');
+    if (ndg) { nudgeSheet(ledgerById(S.params.id), userById(ndg.dataset.nudge)); return; }
 
     const usr = t.closest('[data-user]');
     if (usr) { userSheet(S.users.find(u => u.id === usr.dataset.user)); return; }
@@ -2389,6 +2953,34 @@ async function handle(act, el) {
       return applySearch();
     }
     case 'new-expense': return expenseSheet(ledgerById(S.params.id), null);
+    case 'recurring': return recurringSheet(ledgerById(S.params.id));
+    case 'toggle-notify': {
+      // Flipped locally and saved with the button below, so the toggle and the
+      // address field can't disagree about which of them was saved.
+      S.me.notify = S.me.notify === false;
+      haptic(); return render();
+    }
+    case 'save-profile': {
+      const email = ($('#p-email') || {}).value.trim();
+      try {
+        const r = await api('setProfile', { email, notify: S.me.notify !== false });
+        S.me = r.me;
+        await applyState({ me: S.me, users: S.users, ledgers: S.ledgers, members: S.members, config: S.config });
+        toast('Saved ✓'); render();
+      } catch (err) { toast(errMsg(err)); }
+      return;
+    }
+    case 'test-digest': {
+      try {
+        syncBadge('<span class="spinner"></span>Sending…');
+        const r = await api('adminTestDigest', {});
+        syncBadge('');
+        toast(r.quiet
+          ? 'Nothing to report right now — so nothing was sent'
+          : 'Sent — check your inbox ✉️', 3600);
+      } catch (err) { syncBadge(''); toast(errMsg(err), 3600); }
+      return;
+    }
     case 'record-payment': return settleSheet(ledgerById(S.params.id), null);
     case 'new-user': return userSheet(null);
     case 'change-password': return changePasswordSheet();
