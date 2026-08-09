@@ -206,7 +206,14 @@ const stub = `
         users.push(u); d={user:u}; }
     }
     else if(action==='adminDeleteUser'){ const i=users.findIndex(u=>u.id===payload.id); if(i>=0) users.splice(i,1); d={ok:true}; }
-    else if(action==='adminDeleteLedger'){ const i=ledgers.findIndex(l=>l.id===payload.id); if(i>=0) ledgers.splice(i,1); d={ok:true}; }
+    else if(action==='adminDeleteLedger'){
+      const i=ledgers.findIndex(l=>l.id===payload.id); if(i>=0) ledgers.splice(i,1);
+      /* mirrors the real backend: rules and receipts go with the ledger */
+      for(let k=recurring.length-1;k>=0;k--) if(recurring[k].ledgerId===payload.id) recurring.splice(k,1);
+      const shots=(data[payload.id]||[]).filter(t=>t.receiptId).length;
+      delete data[payload.id];
+      d={ok:true,receiptsTrashed:shots,receiptsLeft:0};
+    }
     else if(action==='setAvatar'){ const u=users.find(x=>x.id===(payload.userId||'u1')); if(u) u.avatar=payload.avatar; d={ok:true,avatar:payload.avatar}; }
     else if(action==='adminSetConfig'){
       if(payload.appName!==undefined) Object.assign(state.config,{appName:payload.appName,currency:payload.currency,symbol:payload.currencySymbol});

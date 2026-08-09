@@ -1241,17 +1241,47 @@ function deleteLedger(p) {
     var l = ledgerById(p.id);
     if (!l) throw new Error('NO_SUCH_LEDGER');
     var sh = ss().getSheetByName(l.SheetName);
+
+    /* Receipt ids live on the rows, so they have to be collected before the tab
+       holding them goes. Keeping the sheet keeps the references with it, and
+       binning the images would strand a tab full of dead links. */
+    var ids = [];
+    if (sh && !p.keepSheet) {
+      var seen = {};
+      readTab(l.SheetName, TXN_COLS).forEach(function (r) {
+        var id = r.ReceiptId ? String(r.ReceiptId) : '';
+        if (!id || seen[id]) return;
+        seen[id] = 1;
+        ids.push(id);
+      });
+    }
+
     if (sh) {
       if (p.keepSheet) sh.setName('archived — ' + l.SheetName);
       else ss().deleteSheet(sh);
     }
     tab(TAB_LEDGERS, LEDGER_COLS).deleteRow(l.__row);
+
     var ms = tab(TAB_MEMBERS, MEMBER_COLS);
     readTab(TAB_MEMBERS, MEMBER_COLS)
       .filter(function (m) { return m.LedgerId === p.id; })
       .sort(function (a, b) { return b.__row - a.__row; })
       .forEach(function (m) { ms.deleteRow(m.__row); });
-    return { ok: true };
+
+    // Repeating rules outlive nothing. Without this they sit in the Recurring
+    // tab forever — harmless, since rollRecurring skips a rule whose ledger has
+    // gone, but they accumulate somewhere the user can see.
+    var rs = tab(TAB_RECURRING, RECUR_COLS);
+    readTab(TAB_RECURRING, RECUR_COLS)
+      .filter(function (r) { return r.LedgerId === p.id; })
+      .sort(function (a, b) { return b.__row - a.__row; })
+      .forEach(function (r) { rs.deleteRow(r.__row); });
+
+    // Last, because it is the slow part and the least important: the ledger is
+    // already gone by the time any of this can fail.
+    var trashed = 0;
+    ids.slice(0, RECEIPT_TRASH_MAX).forEach(function (id) { if (trashReceipt(id)) trashed++; });
+    return { ok: true, receiptsTrashed: trashed, receiptsLeft: Math.max(0, ids.length - RECEIPT_TRASH_MAX) };
   });
 }
 
@@ -1495,13 +1525,23 @@ function push(me, p) {
     readTab(l.SheetName, TXN_COLS).forEach(function (r) { if (r.TxnId) existing[r.TxnId] = r; });
 
     var incoming = p.txns || [];
-    var applied = [], toAppend = [], now = new Date();
+    var applied = [], toAppend = [], orphans = [], now = new Date();
     var revBase = nextRev(incoming.length || 1);
     incoming.forEach(function (t) {
       validateTxn(t);
       var prior = existing[t.id];
       var stamp = revBase + applied.length; // strictly increasing, never reused
       var rev = reviewForChange(me, t, prior);
+
+      /* Attaching a different photo, or removing one, leaves the old file in
+         Drive with nothing pointing at it. Handled here rather than on the
+         client because this is the only place that can see both the row that
+         was and the row that will be.
+
+         Guarded on `undefined` rather than falsiness: a caller that simply
+         omits the field must never be read as "delete their receipt". */
+      var was = (prior && prior.ReceiptId) ? String(prior.ReceiptId) : '';
+      if (was && t.receiptId !== undefined && String(t.receiptId || '') !== was) orphans.push(was);
       var vals = {
         TxnId: t.id,
         Type: t.type || 'expense',
@@ -1514,7 +1554,9 @@ function push(me, p) {
         EnteredBy: t.enteredBy || me.UserId,
         SplitPct: JSON.stringify(t.split || {}),
         Notes: t.notes || '',
-        ReceiptId: t.receiptId || '',
+        // Absent means "unchanged", not "cleared" — a push that forgets the
+        // field shouldn't quietly unlink a receipt.
+        ReceiptId: t.receiptId !== undefined ? (t.receiptId || '') : was,
         Deleted: !!t.deleted,
         CreatedAt: prior ? prior.CreatedAt : new Date(t.createdAt || now),
         UpdatedAt: new Date(),
@@ -1531,6 +1573,10 @@ function push(me, p) {
     });
     appendRows(l.SheetName, TXN_COLS, toAppend);
     SpreadsheetApp.flush();
+
+    // After the rows are committed: if Drive is having a bad day, the worst
+    // outcome is a leftover file, not a lost save.
+    orphans.forEach(trashReceipt);
 
     // Return the merged truth so the client can reconcile immediately.
     var since = Number(p.since || 0);
@@ -1964,6 +2010,29 @@ function receiptFolder() {
   setCfg('receiptFolderId', f.getId());
   return f;
 }
+
+/**
+ * Bin a receipt image. Trashed rather than destroyed, so Drive keeps it for
+ * about thirty days and a mistake stays recoverable — deleting a ledger is
+ * already the one irreversible thing this app does, and there is no reason to
+ * extend that reach into somebody's Drive.
+ *
+ * Best effort on purpose: a file that has already gone, or that the script
+ * cannot see, must never be the reason a delete or a save fails.
+ */
+function trashReceipt(id) {
+  if (!id) return false;
+  try { DriveApp.getFileById(String(id)).setTrashed(true); return true; }
+  catch (e) { return false; }
+}
+
+/**
+ * How many receipts one ledger deletion will bin inline. Each file costs a
+ * couple of Drive calls, and the client gives up on the request long before
+ * the script would — so past this point the rest are left in the folder and
+ * the app says so, rather than the delete timing out half-finished.
+ */
+var RECEIPT_TRASH_MAX = 100;
 
 function putReceipt(me, p) {
   assertMember(me, p.ledgerId);

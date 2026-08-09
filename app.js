@@ -6,7 +6,7 @@
 
 /* Shown in Settings ▸ App & updates. Bump this and SW_BUILD in sw.js together
    whenever you re-upload the app. */
-const APP_BUILD = '2026-08-09.8';
+const APP_BUILD = '2026-08-09.9';
 
 /* ────────────────────────────────────────────────────────────────  helpers */
 const $  = (s, r = document) => r.querySelector(s);
@@ -3137,12 +3137,25 @@ function ledgerSheet(existing) {
     else if (el.dataset.act === 'cancel') return sheet.close();
     else if (el.dataset.act === 'del-ledger') {
       sheet.close();
+      const rules = existing ? rulesFor(st.id).length : 0;
+      const shots = existing
+        ? (S.txns[st.id] || []).filter(t => t.receiptId || t._receiptLocal).length : 0;
+      const also = [
+        rules ? `${rules} repeating expense${rules === 1 ? '' : 's'}` : '',
+        shots ? `${shots} receipt photo${shots === 1 ? '' : 's'}` : ''
+      ].filter(Boolean).join(' and ');
       if (await confirmSheet('Delete "' + st.name + '"?',
-        'The tab and every expense on it are removed from your spreadsheet. This cannot be undone.', 'Delete forever')) {
+        `The tab and every expense on it are removed from your spreadsheet${also ? ', along with ' + also : ''}. ` +
+        (shots ? 'Photos go to your Drive bin, so they can be recovered for about 30 days. ' : '') +
+        'The ledger itself cannot be brought back.', 'Delete forever')) {
         try {
-          await api('adminDeleteLedger', { id: st.id });
+          const r = await api('adminDeleteLedger', { id: st.id });
           await DB.dropLedger(st.id); delete S.txns[st.id]; delete S.cursors[st.id];
-          toast('Ledger deleted'); go('admin', {}, true); await sync({ silent: true });
+          S.recurring = S.recurring.filter(x => x.ledgerId !== st.id);
+          toast(r && r.receiptsLeft
+            ? `Ledger deleted · ${r.receiptsLeft} receipt${r.receiptsLeft === 1 ? '' : 's'} left in your Drive folder`
+            : 'Ledger deleted', r && r.receiptsLeft ? 4600 : 2400);
+          go('admin', {}, true); await sync({ silent: true });
         } catch (err) { toast(errMsg(err)); }
       }
       return;

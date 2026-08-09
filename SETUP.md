@@ -764,7 +764,14 @@ own web app and run through Part 3 — no pasting code, and roughly three minute
   (**File ▸ Settings ▸ Time zone**). Google decides the exact minute; "roughly" is as precise as
   time-driven triggers get, and nothing depends on the precision.
 - **Receipts** are stored in a Drive folder called *SplitStack Receipts — (your sheet name)*,
-  not inside the spreadsheet, so the sheet stays fast.
+  not inside the spreadsheet, so the sheet stays fast. They're tidied up as you go: replacing or
+  removing a photo bins the one it replaced, and deleting a ledger bins the photos that belonged
+  to it. Always **to the Drive bin**, never destroyed, so you have about thirty days to change your
+  mind. Deleting a very large ledger bins the first hundred and tells you how many are left in the
+  folder — the rest are yours to clear whenever.
+- **Deleting an expense doesn't touch its receipt.** A deleted expense is a tombstone rather than a
+  removed row, which is how other phones learn about the deletion and what *Put it back* restores;
+  binning the photo would make that restore incomplete.
 - **Avatars** are stored as small compressed images directly in the `Users` tab.
 - **Backups** — the spreadsheet has full revision history (**File ▸ Version history**). You already
   have a complete audit trail for free.
