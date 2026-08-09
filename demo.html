@@ -578,7 +578,7 @@ select.input{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xml
 
 /* Shown in Settings ▸ App & updates. Bump this and SW_BUILD in sw.js together
    whenever you re-upload the app. */
-const APP_BUILD = '2026-08-09.6';
+const APP_BUILD = '2026-08-09.7';
 
 /* ────────────────────────────────────────────────────────────────  helpers */
 const $  = (s, r = document) => r.querySelector(s);
@@ -729,6 +729,56 @@ const LS = {
   get gate() { return localStorage.getItem('ss.gate') || ''; }, set gate(v) { v ? localStorage.setItem('ss.gate', v) : localStorage.removeItem('ss.gate'); }
 };
 
+/* ─────────────────────────────────────────────────────── view preferences */
+/**
+ * How you like your own home screen arranged. Deliberately not synced: it
+ * describes this screen rather than the shared money, two devices disagreeing
+ * has no wrong answer, and keeping it off the wire means the whole feature
+ * needs no backend change and no redeploy.
+ *
+ * localStorage rather than IndexedDB because signing out wipes the latter, and
+ * losing your ledger order because you signed out on a borrowed phone would be
+ * daft. Keyed per user, so two people sharing a device don't inherit each
+ * other's arrangement.
+ */
+const PREFS_DEFAULT = { order: [], showArchived: true };
+
+const Prefs = {
+  key: id => 'ss.prefs.' + id,
+  load(userId) {
+    if (!userId) return Object.assign({}, PREFS_DEFAULT);
+    try {
+      const raw = JSON.parse(localStorage.getItem(this.key(userId)) || '{}');
+      return {
+        order: Array.isArray(raw.order) ? raw.order.filter(x => typeof x === 'string') : [],
+        showArchived: raw.showArchived !== false
+      };
+    } catch (e) { return Object.assign({}, PREFS_DEFAULT); }
+  },
+  save(userId, prefs) {
+    if (!userId) return;
+    try { localStorage.setItem(this.key(userId), JSON.stringify(prefs)); } catch (e) {}
+  }
+};
+
+/**
+ * Ledgers in the order this person put them.
+ *
+ * An empty order means untouched, and untouched has to keep behaving exactly
+ * as it did before this existed — so the list comes back unsorted rather than
+ * being reordered by some default nobody asked for. Ledgers with no position
+ * (created since the last arrangement) go last, newest first: an explicit
+ * order is an instruction, and a new arrival shouldn't displace it.
+ */
+function orderedLedgers(list) {
+  const order = (S.prefs && S.prefs.order) || [];
+  if (!order.length) return list;
+  const at = id => { const i = order.indexOf(id); return i === -1 ? Infinity : i; };
+  return list.slice().sort((a, b) =>
+    at(a.id) - at(b.id) ||
+    (b.createdAt || '').localeCompare(a.createdAt || ''));
+}
+
 const S = {
   api: LS.api, token: LS.token, gate: LS.gate,
   me: null, users: [], ledgers: [], members: [], recurring: [],
@@ -736,7 +786,8 @@ const S = {
   cursors: {}, txns: {}, pending: {}, online: navigator.onLine,
   view: 'boot', params: {}, tab: 'feed', syncing: false, lastError: '', updateReady: false,
   searchOpen: false, search: '', reviewOnly: false, apiVersion: 0,
-  filterWho: '', filterCat: '', seen: {}, seenAt: {}
+  filterWho: '', filterCat: '', seen: {}, seenAt: {},
+  prefs: Object.assign({}, PREFS_DEFAULT)
 };
 
 /* The backend API this build needs. The Apps Script is pasted in by hand, so
@@ -880,6 +931,7 @@ async function applyState(st) {
   // A backend too old to know about rules sends nothing rather than an empty
   // list — keep what we had instead of blanking the screen.
   if (st.recurring) S.recurring = st.recurring;
+  S.prefs = Prefs.load(S.me && S.me.id);
   await DB.set('state', { me: st.me, users: st.users, ledgers: st.ledgers, members: st.members,
                           recurring: S.recurring, config: st.config });
   document.title = (S.config.appName || 'SplitStack');
@@ -889,6 +941,7 @@ async function loadCache() {
   const st = await DB.get('state');
   if (st) { S.me = st.me; S.users = st.users; S.ledgers = st.ledgers; S.members = st.members;
             S.recurring = st.recurring || []; S.config = st.config || S.config; }
+  S.prefs = Prefs.load(S.me && S.me.id);
   S.cursors = (await DB.get('cursors')) || {};
   S.seen = (await DB.get('seen')) || {};
   for (const l of S.ledgers) {
@@ -1843,8 +1896,9 @@ function viewInvite() {
 /* ──────────────────────────────────────────────────────────────── home */
 function viewHome() {
   if (!S.me) return viewBoot();
-  const active = S.ledgers.filter(l => !l.archived);
-  const archived = S.ledgers.filter(l => l.archived);
+  const active = orderedLedgers(S.ledgers.filter(l => !l.archived));
+  const archived = orderedLedgers(S.ledgers.filter(l => l.archived));
+  const showArchived = S.prefs.showArchived !== false;
   let total = 0;
   active.forEach(l => total += myBalance(l.id));
   total = round2(total);
@@ -1899,10 +1953,12 @@ function viewHome() {
     ${summary}
     <div class="section-title">Your ledgers</div>
     ${active.length ? `<div class="grid2">${cards}</div>` : empty}
-    ${archived.length ? `<div class="section-title">Archived</div>
+    ${archived.length && showArchived ? `<div class="section-title">Archived</div>
       <div class="card">${archived.map(l => `<div class="row-item tap" data-ledger="${esc(l.id)}">
         <div style="font-size:22px">${esc(l.emoji)}</div><div class="grow"><div class="ttl">${esc(l.name)}</div>
         <div class="sub">archived</div></div><div>›</div></div>`).join('')}</div>` : ''}
+    ${archived.length && !showArchived ? `<p class="hint center mt">
+      <a href="#" data-act="arrange">${archived.length} archived ledger${archived.length === 1 ? '' : 's'} hidden</a></p>` : ''}
     <div class="section-title">Account</div>
     <div class="card">
       <div class="row-item tap" data-act="profile">${avatar(S.me, 'm')}
@@ -2544,6 +2600,9 @@ function viewProfile() {
       <h2 class="mt">${esc(u.name)}</h2><p class="hint">@${esc(u.username)}${isAdmin() ? ' · admin 👑' : ''}</p>
     </div>
     <div class="card">
+      <div class="row-item tap" data-act="arrange"><div class="av m" style="background:var(--violet)">🗂️</div>
+        <div class="grow"><div class="ttl">Arrange your ledgers</div>
+          <div class="sub">Reorder them, and show or hide archived ones</div></div><div>›</div></div>
       <div class="row-item tap" data-act="change-password"><div class="av m" style="background:var(--sky)">🔑</div>
         <div class="grow"><div class="ttl">Change password</div><div class="sub">Sets a new one for this account</div></div><div>›</div></div>
       <div class="row-item tap" data-act="signout-everywhere"><div class="av m" style="background:var(--warn)">📵</div>
@@ -3301,6 +3360,85 @@ function settleSheet(ledger, preset, opts = {}) {
     }
     draw();
   });
+  draw();
+}
+
+/* ─────────────────────────────────────────────────────── arrange sheet */
+/**
+ * The order of your own home screen, and whether archived ledgers show up on
+ * it at all. Yours alone — nobody else's screen moves, which is why this sits
+ * under your profile rather than in the admin settings, and why every member
+ * gets it rather than only admins.
+ *
+ * Opening it writes out the full order including anything created since last
+ * time, so after one visit every ledger has an explicit position and nothing
+ * is left to the "no position" fallback.
+ */
+function arrangeSheet() {
+  const st = {
+    order: orderedLedgers(S.ledgers).map(l => l.id),
+    showArchived: S.prefs.showArchived !== false
+  };
+  const sheet = openSheet('<div id="ar-body"></div>', {
+    // Applied live, so the home screen behind is already right when it closes.
+    onClose: () => render()
+  });
+
+  const commit = () => {
+    S.prefs = { order: st.order.slice(), showArchived: st.showArchived };
+    Prefs.save(S.me && S.me.id, S.prefs);
+  };
+
+  const move = (id, delta) => {
+    const i = st.order.indexOf(id);
+    const j = i + delta;
+    if (i < 0 || j < 0 || j >= st.order.length) return;
+    st.order.splice(j, 0, st.order.splice(i, 1)[0]);
+    commit(); haptic(); draw();
+  };
+
+  function draw() {
+    const rows = st.order.map(id => ledgerById(id)).filter(Boolean);
+    const archivedCount = rows.filter(l => l.archived).length;
+    $('#ar-body', sheet).innerHTML = `
+      <h2>Arrange your ledgers</h2>
+      <p class="sheet-sub">Only changes what you see. Everyone else's home screen stays as they left it.</p>
+
+      ${archivedCount ? `<div class="row-item tap" data-x="arch">
+        <div class="av m" style="background:${st.showArchived ? 'var(--good)' : 'var(--ink-3)'}">📦</div>
+        <div class="grow"><div class="ttl">Show archived ledgers</div>
+          <div class="sub">${archivedCount} archived</div></div>
+        <span class="pill ${st.showArchived ? 'ok' : 'no'}">${st.showArchived ? 'ON' : 'OFF'}</span></div>` : ''}
+
+      <div class="section-title">Order</div>
+      <div class="card">${rows.map((l, i) => `<div class="row-item">
+        <div class="av m" style="background:${esc(l.color)}">${esc(l.emoji)}</div>
+        <div class="grow"><div class="ttl">${esc(l.name)}</div>
+          <div class="sub">${l.archived ? '📦 archived' : memberIdsOf(l.id).length + ' people'}</div></div>
+        <button class="iconbtn" data-up="${esc(l.id)}" ${i === 0 ? 'disabled style="opacity:.25"' : ''}
+          title="Move up" aria-label="Move ${esc(l.name)} up">↑</button>
+        <button class="iconbtn" data-down="${esc(l.id)}" ${i === rows.length - 1 ? 'disabled style="opacity:.25"' : ''}
+          title="Move down" aria-label="Move ${esc(l.name)} down">↓</button>
+      </div>`).join('') || '<p class="hint">No ledgers yet.</p>'}</div>
+
+      <button class="btn ghost block mt" data-x="reset">↩️ Back to the default order</button>
+      <button class="btn block mt" data-x="close">Done</button>`;
+  }
+
+  sheet.addEventListener('click', e => {
+    const el = e.target.closest('[data-x],[data-up],[data-down]'); if (!el) return;
+    if (el.dataset.up) return move(el.dataset.up, -1);
+    if (el.dataset.down) return move(el.dataset.down, 1);
+    if (el.dataset.x === 'arch') { st.showArchived = !st.showArchived; commit(); haptic(); return draw(); }
+    if (el.dataset.x === 'reset') {
+      st.order = []; commit();
+      st.order = orderedLedgers(S.ledgers).map(l => l.id);   // re-materialise from the server order
+      toast('Back to the default order'); haptic(); return draw();
+    }
+    if (el.dataset.x === 'close') return sheet.close();
+  });
+
+  commit();          // opening it gives every current ledger a position
   draw();
 }
 
@@ -4147,6 +4285,7 @@ async function handle(act, el) {
       } catch (err) { toast(errMsg(err)); }
       return;
     }
+    case 'arrange': return arrangeSheet();
     case 'categories': return categorySheet();
     case 'save-pay': {
       const handle = ($('#p-handle') || {}).value.trim();

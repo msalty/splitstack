@@ -296,6 +296,30 @@ on a phone.
 
 ---
 
+## Arranging your home screen
+
+**Profile ▸ Arrange your ledgers.** Move them up and down with the arrows, and switch archived
+ledgers on or off. Every member gets this, not just admins.
+
+**It's yours alone.** Reordering doesn't move anybody else's home screen — it's a view preference,
+not shared data, so it isn't stored in the spreadsheet at all. That means two upshots worth
+knowing:
+
+- It's **per device**. Arrange your phone and your tablet keeps its own order.
+- It **survives signing out** and *Clear cache & reload*, and two people signing in on the same
+  device keep separate arrangements.
+
+Leaving it alone changes nothing: with no arrangement saved, ledgers appear in the order they
+always did. A ledger created after you last arranged things goes to the end rather than displacing
+what you set. **Back to the default order** clears your arrangement rather than freezing a copy of
+it, so new ledgers keep falling in naturally afterwards.
+
+Hiding archived ledgers leaves a quiet line at the bottom of the home screen — *"2 archived
+ledgers hidden"* — that takes you straight back to this screen, so nothing disappears without a
+way back.
+
+---
+
 ## Everyone, at a glance
 
 The purple card on the home screen totals what you're owed across every ledger. **Tap it** and you
