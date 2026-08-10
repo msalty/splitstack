@@ -33,7 +33,7 @@
      namespace follows.
    ========================================================================== */
 
-const SW_BUILD = '2026-08-10.1';
+const SW_BUILD = '2026-08-10.2';
 
 /* '/splitstack/' when installed in a subdirectory, '/' at a domain root. */
 const SCOPE = new URL('./', self.location.href).pathname;

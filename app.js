@@ -6,7 +6,7 @@
 
 /* Shown in Settings ▸ App & updates. Bump this and SW_BUILD in sw.js together
    whenever you re-upload the app. */
-const APP_BUILD = '2026-08-10.1';
+const APP_BUILD = '2026-08-10.2';
 
 /* ────────────────────────────────────────────────────────────────  helpers */
 const $  = (s, r = document) => r.querySelector(s);
@@ -1251,6 +1251,191 @@ function pickAvatar() {
     };
     inp.click();
   });
+}
+
+/* ──────────────────────────────────────────────────────────────── lightbox */
+/**
+ * Full-screen receipt viewer: pinch, pan, double-tap and drag-to-dismiss.
+ *
+ * The page viewport is pinned at maximum-scale=1 so the app itself can't be
+ * pinched out of shape — which also means the browser will never zoom a
+ * receipt for us either. So the gestures are done by hand here: pointer
+ * events in, one transform out.
+ *
+ * The state is three numbers. `s` is the zoom; `tx`/`ty` are how far the
+ * picture has slid from its centred, fit-to-screen position, in screen pixels.
+ * Every gesture reduces to "zoom about this point", which is what keeps the
+ * thing you pinched around under your fingers instead of drifting to the
+ * middle of the screen.
+ */
+const LBOX_MAX = 8;
+
+function lightbox(src) {
+  const box = document.createElement('div');
+  box.className = 'lbox';
+  box.innerHTML = `<button class="lbox-x" data-x aria-label="Close the receipt">✕</button>
+    <img alt="Receipt">
+    <p class="lbox-hint">Pinch or double-tap to zoom</p>`;
+  const img = $('img', box), hint = $('.lbox-hint', box);
+  // Assigned rather than interpolated: a data URL never has to survive a trip
+  // through an HTML attribute, so it can't end one early either.
+  img.src = src;
+  document.body.appendChild(box);
+  requestAnimationFrame(() => box.classList.add('on'));
+  haptic();
+
+  let s = 1, tx = 0, ty = 0;
+  const apply = () => { img.style.transform = `translate(${tx}px, ${ty}px) scale(${s})`; };
+
+  /* How far the picture may slide before its edge would come inside the
+     screen. At fit size that is nowhere — which is what makes a one-finger
+     drag mean "put it away" rather than "pan" without needing a second flag. */
+  const contain = () => {
+    const lx = Math.max(0, (img.offsetWidth  * s - box.clientWidth)  / 2);
+    const ly = Math.max(0, (img.offsetHeight * s - box.clientHeight) / 2);
+    tx = clamp(tx, -lx, lx);
+    ty = clamp(ty, -ly, ly);
+  };
+
+  /* Zoom to `next`, leaving whatever sits under (px,py) exactly where it is.
+     A point v away from centre currently draws at t + s·v, so holding it still
+     across a change of scale by k = next/s gives t' = d(1−k) + t·k. */
+  const zoomTo = (next, px, py) => {
+    next = clamp(next, 1, LBOX_MAX);
+    const r = box.getBoundingClientRect();
+    const k = next / s;
+    tx = (px - (r.left + r.width  / 2)) * (1 - k) + tx * k;
+    ty = (py - (r.top  + r.height / 2)) * (1 - k) + ty * k;
+    s = next;
+    contain(); apply();
+  };
+
+  /** Run a change as an ease rather than a jump. */
+  const snap = fn => {
+    img.classList.add('snap');
+    fn();
+    setTimeout(() => img.classList.remove('snap'), 260);
+  };
+
+  /* ── gestures ── */
+  const pts = new Map();
+  let base = null;   // scale/offset/finger positions as the current gesture began
+  let travel = 0;    // total finger movement, so a tap isn't read as a drag
+  let dragY = 0;     // dismiss drag, which deliberately ignores the pan limits
+
+  /* Midpoint of the fingers down, and the gap between them. One finger is the
+     degenerate case: itself, and no gap. */
+  const mid = () => {
+    const a = [...pts.values()];
+    if (a.length < 2) return { x: a[0].x, y: a[0].y, d: 0 };
+    return {
+      x: (a[0].x + a[1].x) / 2,
+      y: (a[0].y + a[1].y) / 2,
+      d: Math.hypot(a[1].x - a[0].x, a[1].y - a[0].y)
+    };
+  };
+  /* Re-anchor on every change of finger count. Without this, lifting one
+     finger out of a pinch makes the picture leap by the distance between the
+     old midpoint and the remaining finger. */
+  const rebase = () => { base = { m: mid(), s, tx, ty }; };
+
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    document.removeEventListener('keydown', onKey);
+    box.classList.remove('on');
+    setTimeout(() => box.remove(), 220);
+  };
+  const onKey = e => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+  document.addEventListener('keydown', onKey);
+
+  box.addEventListener('pointerdown', e => {
+    if (e.target.closest('[data-x]')) return;   // let the close button be a button
+    box.setPointerCapture(e.pointerId);
+    pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    travel = 0;
+    hint.style.opacity = '0';
+    /* A second finger turns a dismiss drag into a pinch. Letting go of the
+       drag state here is what stops the pinch ending in a dismiss because the
+       gesture happened to start as one. */
+    if (pts.size > 1 && dragY) { dragY = 0; box.style.background = ''; }
+    rebase();
+  });
+
+  box.addEventListener('pointermove', e => {
+    const p = pts.get(e.pointerId); if (!p) return;
+    travel += Math.abs(e.clientX - p.x) + Math.abs(e.clientY - p.y);
+    p.x = e.clientX; p.y = e.clientY;
+    const m = mid();
+
+    if (pts.size >= 2 && base.m.d > 0) {
+      // Pinch: scale by how much the gap grew, then follow the midpoint, so
+      // two fingers can zoom and pan in the same movement.
+      const next = clamp(base.s * (m.d / base.m.d), 1, LBOX_MAX);
+      const k = next / base.s;
+      const r = box.getBoundingClientRect();
+      tx = (base.m.x - (r.left + r.width  / 2)) * (1 - k) + base.tx * k + (m.x - base.m.x);
+      ty = (base.m.y - (r.top  + r.height / 2)) * (1 - k) + base.ty * k + (m.y - base.m.y);
+      s = next;
+      contain(); apply();
+    } else if (pts.size === 1 && s > 1) {
+      tx = base.tx + (m.x - base.m.x);
+      ty = base.ty + (m.y - base.m.y);
+      contain(); apply();
+    } else if (pts.size === 1) {
+      // Nothing to pan at fit size, so a drag means "put this away". The
+      // picture follows your finger and the backdrop thins out, so it's plain
+      // what letting go is about to do.
+      dragY = m.y - base.m.y;
+      img.style.transform = `translate(0px, ${dragY}px) scale(1)`;
+      box.style.background = `rgba(12,8,28,${(0.94 * Math.max(0, 1 - Math.abs(dragY) / 420)).toFixed(3)})`;
+    }
+  });
+
+  let lastTap = 0;
+  const tap = e => {
+    const now = Date.now();
+    if (now - lastTap < 300) {           // second tap: toggle zoom about it
+      lastTap = 0;
+      haptic();
+      snap(() => zoomTo(s > 1 ? 1 : 2.6, e.clientX, e.clientY));
+      return;
+    }
+    lastTap = now;
+    /* A single tap dismisses, but only once we know a second one isn't
+       coming — and only at fit size, so a stray tap can't shut the thing
+       while you're reading the small print. */
+    setTimeout(() => { if (lastTap === now && s === 1) close(); }, 300);
+  };
+
+  const lift = e => {
+    if (!pts.delete(e.pointerId)) return;
+    if (pts.size) return rebase();       // one finger up, a pinch continues
+
+    if (Math.abs(dragY) > 110) { dragY = 0; return close(); }
+    if (dragY) {                         // dragged, but not far enough to mean it
+      dragY = 0;
+      box.style.background = '';
+      snap(apply);
+    }
+    // Fingers wobble: a tap that slid a pixel or two is still a tap, and the
+    // snap above has already undone the stray movement.
+    if (travel < 8) tap(e);
+  };
+  box.addEventListener('pointerup', lift);
+  box.addEventListener('pointercancel', lift);
+
+  // Trackpad pinch arrives as ctrl+wheel; a plain wheel may as well zoom too,
+  // since there is nothing else for it to do in here.
+  box.addEventListener('wheel', e => {
+    e.preventDefault();
+    zoomTo(s * Math.exp(-e.deltaY * 0.0015), e.clientX, e.clientY);
+  }, { passive: false });
+
+  box.addEventListener('dragstart', e => e.preventDefault());
+  $('[data-x]', box).addEventListener('click', close);
+  return box;
 }
 
 /* ══════════════════════════════════════════════════════════════════ RENDER */
@@ -3647,10 +3832,18 @@ async function txnSheet(ledger, txn) {
 
   // receipt (local first, then server)
   const box = $('#rcp', sheet);
+  /* Thumbnail in the sheet, whole thing in the lightbox. Both paths below end
+     up here, so there is one place that decides what a receipt looks like. */
+  const showReceipt = d => {
+    box.innerHTML = `<div class="card mb"><div class="section-title" style="margin-top:0">Receipt</div>
+      <button class="rcp-open" data-rcp aria-label="Open the receipt full screen"><img alt="Receipt"></button>
+      <p class="hint center">Tap to zoom</p></div>`;
+    $('[data-rcp] img', box).src = d;
+    $('[data-rcp]', box).addEventListener('click', () => lightbox(d));
+  };
   if (txn._receiptLocal) {
     const d = await DB.blobGet(txn._receiptLocal);
-    if (d) box.innerHTML = `<div class="card mb"><div class="section-title" style="margin-top:0">Receipt</div>
-      <img src="${d}" style="width:100%;border-radius:16px"></div>`;
+    if (d) showReceipt(d);
   } else if (txn.receiptId) {
     const cacheKey = 'srv_' + txn.receiptId;
     let d = await DB.blobGet(cacheKey);
@@ -3659,8 +3852,7 @@ async function txnSheet(ledger, txn) {
       try { const r = await api('getReceipt', { receiptId: txn.receiptId }); d = r.dataUrl; await DB.blobSet(cacheKey, d); }
       catch (err) { box.innerHTML = `<p class="hint center">📎 Receipt can't be loaded right now.</p>`; }
     }
-    if (d) box.innerHTML = `<div class="card mb"><div class="section-title" style="margin-top:0">Receipt</div>
-      <img src="${d}" style="width:100%;border-radius:16px"></div>`;
+    if (d) showReceipt(d);
   }
 }
 
