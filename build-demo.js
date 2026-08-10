@@ -43,14 +43,37 @@ const stub = `
   /* no service worker in demo mode */
   try { Object.defineProperty(navigator,'serviceWorker',{configurable:true,value:undefined}); } catch(e){}
 
-  const U=(id,n,role,color,emoji)=>({id,username:n.toLowerCase(),name:n,email:'',role:role||'member',
-    avatar:'',color,emoji:emoji||'',active:true,hasPassword:true});
-  const users=[U('u1','Mike','admin','#6C5CE7','👑'),U('u2','Sam',null,'#00B894','🦊'),
-               U('u3','Ada',null,'#E84393','🐙'),U('u4','Ben',null,'#0984E3','🐢')];
+  const U=(id,n,role,color,emoji,email)=>({id,username:n.toLowerCase(),name:n,email:email||'',role:role||'member',
+    avatar:'',color,emoji:emoji||'',active:true,notify:true,kind:'person',
+    payType:'',payHandle:'',hasPassword:true});
+  /* A member who isn't a person: holds a balance, can't log in, never emailed. */
+  const E=(id,n,color,emoji)=>({id,username:n.toLowerCase().replace(/[^a-z0-9]+/g,'-'),name:n,email:'',
+    role:'member',avatar:'',color,emoji,active:true,notify:false,kind:'entity',hasPassword:false});
+  const users=[U('u1','Mike','admin','#6C5CE7','👑','mike@example.com'),U('u2','Sam',null,'#00B894','🦊','sam@example.com'),
+               U('u3','Ada',null,'#E84393','🐙','ada@example.com'),U('u4','Ben',null,'#0984E3','🐢','ben@example.com'),
+               E('e1','House Kitty','#E17055','🏺')];
+  /* somewhere to actually send the money */
+  users[0].payType='venmo';   users[0].payHandle='mike-demo';
+  users[2].payType='paypal';  users[2].payHandle='adademo';
+  users[3].payType='cashapp'; users[3].payHandle='bendemo';
   const ledgers=[
-    {id:'l1',name:'Beach House',emoji:'🏝️',color:'#00B894',invite:'demoinvite1',archived:false,createdAt:'2026-06-01T00:00:00Z'},
-    {id:'l2',name:'Monthly Bills',emoji:'🏠',color:'#6C5CE7',invite:'demoinvite2',archived:false,createdAt:'2026-01-01T00:00:00Z'},
-    {id:'l3',name:'Ski Trip',emoji:'🎿',color:'#0984E3',invite:'demoinvite3',archived:false,createdAt:'2026-02-01T00:00:00Z'}
+    {id:'l1',name:'Beach House',emoji:'🏝️',color:'#00B894',invite:'demoinvite1',archived:false,presets:[],createdAt:'2026-06-01T00:00:00Z'},
+    /* a house that always divides 40/30/30 — the case a default split exists for */
+    {id:'l2',name:'Monthly Bills',emoji:'🏠',color:'#6C5CE7',invite:'demoinvite2',archived:false,createdAt:'2026-01-01T00:00:00Z',
+     presets:[{id:'p1',name:'Rent split',split:{u1:40,u2:30,u4:30}},{id:'p2',name:'Just me and Sam',split:{u1:50,u2:50}}],
+     defaultSplit:{u1:40,u2:30,u4:30}},
+    /* two people, 60/40 — no saved splits, and none possible before now */
+    {id:'l3',name:'Ski Trip',emoji:'🎿',color:'#0984E3',invite:'demoinvite3',archived:false,presets:[],
+     defaultSplit:{u1:60,u3:40},createdAt:'2026-02-01T00:00:00Z'}
+  ];
+  /* two standing orders on the bills ledger, so the demo shows the feature off */
+  const recurring=[
+    {id:'rec_rent',ledgerId:'l2',name:'Rent',category:'Home',amount:3200,paidBy:'u1',
+     split:{u1:40,u2:30,u4:30},notes:'',freq:'monthly',every:1,anchor:1,nextDate:'2026-09-01',
+     lastRun:'2026-08-01',active:true,review:true,createdBy:'u1'},
+    {id:'rec_net',ledgerId:'l2',name:'Internet',category:'Internet',amount:79.99,paidBy:'u4',
+     split:{u1:33.33,u2:33.33,u4:33.34},notes:'',freq:'monthly',every:1,anchor:1,nextDate:'2026-09-01',
+     lastRun:'2026-08-01',active:true,review:false,createdBy:'u4'}
   ];
   const members=[
     {ledgerId:'l1',userId:'u1'},{ledgerId:'l1',userId:'u2'},{ledgerId:'l1',userId:'u3'},{ledgerId:'l1',userId:'u4'},
@@ -99,14 +122,15 @@ const stub = `
       T({date:'2026-02-16',name:'Ada paid Mike',type:'settlement',category:'',amount:400,paidBy:'u3',paidTo:'u1',enteredBy:'u3',split:{},notes:'cash'})
     ]
   };
-  const state={me:users[0],users,ledgers,members,
-    config:{currency:'USD',symbol:'$',appName:'SplitStack'},serverTime:new Date().toISOString()};
+  const state={me:users[0],users,ledgers,members,recurring,
+    config:{currency:'USD',symbol:'$',appName:'SplitStack',digest:'weekly',jobs:true,categories:null},
+    serverTime:new Date().toISOString()};
 
   window.fetch = async function(url, opts){
     const {action,payload}=JSON.parse(opts.body);
     await new Promise(r=>setTimeout(r,180));      // a little latency, for realism
     let d;
-    if(action==='ping') d={version:3,ready:true,appName:'SplitStack',iterations:210000};
+    if(action==='ping') d={version:7,ready:true,appName:'SplitStack',iterations:210000};
     else if(action==='bootstrap') d=state;
     else if(action==='pull'){
       d={ledgers:{}};
@@ -148,23 +172,87 @@ const stub = `
     }
     else if(action==='adminSaveLedger'){
       const p=payload;
+      /* the real backend normalises the default against the FINAL member list,
+         so members are applied before it here too */
+      const norm=(s,ids)=>{ if(!s||!Object.keys(s).length) return null;
+        const kept={}; let sum=0;
+        Object.keys(s).forEach(k=>{ if(ids.indexOf(k)<0) return; const v=Number(s[k])||0; if(v<=0) return; kept[k]=v; sum+=v; });
+        const ks=Object.keys(kept); if(!ks.length) return null;
+        if(Math.abs(sum-100)<0.005) return kept;
+        const out={}; let acc=0;
+        ks.forEach((k,i)=>{ if(i===ks.length-1) out[k]=Math.round((100-acc)*100)/100;
+          else { const v=Math.round(kept[k]/sum*10000)/100; out[k]=v; acc=Math.round((acc+v)*100)/100; } });
+        return out; };
       if(p.id){ const l=ledgers.find(x=>x.id===p.id); Object.assign(l,{name:p.name||l.name,emoji:p.emoji||l.emoji,color:p.color||l.color,archived:!!p.archived});
         if(p.memberIds){ for(let i=members.length-1;i>=0;i--) if(members[i].ledgerId===p.id) members.splice(i,1);
           p.memberIds.forEach(u=>members.push({ledgerId:p.id,userId:u})); }
+        if(p.defaultSplit!==undefined)
+          l.defaultSplit=norm(p.defaultSplit,members.filter(m=>m.ledgerId===p.id).map(m=>m.userId));
         d={ledger:l};
-      } else { const l={id:'l'+(ledgers.length+1),name:p.name,emoji:p.emoji,color:p.color,invite:'demo'+Date.now(),archived:false,createdAt:new Date().toISOString()};
-        ledgers.push(l); data[l.id]=[]; (p.memberIds||['u1']).forEach(u=>members.push({ledgerId:l.id,userId:u})); d={ledger:l}; }
+      } else { const l={id:'l'+(ledgers.length+1),name:p.name,emoji:p.emoji,color:p.color,invite:'demo'+Date.now(),archived:false,presets:[],defaultSplit:null,createdAt:new Date().toISOString()};
+        ledgers.push(l); data[l.id]=[]; (p.memberIds||['u1']).forEach(u=>members.push({ledgerId:l.id,userId:u}));
+        if(p.defaultSplit!==undefined) l.defaultSplit=norm(p.defaultSplit,(p.memberIds||['u1']));
+        d={ledger:l}; }
     }
     else if(action==='adminSaveUser'){
       const p=payload;
       if(p.id){ const u=users.find(x=>x.id===p.id); Object.assign(u,{name:p.name,username:p.username,email:p.email,emoji:p.emoji,color:p.color,role:p.role,active:p.active!==false}); d={user:u}; }
-      else { const u={id:'u'+(users.length+1),username:p.username,name:p.name,email:p.email||'',role:p.role,
-        avatar:'',color:p.color,emoji:p.emoji||'',active:true,hasPassword:!!p.dk}; users.push(u); d={user:u}; }
+      else { const ent=p.kind==='entity';
+        const u={id:'u'+(users.length+1),
+          username:ent?String(p.name||'').toLowerCase().replace(/[^a-z0-9]+/g,'-'):p.username,
+          name:p.name,email:ent?'':(p.email||''),role:ent?'member':p.role,avatar:'',color:p.color,
+          emoji:p.emoji||(ent?'🏢':''),active:true,notify:!ent,kind:ent?'entity':'person',
+          hasPassword:!ent&&!!p.dk};
+        users.push(u); d={user:u}; }
     }
     else if(action==='adminDeleteUser'){ const i=users.findIndex(u=>u.id===payload.id); if(i>=0) users.splice(i,1); d={ok:true}; }
-    else if(action==='adminDeleteLedger'){ const i=ledgers.findIndex(l=>l.id===payload.id); if(i>=0) ledgers.splice(i,1); d={ok:true}; }
+    else if(action==='adminDeleteLedger'){
+      const i=ledgers.findIndex(l=>l.id===payload.id); if(i>=0) ledgers.splice(i,1);
+      /* mirrors the real backend: rules and receipts go with the ledger */
+      for(let k=recurring.length-1;k>=0;k--) if(recurring[k].ledgerId===payload.id) recurring.splice(k,1);
+      const shots=(data[payload.id]||[]).filter(t=>t.receiptId).length;
+      delete data[payload.id];
+      d={ok:true,receiptsTrashed:shots,receiptsLeft:0};
+    }
     else if(action==='setAvatar'){ const u=users.find(x=>x.id===(payload.userId||'u1')); if(u) u.avatar=payload.avatar; d={ok:true,avatar:payload.avatar}; }
-    else if(action==='adminSetConfig'){ Object.assign(state.config,{appName:payload.appName,currency:payload.currency,symbol:payload.currencySymbol}); d={ok:true}; }
+    else if(action==='adminSetConfig'){
+      if(payload.appName!==undefined) Object.assign(state.config,{appName:payload.appName,currency:payload.currency,symbol:payload.currencySymbol});
+      if(payload.digest!==undefined) state.config.digest=payload.digest;
+      if(payload.categories!==undefined) state.config.categories=payload.categories;
+      d={ok:true};
+    }
+    else if(action==='setProfile'){
+      const u=users[0];
+      if(payload.email!==undefined) u.email=payload.email;
+      if(payload.notify!==undefined) u.notify=!!payload.notify;
+      if(payload.payType!==undefined) u.payType=payload.payType;
+      if(payload.payHandle!==undefined) u.payHandle=payload.payHandle;
+      d={me:u};
+    }
+    else if(action==='setPresets'){
+      const l=ledgers.find(x=>x.id===payload.ledgerId);
+      if(l) l.presets=(payload.presets||[]).map(p=>Object.assign({},p));
+      d={presets:l?l.presets:[]};
+    }
+    else if(action==='recurringSave'){
+      const i=recurring.findIndex(r=>r.id===payload.id);
+      const rule=Object.assign({},payload);
+      if(i>=0) recurring[i]=rule; else recurring.push(rule);
+      d={rule};
+    }
+    else if(action==='recurringDelete'){
+      const i=recurring.findIndex(r=>r.id===payload.id); if(i>=0) recurring.splice(i,1);
+      d={ok:true};
+    }
+    else if(action==='nudge'){
+      /* The real backend recomputes the amount from the sheet. Here the app's
+         own balance code is already in scope, so borrow it and stay honest. */
+      const t=users.find(u=>u.id===payload.userId)||{name:'them'};
+      const net=balancesFor(payload.ledgerId);
+      d={ok:true,to:t.name,
+         amount:Math.round(Math.min(-(net[payload.userId]||0),net[ME]||0)*100)/100};
+    }
+    else if(action==='adminTestDigest') d={sent:1,quiet:false};
     else d={ok:true};
     return { ok:true, json: async()=>({ok:true,data:d}) };
   };
