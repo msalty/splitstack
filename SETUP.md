@@ -637,8 +637,14 @@ being clear about: today's protection is a check that a file is one of ours, and
 something a bug can get wrong. `drive.file` makes it impossible to reach anything else in the
 first place.
 
-Same idea for the spreadsheet: `spreadsheets.currentonly` limits the script to the sheet it is
-attached to, rather than every spreadsheet you own.
+Only the Drive entry is narrowed. There is a tighter spreadsheet permission —
+`spreadsheets.currentonly`, which limits the script to the sheet it is attached to — but it is
+deliberately not used here. Nothing in this app reaches a spreadsheet by an id somebody else
+supplied, the way the receipt endpoints once did with Drive files, so there is no equivalent bug
+waiting to be prevented; and `currentonly` behaves less predictably under the time-driven triggers
+that post your repeating expenses and send the digests. It tightens a bolt that was never loose,
+at the cost of the two features most likely to break quietly. Swap it in if you want, and check
+the next morning that your 3am and 8am jobs still ran.
 
 ### Before you change anything
 
@@ -660,12 +666,16 @@ So find out first, with your current permissions still in place:
 3. **Change `timeZone` to whatever was already there.** The file in this repo says
    `America/New_York`, and if that is not yours, your repeating expenses and morning emails will
    go out at the wrong hour.
-4. Save. Then **Run ▸ `setup`** from the editor — Google will ask you to authorise again, because
+4. **Check the `webapp` block against your actual deployment.** It should read `USER_DEPLOYING`
+   and `ANYONE_ANONYMOUS`, which is what *Execute as: Me* and *Who has access: Anyone* mean in
+   Part 1. This is the one entry where a wrong value is not a feature failing — it is everybody's
+   app losing the backend at once.
+5. Save. Then **Run ▸ `setup`** from the editor — Google will ask you to authorise again, because
    you are asking for a different set of permissions than last time. The consent screen should now
    say *"See, edit, create, and delete only the specific Google Drive files you use with this
    app"* rather than offering your whole Drive.
-5. **Deploy ▸ Manage deployments ▸ ✏️ ▸ Version: New version ▸ Deploy.**
-6. Run **SplitStack ▸ 🔍 Check what this script can do** again.
+6. **Deploy ▸ Manage deployments ▸ ✏️ ▸ Version: New version ▸ Deploy.**
+7. Run **SplitStack ▸ 🔍 Check what this script can do** again.
 
 ### Reading the result
 
