@@ -1358,9 +1358,9 @@ function viewSetupAdmin() {
       <div class="field"><label>Setup key</label>
         <input class="input" id="s-key" placeholder="ABC123" autocapitalize="characters" autocorrect="off" spellcheck="false">
         <p class="hint">Printed by <b>setup()</b> in the Apps Script editor (View ▸ Logs), or run <b>showSetupKey()</b>.</p></div>
-      <div class="field"><label>Your name</label><input class="input" id="s-name" placeholder="Mike"></div>
+      <div class="field"><label>Your name</label><input class="input" id="s-name"></div>
       <div class="field"><label>Username</label>
-        <input class="input" id="s-user" placeholder="mike" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
+        <input class="input" id="s-user" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
       <div class="field"><label>Password</label>
         <input class="input" id="s-pw" type="password" placeholder="Make it a good one"></div>
       <div class="field"><label>Confirm password</label>
@@ -1379,7 +1379,7 @@ function viewLogin() {
     <div class="card">
       <div class="field"><label>Username</label>
         <input class="input" id="l-user" autocapitalize="off" autocorrect="off" spellcheck="false"
-               autocomplete="username" placeholder="mike"></div>
+               autocomplete="username"></div>
       <div class="field"><label>Password</label>
         <input class="input" id="l-pw" type="password" autocomplete="current-password"></div>
       <div id="l-err"></div>
