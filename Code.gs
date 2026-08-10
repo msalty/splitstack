@@ -453,6 +453,7 @@ function onOpen() {
       .addItem('🛠  Run setup / repair', 'menuSetup')
       .addItem('⏰  Check background jobs', 'menuJobs')
       .addItem('🧹  Clean up unused files', 'menuCleanup')
+      .addItem('🔍  Check what this script can do', 'menuVerifyScopes')
       .addItem('🔓  Unlock a locked account', 'menuUnlock')
       .addItem('♻️  Reset the admin account', 'menuResetAdmin')
       .addToUi();
@@ -2156,12 +2157,34 @@ function rollRecurring() {
 
 /* ----------------------------------------------------------------- receipts */
 
+/**
+ * The folder receipts live in, found by the id we wrote down when we made it.
+ *
+ * The id lives in the Config tab. If that row ever goes missing, searching
+ * Drive by name is how the folder used to be found again — but searching means
+ * being able to see folders this app did not create, which is precisely the
+ * permission `drive.file` withholds. So the search is still attempted and is
+ * now allowed to fail: instances on the wider permission keep their recovery
+ * path, and narrowed ones fall through to making a fresh folder rather than
+ * throwing.
+ *
+ * Losing the recorded id on a narrowed instance is the one case worth knowing
+ * about: old receipts stay in the old folder and stay readable, but the app no
+ * longer recognises them as its own, so it will decline to serve them. Put the
+ * folder's id back in the Config tab and everything reappears.
+ */
 function receiptFolder() {
   var id = cfg('receiptFolderId');
   if (id) { try { return DriveApp.getFolderById(id); } catch (e) {} }
+
   var name = 'SplitStack Receipts — ' + ss().getName();
-  var it = DriveApp.getFoldersByName(name);
-  var f = it.hasNext() ? it.next() : DriveApp.createFolder(name);
+  var found = null;
+  try {
+    var it = DriveApp.getFoldersByName(name);
+    if (it.hasNext()) found = it.next();
+  } catch (e) { /* narrowed permissions cannot search; that is expected */ }
+
+  var f = found || DriveApp.createFolder(name);
   setCfg('receiptFolderId', f.getId());
   return f;
 }
@@ -2187,8 +2210,12 @@ function receiptFolder() {
  */
 function isOurReceipt(id) {
   if (!id) return false;
+  // The configured id, not receiptFolder() — a question about whether a file is
+  // ours should never have the side effect of creating a folder to compare it
+  // against. No folder recorded yet means no receipts yet, so nothing matches.
+  var want = cfg('receiptFolderId', '');
+  if (!want) return false;
   try {
-    var want = receiptFolder().getId();
     var parents = DriveApp.getFileById(String(id)).getParents();
     while (parents.hasNext()) if (parents.next().getId() === want) return true;
   } catch (e) {}
@@ -2365,6 +2392,114 @@ function menuCleanup() {
     (rules.length ? ', ' + rules.length + ' leftover repeating expense' + (rules.length === 1 ? '' : 's') + ' removed' : '') +
     '.' + (scan.orphans.length > trashed ? '\n\nRun it again to finish the rest.' : ''),
     u.ButtonSet.OK);
+}
+
+/* ═══════════════════════════════════════════ what this script can still do */
+/**
+ * Exercises every Google service this app depends on and reports which ones
+ * answered. Run it after changing the permissions in `appsscript.json`.
+ *
+ * The point is the third check. Narrowing Drive access to `drive.file` means
+ * the script can only reach files it created itself — which is exactly what
+ * receipts are, so in principle nothing changes. In practice the association
+ * between an app and a file it made under a *different, wider* permission is
+ * not something the documentation promises to preserve, and the honest answer
+ * for an instance that already has receipts is "try it and see". This is the
+ * trying. Nothing here writes to your data: the one file it creates is a few
+ * bytes, in the receipts folder, and goes to the bin on the way out.
+ *
+ * Every check is independent, so one failure does not hide the others.
+ */
+function verifyScopes() {
+  var results = [];
+  var check = function (name, fn) {
+    try {
+      var detail = fn();
+      results.push({ ok: true, name: name, detail: detail || 'ok' });
+    } catch (e) {
+      results.push({ ok: false, name: name, detail: String(e && e.message ? e.message : e) });
+    }
+  };
+
+  check('Read the spreadsheet', function () {
+    return ss().getName() + ' — ' + ss().getSheets().length + ' tabs';
+  });
+
+  check('Write to the spreadsheet', function () {
+    // Round-trips a value through the Config tab it already owns.
+    var was = cfg('scopeProbe', '');
+    setCfg('scopeProbe', String(Date.now()));
+    var now = cfg('scopeProbe', '');
+    setCfg('scopeProbe', was);
+    return now ? 'read back what it wrote' : 'wrote, but read back blank';
+  });
+
+  var folder = null;
+  check('Reach the receipts folder', function () {
+    var id = cfg('receiptFolderId', '');
+    if (!id) return 'none recorded yet — nothing to lose';
+    folder = DriveApp.getFolderById(id);
+    return folder.getName();
+  });
+
+  check('List what is in it', function () {
+    if (!folder) return 'skipped — no folder';
+    var n = 0, it = folder.getFiles();
+    while (it.hasNext() && n < 50) { it.next(); n++; }
+    return n + (n === 50 ? '+' : '') + ' file' + (n === 1 ? '' : 's');
+  });
+
+  // The migration question, asked directly: can we still open a receipt that
+  // was uploaded before the permissions changed?
+  check('Open a receipt made by the old permissions', function () {
+    var ids = Object.keys(referencedReceiptIds());
+    if (!ids.length) return 'no existing receipts — nothing to migrate';
+    var opened = 0, failed = [];
+    ids.slice(0, 5).forEach(function (id) {
+      try { DriveApp.getFileById(id).getSize(); opened++; }
+      catch (e) { failed.push(id); }
+    });
+    if (failed.length) {
+      throw new Error(opened + ' of ' + (opened + failed.length) +
+        ' opened. First unreachable: ' + failed[0]);
+    }
+    return 'opened ' + opened + ' of ' + Math.min(ids.length, 5) + ' sampled';
+  });
+
+  check('Create and bin a file', function () {
+    var f = (folder || receiptFolder()).createFile(
+      Utilities.newBlob('scope probe', 'text/plain', 'rcp_scopeprobe.txt'));
+    var id = f.getId();
+    f.setTrashed(true);
+    return 'created and binned ' + id.slice(0, 8) + '…';
+  });
+
+  check('See the background jobs', function () {
+    return ScriptApp.getProjectTriggers().length + ' trigger(s) installed';
+  });
+
+  check('Send email', function () {
+    return MailApp.getRemainingDailyQuota() + ' messages left today';
+  });
+
+  return results;
+}
+
+/** The menu entry. Same checks, written out for a human. */
+function menuVerifyScopes() {
+  var results = verifyScopes();
+  var bad = results.filter(function (r) { return !r.ok; });
+  var lines = results.map(function (r) {
+    return (r.ok ? '✅  ' : '❌  ') + r.name + '\n      ' + r.detail;
+  });
+
+  var verdict = bad.length
+    ? '\n\n' + bad.length + ' check' + (bad.length === 1 ? '' : 's') + ' failed. If you have just ' +
+      'narrowed the permissions in appsscript.json, widen the ones named above back to what they ' +
+      'were, save, and run this again — the app keeps working the whole time.'
+    : '\n\nEverything this app needs still works.';
+
+  ui().alert('What this script can do', lines.join('\n\n') + verdict, ui().ButtonSet.OK);
 }
 
 /** Same thing from the Apps Script editor, for anyone who prefers the log. */

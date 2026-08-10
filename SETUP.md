@@ -621,6 +621,82 @@ marked as text first, so what you see in the sheet is what somebody typed, and n
 
 ---
 
+## Narrowing what the script is allowed to touch
+
+**Optional, and a prototype — read the whole section before starting.**
+
+When you first ran `setup()` and clicked **Allow**, Apps Script worked out for itself what
+permissions it needed and asked for all of them. Because the code calls `DriveApp`, that includes
+**full access to your Drive** — every file you own, not just the receipts this app made. The
+receipt endpoints are locked down and check what they are handed, but the *permission* is still
+there, which means any future bug in this script inherits your whole Drive.
+
+`appsscript.json` in this repo pins the permission list by hand instead, and swaps that one entry
+for `drive.file` — access to files this app created and nothing else. The difference is worth
+being clear about: today's protection is a check that a file is one of ours, and a check is
+something a bug can get wrong. `drive.file` makes it impossible to reach anything else in the
+first place.
+
+Only the Drive entry is narrowed. There is a tighter spreadsheet permission —
+`spreadsheets.currentonly`, which limits the script to the sheet it is attached to — but it is
+deliberately not used here. Nothing in this app reaches a spreadsheet by an id somebody else
+supplied, the way the receipt endpoints once did with Drive files, so there is no equivalent bug
+waiting to be prevented; and `currentonly` behaves less predictably under the time-driven triggers
+that post your repeating expenses and send the digests. It tightens a bolt that was never loose,
+at the cost of the two features most likely to break quietly. Swap it in if you want, and check
+the next morning that your 3am and 8am jobs still ran.
+
+### Before you change anything
+
+There is one thing nobody can tell you from the outside: whether an instance that **already has
+receipts** keeps access to them after the permission narrows. Those files were created under the
+wider permission, and Google does not promise the association survives.
+
+So find out first, with your current permissions still in place:
+
+1. Paste the new `Code.gs` in, save, and deploy a new version as usual.
+2. In your spreadsheet: **SplitStack ▸ 🔍 Check what this script can do**.
+3. Everything should come back ✅. That is your "before" picture.
+
+### Making the change
+
+1. In the Apps Script editor: **⚙️ Project Settings** ▸ tick **Show "appsscript.json" manifest
+   file in editor**.
+2. Back in **Editor**, open `appsscript.json` and paste in the version from this repo.
+3. **Change `timeZone` to whatever was already there.** The file in this repo says
+   `America/New_York`, and if that is not yours, your repeating expenses and morning emails will
+   go out at the wrong hour.
+4. **Check the `webapp` block against your actual deployment.** It should read `USER_DEPLOYING`
+   and `ANYONE_ANONYMOUS`, which is what *Execute as: Me* and *Who has access: Anyone* mean in
+   Part 1. This is the one entry where a wrong value is not a feature failing — it is everybody's
+   app losing the backend at once.
+5. Save. Then **Run ▸ `setup`** from the editor — Google will ask you to authorise again, because
+   you are asking for a different set of permissions than last time. The consent screen should now
+   say *"See, edit, create, and delete only the specific Google Drive files you use with this
+   app"* rather than offering your whole Drive.
+6. **Deploy ▸ Manage deployments ▸ ✏️ ▸ Version: New version ▸ Deploy.**
+7. Run **SplitStack ▸ 🔍 Check what this script can do** again.
+
+### Reading the result
+
+The check that matters is **"Open a receipt made by the old permissions."**
+
+- ✅ — the association survived. You are done, and the app is now structurally unable to reach
+  anything in your Drive it did not create.
+- ❌ — your existing receipts are no longer reachable. Nothing is lost: the files are still in the
+  folder, and the expenses still point at them. Undo it by removing the `oauthScopes` block from
+  `appsscript.json`, saving, running `setup` once to re-authorise, and deploying a new version.
+  Everything comes straight back.
+
+Any other ❌ means a permission this app genuinely needs is missing from the list. Widen that one
+entry, re-authorise, and run the check again. The app keeps working throughout — a missing
+permission makes a feature fail, not the whole instance.
+
+> Instances with **no receipts yet** have nothing to migrate, so this is a free win. If you are
+> setting up from scratch, do it now and never think about it again.
+
+---
+
 ## Offline behaviour
 
 - The interface, your ledgers and every transaction are cached locally in IndexedDB.
@@ -768,6 +844,7 @@ to go back into the Apps Script editor.
 | **🛠 Run setup / repair** | Rebuilds any missing tab or column. Safe to run any time; never touches data |
 | **⏰ Check background jobs** | Says whether repeating expenses and email summaries are actually scheduled, and re-installs them if not |
 | **🧹 Clean up unused files** | Finds receipt photos nothing points at any more, tells you what it found, and bins them only if you say yes |
+| **🔍 Check what this script can do** | Tries every Google service the app relies on and reports what answered. Use it after changing permissions in `appsscript.json` |
 | **🔓 Unlock a locked account** | Clears someone's 15-minute lockout immediately |
 | **♻️ Reset the admin account** | Clears the admin password and issues a fresh setup key. Ledgers untouched |
 
@@ -830,6 +907,7 @@ own web app and run through Part 3 — no pasting code, and roughly three minute
 | File | Purpose |
 |---|---|
 | `Code.gs` | The whole backend. Paste into Apps Script. |
+| `appsscript.json` | Optional. Pins the permissions the script asks for, so it can only reach files it made. See *Narrowing what the script is allowed to touch*. |
 | `index.html` | Markup and the full design system. |
 | `app.js` | The application: sync engine, offline queue, money math, every screen. |
 | `sw.js` | Service worker — offline app shell. |
