@@ -2801,6 +2801,10 @@ function expenseSheet(ledger, existing) {
     const total = sum();
     const ok = Math.abs(total - 100) < 0.05;
     const shares = liveShares();
+    /* A receipt still waiting to sync counts too. It has no id yet — that
+       arrives with the upload — so asking only about receiptId made the
+       editor offer "Attach a photo" for an expense that already had one. */
+    const hasRcp = ed.receiptPreview || ed.receiptId || ed.receiptLocal;
     body().innerHTML = `
       <h2>${existing ? 'Edit expense' : 'New expense'}</h2>
       <p class="sheet-sub">${esc(ledger.emoji)} ${esc(ledger.name)}</p>
@@ -2859,11 +2863,14 @@ function expenseSheet(ledger, existing) {
       </div>
 
       <div class="field"><label>Receipt</label>
-        ${ed.receiptPreview || ed.receiptId ? `<div class="flex mb">
-          ${ed.receiptPreview ? `<img src="${ed.receiptPreview}" style="width:72px;height:72px;object-fit:cover;border-radius:14px">` :
-            `<div class="av l" style="background:var(--card-2);color:var(--ink-3)">📎</div>`}
+        ${hasRcp ? `<div class="flex mb">
+          ${ed.receiptPreview
+            ? `<button data-act="zoom-receipt" aria-label="Open the receipt full screen"
+                 style="padding:0;line-height:0;border-radius:14px"><img data-rcp-thumb alt="Receipt"
+                 style="width:72px;height:72px;object-fit:cover;border-radius:14px"></button>`
+            : `<div class="av l" style="background:var(--card-2);color:var(--ink-3)">📎</div>`}
           <button class="btn sm ghost" data-act="rm-receipt">Remove</button></div>` : ''}
-        <button class="btn ghost block" data-act="add-receipt">📷 ${ed.receiptPreview || ed.receiptId ? 'Replace photo' : 'Attach a photo'}</button></div>
+        <button class="btn ghost block" data-act="add-receipt">📷 ${hasRcp ? 'Replace photo' : 'Attach a photo'}</button></div>
 
       <div class="field"><label>Notes</label>
         <textarea class="input" id="f-notes" placeholder="Anything worth remembering">${esc(ed.notes)}</textarea></div>
@@ -2873,6 +2880,10 @@ function expenseSheet(ledger, existing) {
         <button class="btn ghost grow" data-act="cancel">Cancel</button>
         <button class="btn grow" data-act="save-expense">${existing ? 'Save' : 'Add it'}</button>
       </div>`;
+    // Assigned rather than interpolated, so a data URL never has to survive a
+    // trip through an HTML attribute.
+    const thumb = $('[data-rcp-thumb]', sheet);
+    if (thumb) thumb.src = ed.receiptPreview;
   }
 
   function readFields() {
@@ -2951,6 +2962,9 @@ function expenseSheet(ledger, existing) {
     else {
       const act = el.dataset.act;
       if (act === 'cancel') return sheet.close();
+      // A 72px crop is no way to tell whether the total came out legible, and
+      // here is where you'd still do something about it.
+      if (act === 'zoom-receipt') { lightbox(ed.receiptPreview); return; }
       if (act === 'add-receipt') {
         const d = await pickImage(1400, .72);
         if (d) {
@@ -3067,6 +3081,21 @@ function expenseSheet(ledger, existing) {
   });
 
   draw();
+  /* A receipt the editor didn't take itself arrives as an id, not a picture,
+     so there is nothing to show a thumbnail of — or to open. Both kinds live
+     in the blob store already: one still waiting to upload, one cached by the
+     viewer on the way in. So this is a lookup rather than a fetch, and when it
+     finds nothing — a receipt saved on another device, say — the paperclip
+     placeholder stands exactly as before. */
+  (async () => {
+    const key = ed.receiptLocal || (ed.receiptId ? 'srv_' + ed.receiptId : '');
+    if (!key) return;
+    const d = await DB.blobGet(key);
+    // Nothing is focused for the first 380ms, but read the fields back anyway:
+    // draw() rebuilds them from `ed`, and a fast typist shouldn't lose a word
+    // to a redraw they didn't ask for.
+    if (d && !ed.receiptPreview) { ed.receiptPreview = d; readFields(); draw(); }
+  })();
   setTimeout(() => { const a = $('#f-amount', sheet); a && a.focus(); }, 380);
 }
 
