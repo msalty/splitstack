@@ -925,6 +925,18 @@ function isEvenSplit(split) {
   return vals.every(v => Math.abs(v - eq) < 0.02);
 }
 
+/**
+ * True when a split says nothing that "evenly" wouldn't have said anyway:
+ * everybody in `ids` is in it, on the same share.
+ *
+ * Equal shares between *some* of them is not the same statement — leaving
+ * somebody out is the entire point of writing it down — so it stays a split of
+ * its own rather than collapsing back to "evenly".
+ */
+function isEvenSplitOf(split, ids) {
+  return isEvenSplit(split) && ids.every(i => (Number((split || {})[i]) || 0) > 0);
+}
+
 /* ─────────────────────────────────────────────────────────────────── review */
 /**
  * Three ways a row ends up wanting a second pair of eyes:
@@ -3154,7 +3166,11 @@ function ledgerSheet(existing) {
           ids: st.members.slice(),
           split: st.defaultSplit,
           confirmLabel: 'Use this',
-          onSave: s => { st.defaultSplit = isEvenSplit(s) ? null : s; haptic(25); draw(); }
+          // Only fold back to "evenly" when the split really is evenly for
+          // everyone here — a half-each between two of the four housemates is
+          // a custom split, and storing it as "evenly" would put the other two
+          // straight back into every new expense.
+          onSave: s => { st.defaultSplit = isEvenSplitOf(s, st.members) ? null : s; haptic(25); draw(); }
         });
       }
       haptic();
