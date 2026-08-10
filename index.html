@@ -280,6 +280,39 @@ input[type=time].input::-webkit-date-and-time-value{
   .sheet{border-radius:30px;max-height:88dvh;padding-bottom:26px}
 }
 
+/* ══════════════════════════════════════════════════════════════ lightbox */
+/* The receipt as it sits in the transaction sheet: a button, because tapping
+   it does something, and the whole picture is the target. */
+.rcp-open{display:block;width:100%;padding:0;line-height:0;border-radius:16px;
+  transition:transform .18s var(--spring)}
+.rcp-open img{width:100%;display:block;border-radius:16px}
+.rcp-open:active{transform:scale(.985)}
+
+/* Full screen, above the sheet it was opened from. `touch-action:none` is
+   load-bearing: it stops the browser treating a pinch as a page gesture or a
+   drag as a scroll, which is what lets the handlers own both outright. */
+.lbox{position:fixed;inset:0;z-index:90;background:rgba(12,8,28,.94);
+  display:flex;align-items:center;justify-content:center;overflow:hidden;
+  opacity:0;transition:opacity .2s;touch-action:none;
+  -webkit-user-select:none;user-select:none}
+.lbox.on{opacity:1}
+/* width/height auto so the box shrink-wraps the picture: the element's own
+   size is then the size of what you can see, which is what the pan limits are
+   measured against. object-fit would leave dead space inside the box and the
+   maths would quietly drift. */
+.lbox img{max-width:100%;max-height:100%;width:auto;height:auto;display:block;
+  will-change:transform;-webkit-user-drag:none}
+/* Only while easing back into place — during a gesture the transform has to
+   track the fingers exactly, with nothing smoothing it. */
+.lbox img.snap{transition:transform .24s var(--spring)}
+.lbox-x{position:fixed;top:calc(var(--sat) + 10px);right:14px;z-index:2;
+  width:42px;height:42px;border-radius:50%;display:grid;place-items:center;
+  background:rgba(255,255,255,.16);color:#fff;font-size:19px;font-weight:850;
+  backdrop-filter:blur(6px)}
+.lbox-hint{position:fixed;left:50%;transform:translateX(-50%);
+  bottom:calc(var(--sab) + 18px);margin:0;color:rgba(255,255,255,.72);
+  font-size:13px;font-weight:650;pointer-events:none;transition:opacity .3s}
+
 /* ═════════════════════════════════════════════════════════════════ splitter */
 .split-row{display:flex;align-items:center;gap:11px;padding:9px 0;border-bottom:1px solid var(--line)}
 .split-row:last-child{border-bottom:0}
