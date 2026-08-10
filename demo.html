@@ -1610,7 +1610,13 @@ const avatarPic = u => (u && AVATAR_RE.test(String(u.avatar || '')) ? String(u.a
 
 function avatar(u, size = 'm', badge) {
   const pic = avatarPic(u);
-  const bg = pic ? `background-image:url("${pic}")` : `background:${esc(u.color || '#8A84A6')}`;
+  // Single quotes inside, because the style attribute around this is written
+  // with double ones — `url("…")` closes the attribute on the spot and the
+  // browser throws the rest away, which is a photo that silently stops
+  // appearing. Safe to quote at all only because AVATAR_RE has already ruled
+  // out every quote character; without that check this would be the hole, not
+  // the fix for one.
+  const bg = pic ? `background-image:url('${pic}')` : `background:${esc(u.color || '#8A84A6')}`;
   // Entities wear squared-off corners. It reads at avatar size in a way a badge
   // or a colour never would, and it means a split row shows at a glance that
   // one of the shares belongs to a company rather than a housemate.
