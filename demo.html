@@ -585,7 +585,7 @@ select.input{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xml
 
 /* Shown in Settings ▸ App & updates. Bump this and SW_BUILD in sw.js together
    whenever you re-upload the app. */
-const APP_BUILD = '2026-08-09.9';
+const APP_BUILD = '2026-08-10.1';
 
 /* ────────────────────────────────────────────────────────────────  helpers */
 const $  = (s, r = document) => r.querySelector(s);
@@ -680,6 +680,17 @@ function backendFromId(id) {
 }
 /** Where this copy of the app lives, without any hash. */
 const appHome = () => location.origin + location.pathname;
+
+/* The directory this copy is installed in — '/splitstack/' under a subdirectory,
+   '/' at a domain root. Resolved exactly the way the browser resolves the
+   relative hrefs in index.html, so the two can't disagree.
+
+   Everything an origin shares with the apps hosted beside it — CacheStorage,
+   the service worker registry — gets namespaced by this, so a reset here can't
+   reach into a neighbour. Derived at runtime and never hardcoded: drop the
+   folder anywhere, on any server, and it still points at itself. */
+const APP_SCOPE = new URL('./', document.baseURI).pathname;
+const CACHE_NS  = 'splitstack@' + APP_SCOPE + ':';   // must match sw.js
 
 let toastTimer;
 function toast(msg, ms = 2400) {
@@ -1197,7 +1208,14 @@ const Updater = {
   async init() {
     if (!navigator.serviceWorker || location.protocol === 'file:') return;
     try {
-      this.reg = await navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' });
+      // Absolute paths off APP_SCOPE, and an explicit scope: a relative script
+      // URL resolves against the document while the manifest's resolves against
+      // <base>, so the two can drift apart. Pinning both to the directory we
+      // were loaded from keeps this worker's reach to exactly this app.
+      this.reg = await navigator.serviceWorker.register(APP_SCOPE + 'sw.js', {
+        scope: APP_SCOPE,
+        updateViaCache: 'none'
+      });
     } catch (e) { return; }
 
     // Somebody else's tab activated a new worker — reload to match it.
@@ -1274,16 +1292,28 @@ const Updater = {
     }
   },
 
-  /** Nuclear option: drop every cache and re-register from scratch. */
+  /**
+   * Nuclear option: drop this app's caches and re-register from scratch.
+   *
+   * "This app's" is the whole subtlety. CacheStorage and the service worker
+   * registry are per-ORIGIN, so on a host shared with other PWAs the obvious
+   * spelling — every cache from caches.keys(), every registration from
+   * getRegistrations() — resets the neighbours too, silently uninstalling
+   * their workers and wiping their offline shells. Stay inside CACHE_NS, and
+   * unregister only the worker that controls this page.
+   */
   async hardReset() {
     try {
       if (navigator.serviceWorker.controller) navigator.serviceWorker.controller.postMessage('clearCaches');
       if (window.caches) {
         const keys = await caches.keys();
-        await Promise.all(keys.map(k => caches.delete(k)));
+        await Promise.all(
+          keys.filter(k => k.startsWith(CACHE_NS) || /^splitstack-/.test(k))   // + pre-namespace caches
+              .map(k => caches.delete(k))
+        );
       }
-      const regs = await navigator.serviceWorker.getRegistrations();
-      await Promise.all(regs.map(r => r.unregister()));
+      const reg = this.reg || await navigator.serviceWorker.getRegistration(APP_SCOPE);
+      if (reg) await reg.unregister();
     } catch (e) { /* keep going — the reload is what matters */ }
     this.reload();
   }
