@@ -272,9 +272,18 @@ const stub = `
 </script>
 `;
 
+/* The demo is one file: the app and its fake backend are inline scripts, which
+   the real app's `script-src 'self'` rightly forbids. Swap in a policy that
+   fits what the demo actually is — self-contained, and talking to nothing. */
+const DEMO_CSP =
+  `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; ` +
+  `script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; ` +
+  `base-uri 'none'; form-action 'none'">`;
+
 /* NOTE: replacer functions, not strings — app.js is full of $ and $$ which
    would otherwise be interpreted as replacement patterns. */
 const out = html
+  .replace(/<meta http-equiv="Content-Security-Policy"[\s\S]*?>/, () => DEMO_CSP)
   .replace('<link rel="manifest" href="manifest.webmanifest">', () => '')
   .replace('<link rel="apple-touch-icon" href="icons/icon-192.png">', () => '')
   .replace('<title>SplitStack</title>', () => '<title>SplitStack — demo</title>')

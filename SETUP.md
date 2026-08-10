@@ -583,6 +583,42 @@ It's a supplement, never a replacement.
 > Turning it on or changing it signs nobody out, but every device will ask for the new phrase the
 > next time it syncs. Have it ready before you change it.
 
+### Where the secrets come from
+
+Every secret the backend mints — the pepper, the setup key, invite tokens — is drawn from
+`Utilities.getUuid()`, which is backed by Java's `SecureRandom`, and stretched with SHA-256.
+Nothing security-relevant uses `Math.random()`, which is fast, seeded, and reversible: given a
+few of its outputs you can work out the rest of the stream in both directions.
+
+> **Upgrading from a version before this?** Instances set up earlier generated their pepper with
+> `Math.random()`. Pasting in the new `Code.gs` fixes everything minted from now on, but it cannot
+> re-mint a pepper that is already in use — that value is what every stored password verifier is
+> built on, so replacing it would lock everybody out. If your setup key was ever shared somewhere
+> public, the tidy way to start over on new randomness is: **SplitStack ▸ Reset the admin account**,
+> claim it again, then have everyone set a new password.
+
+### What one member can reach
+
+Being on a ledger gets you that ledger, and stops there.
+
+- **Receipts.** A receipt is fetched by Drive file id, and the script runs as *you* — so an
+  unchecked id would be a way to ask for any file in your Drive. Two things have to agree before
+  the backend will hand one over: the file lives in the SplitStack receipts folder, and a row on a
+  ledger you belong to points at it. The same pair of checks decides what the cleanup sweeper is
+  allowed to bin.
+- **People.** You see the people you share a ledger with, and nobody else. Admins see everyone.
+- **Money.** An expense can only name people who are on that ledger — or who were on it when the
+  expense was written, so history stays editable after somebody moves out.
+- **Authorship.** Who entered a row is taken from the session that wrote it, never from the request.
+  Nobody can put their edit in someone else's name, or dodge review by claiming to be the author.
+
+### Your spreadsheet can't be turned into a program
+
+Names, notes and categories are typed by people and land in cells you scroll past. Sheets treats a
+value starting with `=`, `+`, `-` or `@` as a *formula*, so an expense named `=IMPORTRANGE(…)` would
+be code running with your access the moment you opened the tab. Everything written to a cell is
+marked as text first, so what you see in the sheet is what somebody typed, and nothing more.
+
 ---
 
 ## Offline behaviour

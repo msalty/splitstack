@@ -2,6 +2,13 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<!-- A second lock on the door. Everything this app runs ships in these files,
+     and the only server it talks to is an Apps Script deployment — so say so.
+     If a bug ever let somebody's display name or avatar reach the page as
+     markup, this is what stops it fetching or phoning anywhere.
+     'unsafe-inline' stays for styles only: the design is built on inline style
+     attributes. There is no inline script, and none is permitted. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; base-uri 'none'; form-action 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
 <meta name="theme-color" content="#6C5CE7">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -687,9 +694,28 @@ function backendId(url) {
   if (m) return m[1];
   try { return url ? 'u.' + b64u(url) : ''; } catch (e) { return ''; }
 }
+/* Where an Apps Script deployment is allowed to live. A backend URL decides
+   where this app sends usernames, passwords and session tokens, so the one that
+   arrives inside a link a stranger can text you gets held to exactly the same
+   rule as the one typed into the setup screen by hand. */
+function allowedBackend(url) {
+  let u;
+  try { u = new URL(url); } catch (e) { return false; }
+  return u.protocol === 'https:' &&
+    (u.hostname === 'script.google.com' || /(^|\.)googleusercontent\.com$/.test(u.hostname));
+}
+
 function backendFromId(id) {
   if (!id) return '';
-  if (id.slice(0, 2) === 'u.') { try { return unb64u(id.slice(2)); } catch (e) { return ''; } }
+  if (id.slice(0, 2) === 'u.') {
+    let url = '';
+    try { url = unb64u(id.slice(2)); } catch (e) { return ''; }
+    // The escape hatch for Workspace domain deployments, which carry the whole
+    // URL rather than just an id. Still has to be Google's own host — without
+    // that, '#/connect/u.<anything>' is a one-tap way to point somebody's login
+    // screen at a server of your choosing.
+    return allowedBackend(url) ? url : '';
+  }
   if (!/^[A-Za-z0-9_-]+$/.test(id)) return '';
   return 'https://script.google.com/macros/s/' + id + '/exec';
 }
@@ -757,12 +783,19 @@ const DB = (() => {
 })();
 
 /* ─────────────────────────────────────────────────────────────── crypto */
+/* The work factor is never allowed below this, whatever the server says it is.
+   The backend has only ever stored 210,000, so a smaller number coming back
+   means either a downgrade attempt or a server that is not the one we think —
+   and a derived key made with a handful of rounds is a password sent in the
+   clear with extra steps. */
+const PBKDF2_MIN = 210000;
+
 async function derive(password, saltHex, iterations) {
   if (!crypto.subtle) throw new Error('This browser needs a secure (https) connection for login.');
   const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
   const salt = new Uint8Array((saltHex.match(/.{1,2}/g) || []).map(b => parseInt(b, 16)));
   const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt, iterations: iterations || 210000, hash: 'SHA-256' }, key, 256);
+    { name: 'PBKDF2', salt, iterations: Math.max(PBKDF2_MIN, Number(iterations) || 0), hash: 'SHA-256' }, key, 256);
   return [...new Uint8Array(bits)].map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
@@ -957,7 +990,17 @@ const ERRORS = {
   NO_SUCH_RULE: 'That repeating expense is gone.',
   NOT_A_PERSON: "That's not a person — it can't log in or be emailed.",
   HAS_A_LOGIN: "They've already set a password, so they're a person. Remove the account instead.",
-  ADMIN_IS_A_PERSON: 'Admins have to be people. Change the role first.'
+  ADMIN_IS_A_PERSON: 'Admins have to be people. Change the role first.',
+  BAD_IMAGE: "That doesn't look like an image.",
+  NAME_TOO_LONG: 'That name is too long.',
+  NOTES_TOO_LONG: 'That note is too long.',
+  CATEGORY_TOO_LONG: 'That category name is too long.',
+  NO_SUCH_RECEIPT: 'That receipt is gone.',
+  NOT_SET_UP: "This backend hasn't finished setup. Run setup() in the Apps Script editor.",
+  // Both mean the browser sent a malformed hash — a stale tab, or something
+  // that isn't this app talking to the backend.
+  BAD_SALT: 'Something went wrong setting that password. Reload and try again.',
+  BAD_DK: 'Something went wrong setting that password. Reload and try again.'
 };
 const errMsg = e => ERRORS[e && e.code] || (e && e.message) || 'Something went wrong.';
 
@@ -1556,12 +1599,22 @@ function reviewPatch(existing, next) {
 }
 
 /* ───────────────────────────────────────────────────────────────── snippets */
+/* An avatar is a base64 image or it is nothing.
+   It arrives from the server, having been uploaded by whoever it belongs to,
+   and goes straight into a style attribute — so anything that is not the exact
+   shape of an inline image is somebody's markup, not somebody's face. The
+   backend refuses these on the way in; this is the half that would still hold
+   if it ever stopped. */
+const AVATAR_RE = /^data:image\/[a-z0-9+.-]{1,20};base64,[A-Za-z0-9+/=]+$/i;
+const avatarPic = u => (u && AVATAR_RE.test(String(u.avatar || '')) ? String(u.avatar) : '');
+
 function avatar(u, size = 'm', badge) {
-  const bg = u.avatar ? `background-image:url('${u.avatar}')` : `background:${esc(u.color || '#8A84A6')}`;
+  const pic = avatarPic(u);
+  const bg = pic ? `background-image:url("${pic}")` : `background:${esc(u.color || '#8A84A6')}`;
   // Entities wear squared-off corners. It reads at avatar size in a way a badge
   // or a colour never would, and it means a split row shows at a glance that
   // one of the shares belongs to a company rather than a housemate.
-  return `<div class="av ${size}${isEntity(u) ? ' entity' : ''}" style="${bg}" title="${esc(u.name)}">${u.avatar ? '' : esc(u.emoji || initials(u.name))}${badge ? `<span class="badge">${badge}</span>` : ''}</div>`;
+  return `<div class="av ${size}${isEntity(u) ? ' entity' : ''}" style="${bg}" title="${esc(u.name)}">${pic ? '' : esc(u.emoji || initials(u.name))}${badge ? `<span class="badge">${badge}</span>` : ''}</div>`;
 }
 function avStack(ids, max = 5) {
   const shown = ids.slice(0, max);
@@ -4446,7 +4499,7 @@ async function doConnect() {
   let url = $('#c-url').value.trim();
   if (!url) return fieldErr('#c-err', 'Paste the /exec URL first.');
   url = url.replace(/\/dev$/, '/exec');
-  if (!/^https:\/\/script\.google(usercontent)?\.com\//.test(url))
+  if (!allowedBackend(url))
     return fieldErr('#c-err', 'That should be a script.google.com URL ending in /exec.');
   S.api = url;
   try {

@@ -250,11 +250,33 @@ function headerIndex(sheet) {
   return (_hdr[name] = m);
 }
 
+/**
+ * A cell value that cannot turn into a formula.
+ *
+ * The database is a spreadsheet the owner opens and reads. Sheets treats a
+ * value beginning with = + - @ as a formula, so an expense named
+ * `=IMPORTRANGE(...)` or `=IMAGE("https://…/"&A1)` is not a name at all — it is
+ * code that runs with the owner's access the moment they look at the tab, and
+ * can quietly post what it finds to somewhere else. A leading apostrophe is the
+ * spreadsheet's own "this is text" marker: it forces the cell to plain text and
+ * is not part of the value, so getValues() reads back exactly what was typed
+ * and nothing downstream can tell the difference.
+ *
+ * Strings that merely look like negative numbers ("-12.50") are left alone —
+ * they are numbers, not formulas.
+ */
+function safeCell(v) {
+  if (typeof v !== 'string' || !v) return v;
+  if (!/^[=+\-@]/.test(v)) return v;
+  if (isFinite(v)) return v;
+  return "'" + v;
+}
+
 function appendRow(name, cols, obj) {
   var s = tab(name, cols);
   var idx = headerIndex(s);
   var row = new Array(idx.__width).fill('');
-  Object.keys(obj).forEach(function (k) { if (idx[k]) row[idx[k] - 1] = obj[k]; });
+  Object.keys(obj).forEach(function (k) { if (idx[k]) row[idx[k] - 1] = safeCell(obj[k]); });
   s.getRange(s.getLastRow() + 1, 1, 1, row.length).setValues([row]);
 }
 
@@ -264,7 +286,7 @@ function updateRow(name, cols, rowNum, obj) {
   var idx = headerIndex(s);
   var rng = s.getRange(rowNum, 1, 1, idx.__width);
   var row = rng.getValues()[0];
-  Object.keys(obj).forEach(function (k) { if (idx[k]) row[idx[k] - 1] = obj[k]; });
+  Object.keys(obj).forEach(function (k) { if (idx[k]) row[idx[k] - 1] = safeCell(obj[k]); });
   rng.setValues([row]);
 }
 
@@ -275,7 +297,7 @@ function appendRows(name, cols, objs) {
   var idx = headerIndex(s);
   var rows = objs.map(function (obj) {
     var row = new Array(idx.__width).fill('');
-    Object.keys(obj).forEach(function (k) { if (idx[k]) row[idx[k] - 1] = obj[k]; });
+    Object.keys(obj).forEach(function (k) { if (idx[k]) row[idx[k] - 1] = safeCell(obj[k]); });
     return row;
   });
   s.getRange(s.getLastRow() + 1, 1, rows.length, idx.__width).setValues(rows);
@@ -351,17 +373,20 @@ function setCfg(key, value) {
   var s = tab(TAB_CONFIG, ['Key', 'Value']);
   var rows = readTab(TAB_CONFIG, ['Key', 'Value']);
   for (var i = 0; i < rows.length; i++) {
-    if (rows[i].Key === key) { s.getRange(rows[i].__row, 2).setValue(value); _cfg = null; return; }
+    if (rows[i].Key === key) { s.getRange(rows[i].__row, 2).setValue(safeCell(value)); _cfg = null; return; }
   }
-  s.appendRow([key, value]);
+  s.appendRow([key, safeCell(value)]);
   _cfg = null;
 }
 
 var DIGEST_MODES = ['off', 'daily', 'weekly'];
 
 function setConfig(p) {
-  ['appName', 'currency', 'currencySymbol'].forEach(function (k) {
-    if (p[k] !== undefined) setCfg(k, p[k]);
+  // Short free text, so keep it short. These are rendered in emails and page
+  // titles, and there is no reason for a currency symbol to be a paragraph.
+  var CAPS = { appName: 60, currency: 8, currencySymbol: 8 };
+  Object.keys(CAPS).forEach(function (k) {
+    if (p[k] !== undefined) setCfg(k, String(p[k]).trim().slice(0, CAPS[k]));
   });
   if (p.digest !== undefined) {
     if (DIGEST_MODES.indexOf(p.digest) === -1) throw new Error('BAD_DIGEST_MODE');
@@ -658,7 +683,7 @@ function requireGate(req) {
   if (!want) return true;                                  // disabled
   var got = req.gate === undefined ? '' : String(req.gate);
   if (!got) throw new Error('GATE_REQUIRED');
-  if (hmac(pepper(), 'gate:' + got) !== want) {
+  if (!safeEqual(hmac(pepper(), 'gate:' + got), want)) {
     var c = CacheService.getScriptCache();
     var n = Number(c.get('gatefail') || 0);
     c.put('gatefail', String(n + 1), LOCK_WINDOW_SEC);
@@ -712,10 +737,28 @@ function adminUnlock(p) {
 
 /* ------------------------------------------------------------------ crypto */
 
+/**
+ * Unguessable random bytes, as hex.
+ *
+ * Everything this produces is a secret: the pepper that signs every session
+ * token and every stored password verifier, the setup key that claims the
+ * admin account, the invite tokens. Math.random() is a fast, seeded,
+ * *reversible* generator — given a few of its outputs you can recover its
+ * state and read the rest of the stream both forwards and backwards. That is
+ * fine for confetti and disqualifying for any of the above.
+ *
+ * Utilities.getUuid() is Java's UUID.randomUUID(), which draws on SecureRandom,
+ * so it is the entropy source. SHA-256 stretches a pair of them to whatever
+ * length was asked for without exposing the UUIDs themselves.
+ */
 function randomHex(bytes) {
   var out = '';
-  for (var i = 0; i < bytes; i++) out += ('0' + Math.floor(Math.random() * 256).toString(16)).slice(-2);
-  return out;
+  while (out.length < bytes * 2) {
+    out += bytesToHex(Utilities.computeDigest(
+      Utilities.DigestAlgorithm.SHA_256,
+      Utilities.getUuid() + ':' + Utilities.getUuid() + ':' + out));
+  }
+  return out.slice(0, bytes * 2);
 }
 
 function uid(prefix) {
@@ -747,6 +790,20 @@ function hmacHex(keyStr, msgStr) {
  */
 function verifierFor(dk) { return hmac(pepper(), 'v1:' + dk); }
 
+/**
+ * Compare two secrets in time that does not depend on how much of them
+ * matches. `a !== b` stops at the first differing character, which in principle
+ * lets a patient attacker learn a signature one character at a time. Network
+ * jitter makes that fanciful here; it costs nothing to not have to argue about.
+ */
+function safeEqual(a, b) {
+  a = String(a == null ? '' : a);
+  b = String(b == null ? '' : b);
+  var diff = a.length ^ b.length;
+  for (var i = 0; i < a.length && i < b.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
 function makeToken(user) {
   var exp     = Date.now() + SESSION_DAYS * 86400000;
   var payload = user.UserId + '|' + exp + '|' + (Number(user.TokenVer) || 0);
@@ -760,7 +817,7 @@ function requireAuth(token) {
   var payload;
   try { payload = Utilities.newBlob(Utilities.base64DecodeWebSafe(parts[0])).getDataAsString(); }
   catch (e) { throw new Error('AUTH_INVALID'); }
-  if (hmac(pepper(), payload).replace(/=+$/, '') !== parts[1]) throw new Error('AUTH_INVALID');
+  if (!safeEqual(hmac(pepper(), payload).replace(/=+$/, ''), parts[1])) throw new Error('AUTH_INVALID');
 
   var bits = payload.split('|');
   if (Number(bits[1]) < Date.now()) throw new Error('AUTH_EXPIRED');
@@ -812,8 +869,10 @@ function login(p) {
   // An entity is indistinguishable from a name nobody has registered, which is
   // the same answer the login screen already gives for every unknown username.
   if (!u || !u.Verifier || isEntity(u))        { guardFail(g); throw new Error('BAD_CREDENTIALS'); }
+  if (!safeEqual(verifierFor(p.dk), u.Verifier)) { guardFail(g); throw new Error('BAD_CREDENTIALS'); }
+  // Only after the password checks out. Answering "that account is switched
+  // off" to a wrong password tells a stranger the username was a real one.
   if (u.Active === false || u.Active === 'FALSE') throw new Error('ACCOUNT_DISABLED');
-  if (verifierFor(p.dk) !== u.Verifier)        { guardFail(g); throw new Error('BAD_CREDENTIALS'); }
   guardPass(g);
   return { token: makeToken(u), me: publicUser(u), state: bootstrap(u) };
 }
@@ -823,7 +882,11 @@ function claimAdmin(p) {
     setup(true);
     if (isReady()) throw new Error('ADMIN_EXISTS');
     var g = guardCheck('*setupkey*');
-    if (String(p.setupKey || '').toUpperCase().trim() !== String(cfg('setupKey')).toUpperCase().trim()) {
+    var want = String(cfg('setupKey', '')).toUpperCase().trim();
+    // No key configured means setup() has not finished. Fail rather than
+    // compare against the empty string, which everything matches.
+    if (!want) throw new Error('NOT_SET_UP');
+    if (!safeEqual(String(p.setupKey || '').toUpperCase().trim(), want)) {
       guardFail(g);
       throw new Error('BAD_SETUP_KEY');
     }
@@ -832,8 +895,9 @@ function claimAdmin(p) {
     var now = new Date();
     var u = {
       UserId: uid('usr'), Username: String(p.username).toLowerCase().trim(),
-      DisplayName: p.displayName || p.username, Email: p.email || '', Role: 'admin',
-      Salt: p.salt, Iterations: PBKDF2_ITERATIONS, Verifier: verifierFor(p.dk), TokenVer: 1,
+      DisplayName: String(p.displayName || p.username).trim().slice(0, 60),
+      Email: validEmail(p.email), Role: 'admin',
+      Salt: validSalt(p.salt), Iterations: PBKDF2_ITERATIONS, Verifier: verifierFor(validDk(p.dk)), TokenVer: 1,
       Avatar: '', Color: pickColor(0), Emoji: '👑', Active: true, CreatedAt: now, UpdatedAt: now
     };
     appendRow(TAB_USERS, USER_COLS, u);
@@ -846,10 +910,10 @@ function claimAdmin(p) {
 function changePassword(me, p) {
   return lock(function () {
     var g = guardCheck(me.Username);
-    if (verifierFor(p.oldDk) !== me.Verifier) { guardFail(g); throw new Error('BAD_CREDENTIALS'); }
+    if (!safeEqual(verifierFor(p.oldDk), me.Verifier)) { guardFail(g); throw new Error('BAD_CREDENTIALS'); }
     guardPass(g);
     updateRow(TAB_USERS, USER_COLS, me.__row, {
-      Salt: p.salt, Iterations: PBKDF2_ITERATIONS, Verifier: verifierFor(p.dk),
+      Salt: validSalt(p.salt), Iterations: PBKDF2_ITERATIONS, Verifier: verifierFor(validDk(p.dk)),
       TokenVer: (Number(me.TokenVer) || 0) + 1, UpdatedAt: new Date()
     });
     var fresh = findUser('UserId', me.UserId);
@@ -873,7 +937,7 @@ function adminSetPassword(p) {
     if (!u) throw new Error('NO_SUCH_USER');
     if (isEntity(u)) throw new Error('NOT_A_PERSON');
     updateRow(TAB_USERS, USER_COLS, u.__row, {
-      Salt: p.salt, Iterations: PBKDF2_ITERATIONS, Verifier: verifierFor(p.dk),
+      Salt: validSalt(p.salt), Iterations: PBKDF2_ITERATIONS, Verifier: verifierFor(validDk(p.dk)),
       TokenVer: (Number(u.TokenVer) || 0) + 1, UpdatedAt: new Date()
     });
     return { ok: true };
@@ -882,6 +946,27 @@ function adminSetPassword(p) {
 
 function validateUsername(n) {
   if (!n || !/^[a-z0-9._-]{2,24}$/i.test(String(n).trim())) throw new Error('BAD_USERNAME');
+}
+
+/**
+ * The salt and the derived key are both hex strings of a known length, made by
+ * the client's own crypto. Nothing downstream breaks if they are something
+ * else — the verifier simply never matches — but a row full of arbitrary text
+ * where a hash belongs is worth refusing at the door.
+ */
+function validHex(v, chars, what) {
+  var s = String(v == null ? '' : v).trim();
+  if (s.length !== chars || !/^[0-9a-f]+$/i.test(s)) throw new Error(what);
+  return s.toLowerCase();
+}
+function validSalt(v) { return validHex(v, 32, 'BAD_SALT'); }   // 16 bytes
+function validDk(v)   { return validHex(v, 64, 'BAD_DK'); }     // SHA-256 width
+
+/** An address this script is willing to hand to MailApp, or ''. */
+function validEmail(v) {
+  var email = String(v == null ? '' : v).trim().slice(0, 160);
+  if (email && !/^[^@\s]+@[^@\s.]+\.[^@\s]+$/.test(email)) throw new Error('BAD_EMAIL');
+  return email;
 }
 
 /* -------------------------------------------------------------------- users */
@@ -960,11 +1045,7 @@ function setProfile(me, p) {
       if (!name) throw new Error('NAME_REQUIRED');
       patch.DisplayName = name;
     }
-    if (p.email !== undefined) {
-      var email = String(p.email).trim().slice(0, 160);
-      if (email && !/^[^@\s]+@[^@\s.]+\.[^@\s]+$/.test(email)) throw new Error('BAD_EMAIL');
-      patch.Email = email;
-    }
+    if (p.email !== undefined) patch.Email = validEmail(p.email);
     if (p.notify !== undefined) patch.Notify = p.notify ? 'on' : 'off';
     if (p.payType !== undefined || p.payHandle !== undefined) {
       var type = String(p.payType || '').toLowerCase();
@@ -997,10 +1078,12 @@ function saveUser(me, p) {
       var u = findUser('UserId', p.id);
       if (!u) throw new Error('NO_SUCH_USER');
       var patch = { UpdatedAt: now };
-      if (p.name  !== undefined) patch.DisplayName = p.name;
-      if (p.email !== undefined) patch.Email = p.email;
-      if (p.emoji !== undefined) patch.Emoji = p.emoji;
-      if (p.color !== undefined) patch.Color = p.color;
+      // Same caps and the same email check setProfile applies. An admin has no
+      // more business writing a 10,000-character display name than anyone else.
+      if (p.name  !== undefined) patch.DisplayName = String(p.name).trim().slice(0, 60);
+      if (p.email !== undefined) patch.Email = validEmail(p.email);
+      if (p.emoji !== undefined) patch.Emoji = String(p.emoji).slice(0, 8);
+      if (p.color !== undefined) patch.Color = String(p.color).slice(0, 32);
       if (p.username !== undefined && String(p.username).toLowerCase() !== String(u.Username).toLowerCase()) {
         validateUsername(p.username);
         if (findUser('Username', p.username)) throw new Error('USERNAME_TAKEN');
@@ -1045,15 +1128,16 @@ function saveUser(me, p) {
     var n = readTab(TAB_USERS, USER_COLS).length;
     var nu = {
       UserId: uid('usr'), Username: username,
-      DisplayName: p.name || p.username, Email: entity ? '' : (p.email || ''),
+      DisplayName: String(p.name || p.username).trim().slice(0, 60),
+      Email: entity ? '' : validEmail(p.email),
       Role: (!entity && p.role === 'admin') ? 'admin' : 'member',
       // An entity is given no credentials at all — not a blank password, which
       // is a seat waiting to be claimed, but nothing a login could ever match.
-      Salt: entity ? '' : (p.salt || ''),
+      Salt: entity ? '' : (p.salt ? validSalt(p.salt) : ''),
       Iterations: PBKDF2_ITERATIONS,
-      Verifier: (!entity && p.dk) ? verifierFor(p.dk) : '',
-      TokenVer: 1, Avatar: '', Color: p.color || pickColor(n),
-      Emoji: p.emoji || (entity ? '🏢' : ''),
+      Verifier: (!entity && p.dk) ? verifierFor(validDk(p.dk)) : '',
+      TokenVer: 1, Avatar: '', Color: String(p.color || pickColor(n)).slice(0, 32),
+      Emoji: String(p.emoji || (entity ? '🏢' : '')).slice(0, 8),
       Active: true, Notify: entity ? 'off' : '', Kind: entity ? 'entity' : 'person',
       CreatedAt: now, UpdatedAt: now
     };
@@ -1085,6 +1169,16 @@ function deleteUser(me, p) {
   });
 }
 
+/**
+ * An avatar is a base64 image and nothing else.
+ *
+ * It is stored verbatim and every device that shares a ledger with this person
+ * renders it, so an unchecked string here is a sentence of somebody else's
+ * choosing running in everybody else's browser. The shape is narrow and known;
+ * insist on it.
+ */
+var AVATAR_RE = /^data:image\/[a-z0-9+.\-]{1,20};base64,[A-Za-z0-9+\/=]+$/i;
+
 function setAvatar(me, p) {
   return lock(function () {
     var targetId = p.userId && me.Role === 'admin' ? p.userId : me.UserId;
@@ -1092,6 +1186,7 @@ function setAvatar(me, p) {
     if (!u) throw new Error('NO_SUCH_USER');
     var data = String(p.avatar || '');
     if (data.length > 48000) throw new Error('AVATAR_TOO_BIG');
+    if (data && !AVATAR_RE.test(data)) throw new Error('BAD_IMAGE');
     updateRow(TAB_USERS, USER_COLS, u.__row, { Avatar: data, UpdatedAt: new Date() });
     return { ok: true, avatar: data };
   });
@@ -1190,12 +1285,13 @@ function saveLedger(me, p) {
       var patch = { UpdatedAt: now };
       if (p.name && p.name !== l.Name) {
         var sh = ss().getSheetByName(l.SheetName);
-        var newName = sheetNameFor(p.name);
+        var renamed = String(p.name).trim().slice(0, 80);
+        var newName = sheetNameFor(renamed);
         if (sh) sh.setName(newName);
-        patch.Name = p.name; patch.SheetName = newName;
+        patch.Name = renamed; patch.SheetName = newName;
       }
-      if (p.emoji !== undefined) patch.Emoji = p.emoji;
-      if (p.color !== undefined) patch.Color = p.color;
+      if (p.emoji !== undefined) patch.Emoji = String(p.emoji).slice(0, 8);
+      if (p.color !== undefined) patch.Color = String(p.color).slice(0, 32);
       if (p.archived !== undefined) patch.Archived = !!p.archived;
       // Membership first: the default split has to be judged against who ends
       // up on the ledger, not who was on it when the request was written.
@@ -1207,7 +1303,7 @@ function saveLedger(me, p) {
       return { ledger: publicLedger(ledgerById(p.id)) };
     }
 
-    var name = String(p.name || '').trim();
+    var name = String(p.name || '').trim().slice(0, 80);
     if (!name) throw new Error('NAME_REQUIRED');
     var sheetName = sheetNameFor(name);
     var s = ss().insertSheet(sheetName);
@@ -1219,7 +1315,7 @@ function saveLedger(me, p) {
 
     var l = {
       LedgerId: uid('ldg'), Name: name, SheetName: sheetName,
-      Emoji: p.emoji || '💸', Color: p.color || PALETTE[0],
+      Emoji: String(p.emoji || '💸').slice(0, 8), Color: String(p.color || PALETTE[0]).slice(0, 32),
       InviteToken: randomHex(12), Archived: false,
       CreatedBy: me.UserId, CreatedAt: now, UpdatedAt: now
     };
@@ -1314,9 +1410,27 @@ function rotateInvite(p) {
   });
 }
 
+/**
+ * Look up a ledger by its invite token.
+ *
+ * Reached without a login, so a wrong guess is counted the same way a wrong
+ * password is: enough of them and this stops answering for a quarter of an
+ * hour. The token is long enough that guessing it was never realistic, but an
+ * unauthenticated endpoint that will answer as fast as you can ask is worth
+ * closing on principle.
+ */
 function ledgerByInvite(token) {
   var all = readTab(TAB_LEDGERS, LEDGER_COLS);
   for (var i = 0; i < all.length; i++) if (all[i].InviteToken && all[i].InviteToken === token) return all[i];
+
+  // Wrong token. This endpoint answers without a login, so slow the next guess
+  // down — deliberately a growing pause rather than a lockout, because an
+  // invite link is shared by design and one stranger guessing must never be
+  // able to shut the door on everybody else's.
+  var c = CacheService.getScriptCache();
+  var n = Number(c.get('invitefail') || 0);
+  c.put('invitefail', String(n + 1), LOCK_WINDOW_SEC);
+  Utilities.sleep(Math.min(3000, 250 * (n + 1)));
   return null;
 }
 
@@ -1355,7 +1469,7 @@ function claimSeat(p) {
     });
     if (!isMember) throw new Error('NOT_A_MEMBER');
     updateRow(TAB_USERS, USER_COLS, u.__row, {
-      Salt: p.salt, Iterations: PBKDF2_ITERATIONS, Verifier: verifierFor(p.dk),
+      Salt: validSalt(p.salt), Iterations: PBKDF2_ITERATIONS, Verifier: verifierFor(validDk(p.dk)),
       TokenVer: (Number(u.TokenVer) || 0) + 1, UpdatedAt: new Date()
     });
     var fresh = findUser('UserId', u.UserId);
@@ -1525,12 +1639,13 @@ function push(me, p) {
     var existing = {};
     readTab(l.SheetName, TXN_COLS).forEach(function (r) { if (r.TxnId) existing[r.TxnId] = r; });
 
+    var members = memberIdsOf(p.ledgerId);
     var incoming = p.txns || [];
     var applied = [], toAppend = [], orphans = [], now = new Date();
     var revBase = nextRev(incoming.length || 1);
     incoming.forEach(function (t) {
-      validateTxn(t);
       var prior = existing[t.id];
+      validateTxn(t, prior ? members.concat(participantsOf(prior)) : members);
       var stamp = revBase + applied.length; // strictly increasing, never reused
       var rev = reviewForChange(me, t, prior);
 
@@ -1552,7 +1667,11 @@ function push(me, p) {
         Amount: Number(t.amount) || 0,
         PaidBy: t.paidBy || '',
         PaidTo: t.paidTo || '',
-        EnteredBy: t.enteredBy || me.UserId,
+        // Whoever wrote the row is whoever is holding the token, never whoever
+        // the request says. The review rules turn on authorship, so a client
+        // that could name someone else could also arrange never to be flagged —
+        // or pin its edits on a housemate.
+        EnteredBy: prior ? (prior.EnteredBy || me.UserId) : me.UserId,
         SplitPct: JSON.stringify(t.split || {}),
         Notes: t.notes || '',
         // Absent means "unchanged", not "cleared" — a push that forgets the
@@ -1611,7 +1730,9 @@ function push(me, p) {
 function reviewForChange(me, t, prior) {
   var clear = { state: '', by: '', note: '', done: '', was: '' };
   if (!prior) return clear;                      // brand new: nothing to review yet
-  var author = prior.EnteredBy || t.enteredBy || '';
+  // The stored author only — a row that named its own author in the request
+  // could name whoever it liked, and so never be flagged.
+  var author = prior.EnteredBy || '';
   if (!author || author === me.UserId) return clear;
 
   var base = Number(t.baseRev) || 0;
@@ -1687,10 +1808,43 @@ function reviewTxn(me, p) {
   });
 }
 
-function validateTxn(t) {
+/**
+ * Everyone a row puts money on: who paid, who was paid, and everyone whose
+ * share it divides into. Used to decide whether a pushed row is talking about
+ * this ledger's people or somebody else's.
+ */
+function participantsOf(row) {
+  var ids = [];
+  if (row.PaidBy) ids.push(String(row.PaidBy));
+  if (row.PaidTo) ids.push(String(row.PaidTo));
+  var split = parseJson(row.SplitPct) || {};
+  for (var k in split) if (split.hasOwnProperty(k)) ids.push(k);
+  return ids;
+}
+
+/**
+ * @param allowed  ids this row may name — the ledger's current members, plus
+ *                 whoever the row already named. The second half matters: a
+ *                 housemate who moves out stops being a member but stays on the
+ *                 expenses they were part of, and those still have to be
+ *                 editable.
+ */
+function validateTxn(t, allowed) {
   if (!t.id) throw new Error('TXN_ID_REQUIRED');
   if (!(Number(t.amount) >= 0)) throw new Error('BAD_AMOUNT');
   if (Number(t.amount) > 100000000) throw new Error('AMOUNT_TOO_LARGE');
+
+  // Names and notes land in a spreadsheet cell somebody scrolls through. Cap
+  // them here rather than trusting the form that usually sends them.
+  if (String(t.name || '').length > 200) throw new Error('NAME_TOO_LONG');
+  if (String(t.notes || '').length > 2000) throw new Error('NOTES_TOO_LONG');
+  if (String(t.category || '').length > 40) throw new Error('CATEGORY_TOO_LONG');
+
+  var ok = function (id) {
+    if (id && allowed.indexOf(String(id)) === -1) throw new Error('NOT_A_MEMBER');
+  };
+  ok(t.paidBy); ok(t.paidTo);
+
   if (t.type === 'settlement') {
     if (!t.paidBy || !t.paidTo) throw new Error('SETTLEMENT_NEEDS_BOTH_PARTIES');
     if (t.paidBy === t.paidTo) throw new Error('SETTLEMENT_SAME_PERSON');
@@ -1698,7 +1852,7 @@ function validateTxn(t) {
   }
   if (!t.deleted) {
     var sum = 0, n = 0;
-    Object.keys(t.split || {}).forEach(function (k) { sum += Number(t.split[k]) || 0; n++; });
+    Object.keys(t.split || {}).forEach(function (k) { ok(k); sum += Number(t.split[k]) || 0; n++; });
     if (!n) throw new Error('SPLIT_REQUIRED');
     if (Math.abs(sum - 100) > 0.05) throw new Error('SPLIT_MUST_TOTAL_100');
   }
@@ -2021,8 +2175,28 @@ function receiptFolder() {
  * Best effort on purpose: a file that has already gone, or that the script
  * cannot see, must never be the reason a delete or a save fails.
  */
-function trashReceipt(id) {
+/**
+ * Does this file id actually name one of our receipts?
+ *
+ * A ReceiptId is a plain string on a row, and rows are written by whoever is
+ * on the ledger — so the id in one is a claim, not a fact. The script runs as
+ * the spreadsheet's owner and DriveApp can reach everything they own, which
+ * makes an unchecked id a way to read, or bin, any file in their Drive.
+ * Membership decides which receipts you may see; this decides what counts as a
+ * receipt at all.
+ */
+function isOurReceipt(id) {
   if (!id) return false;
+  try {
+    var want = receiptFolder().getId();
+    var parents = DriveApp.getFileById(String(id)).getParents();
+    while (parents.hasNext()) if (parents.next().getId() === want) return true;
+  } catch (e) {}
+  return false;
+}
+
+function trashReceipt(id) {
+  if (!id || !isOurReceipt(id)) return false;
   try { DriveApp.getFileById(String(id)).setTrashed(true); return true; }
   catch (e) { return false; }
 }
@@ -2204,8 +2378,38 @@ function cleanUpOrphans() {
   return { unused: scan.orphans.length, bytes: scan.bytes, orphanRules: rules.length };
 }
 
+/**
+ * Is this file id one of *your* receipts?
+ *
+ * The script runs as the spreadsheet's owner, so DriveApp can reach every file
+ * in that person's Drive — tax returns, work documents, everything. A file id
+ * arriving in a request is therefore not a receipt until a row on a ledger the
+ * caller belongs to says it is. Only the ReceiptId column is read, so the cost
+ * is one narrow range per ledger.
+ */
+function receiptVisibleTo(me, id) {
+  var ledgers = myLedgers(me);
+  for (var i = 0; i < ledgers.length; i++) {
+    var sh = ss().getSheetByName(ledgers[i].SheetName);
+    if (!sh) continue;
+    var col = headerIndex(sh).ReceiptId;
+    var last = sh.getLastRow();
+    if (!col || last < 2) continue;
+    var vals = sh.getRange(2, col, last - 1, 1).getValues();
+    for (var r = 0; r < vals.length; r++) {
+      if (vals[r][0] && String(vals[r][0]).trim() === id) return true;
+    }
+  }
+  return false;
+}
+
 function getReceipt(me, p) {
-  var f = DriveApp.getFileById(p.receiptId);
+  var id = String(p.receiptId || '').trim();
+  if (!id) throw new Error('NO_SUCH_RECEIPT');
+  // Both halves matter: the folder says it is a receipt, the ledger says it is
+  // one of yours.
+  if (!isOurReceipt(id) || !receiptVisibleTo(me, id)) throw new Error('FORBIDDEN');
+  var f = DriveApp.getFileById(id);
   var b = f.getBlob();
   return { dataUrl: 'data:' + b.getContentType() + ';base64,' + Utilities.base64Encode(b.getBytes()) };
 }
