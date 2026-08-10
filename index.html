@@ -2,6 +2,24 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<!-- A second lock on the door. Everything this app runs ships in these files,
+     and the only server it talks to is an Apps Script deployment — so say so.
+     If a bug ever let somebody's display name or avatar reach the page as
+     markup, this is what stops it fetching or phoning anywhere.
+     'unsafe-inline' stays for styles only: the design is built on inline style
+     attributes. There is no inline script, and none is permitted. -->
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'none';
+  script-src 'self';
+  style-src 'self' 'unsafe-inline';
+  img-src 'self' data: blob:;
+  font-src 'self';
+  connect-src 'self' https://script.google.com https://*.googleusercontent.com;
+  manifest-src 'self';
+  worker-src 'self';
+  base-uri 'none';
+  form-action 'none';
+  frame-ancestors 'none'">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
 <meta name="theme-color" content="#6C5CE7">
 <meta name="apple-mobile-web-app-capable" content="yes">
