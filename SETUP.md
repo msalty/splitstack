@@ -662,20 +662,38 @@ So find out first, with your current permissions still in place:
 
 1. In the Apps Script editor: **⚙️ Project Settings** ▸ tick **Show "appsscript.json" manifest
    file in editor**.
-2. Back in **Editor**, open `appsscript.json` and paste in the version from this repo.
-3. **Change `timeZone` to whatever was already there.** The file in this repo says
-   `America/New_York`, and if that is not yours, your repeating expenses and morning emails will
-   go out at the wrong hour.
-4. **Check the `webapp` block against your actual deployment.** It should read `USER_DEPLOYING`
-   and `ANYONE_ANONYMOUS`, which is what *Execute as: Me* and *Who has access: Anyone* mean in
-   Part 1. This is the one entry where a wrong value is not a feature failing — it is everybody's
-   app losing the backend at once.
-5. Save. Then **Run ▸ `setup`** from the editor — Google will ask you to authorise again, because
+2. Back in **Editor**, open `appsscript.json`. **There is already one there** — every project has
+   it, it was just hidden. Copy what you find into a scratch note before touching it. That is your
+   rollback, and it is a better one than anything written down here, because it is exactly what
+   you had.
+3. **Do not replace it.** Add only the `oauthScopes` block from this repo's copy, and leave every
+   other line as you found it:
+
+   ```json
+     "oauthScopes": [
+       "https://www.googleapis.com/auth/spreadsheets",
+       "https://www.googleapis.com/auth/script.container.ui",
+       "https://www.googleapis.com/auth/drive.file",
+       "https://www.googleapis.com/auth/script.send_mail",
+       "https://www.googleapis.com/auth/script.scriptapp"
+     ],
+   ```
+
+   That array is the entire change. Everything else in this repo's copy — `timeZone`,
+   `runtimeVersion`, the `webapp` block — is a reconstruction of settings your project already
+   holds, and yours are right by definition. Overwriting them is how you end up with digests
+   arriving at 3am in the wrong timezone, or a `webapp` block that quietly takes the backend away
+   from everybody. Adding one array cannot do either.
+
+   > Setting up a **brand-new instance** from scratch? Then there is nothing to preserve — paste
+   > the whole file, and set `timeZone` to yours.
+
+4. Save. Then **Run ▸ `setup`** from the editor — Google will ask you to authorise again, because
    you are asking for a different set of permissions than last time. The consent screen should now
    say *"See, edit, create, and delete only the specific Google Drive files you use with this
    app"* rather than offering your whole Drive.
-6. **Deploy ▸ Manage deployments ▸ ✏️ ▸ Version: New version ▸ Deploy.**
-7. Run **SplitStack ▸ 🔍 Check what this script can do** again.
+5. **Deploy ▸ Manage deployments ▸ ✏️ ▸ Version: New version ▸ Deploy.**
+6. Run **SplitStack ▸ 🔍 Check what this script can do** again.
 
 ### Reading the result
 
@@ -907,7 +925,7 @@ own web app and run through Part 3 — no pasting code, and roughly three minute
 | File | Purpose |
 |---|---|
 | `Code.gs` | The whole backend. Paste into Apps Script. |
-| `appsscript.json` | Optional. Pins the permissions the script asks for, so it can only reach files it made. See *Narrowing what the script is allowed to touch*. |
+| `appsscript.json` | Optional, and a reference copy — your project already has its own. The `oauthScopes` block is the part worth copying across; it stops the script being able to reach anything in Drive it did not create. See *Narrowing what the script is allowed to touch*. |
 | `index.html` | Markup and the full design system. |
 | `app.js` | The application: sync engine, offline queue, money math, every screen. |
 | `sw.js` | Service worker — offline app shell. |
