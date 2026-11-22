@@ -217,8 +217,13 @@ const DB = (() => {
     async queue(item) { return tx('outbox', 'readwrite', s => s.add(item)); },
     async outbox() { const db = await open(); return req(db.transaction('outbox').objectStore('outbox').getAll()); },
     async unqueue(seq) { return tx('outbox', 'readwrite', s => s.delete(seq)); },
+    /* Update a queued item in place, keeping its seq and so its place in the
+       queue. Used to record progress part-way through sending something, so a
+       retry doesn't redo the half that worked. */
+    async requeue(item) { return tx('outbox', 'readwrite', s => s.put(item)); },
     async blobGet(k) { const db = await open(); return req(db.transaction('blobs').objectStore('blobs').get(k)); },
     async blobSet(k, v) { return tx('blobs', 'readwrite', s => s.put(v, k)); },
+    async blobDel(k) { return tx('blobs', 'readwrite', s => s.delete(k)); },
     async wipe() {
       const db = await open();
       return new Promise(res => {
@@ -336,6 +341,16 @@ const SYNC_API = 8;
  * which is the difference between a bug and a wrinkle.
  */
 const SYNC_TTL = 12 * 60 * 60 * 1000;
+
+/**
+ * Receipt uploads that are never going to work, however many times we ask.
+ * The photo is the wrong shape or too big, or this device has no business
+ * writing to the ledger — none of which another attempt improves. Anything
+ * else (a timeout, a 500, a reply that made no sense) gets a few more goes,
+ * because that is usually a tunnel rather than a problem with the photo.
+ */
+const RECEIPT_FATAL = /^(BAD_IMAGE|IMAGE_TOO_BIG|RECEIPT_GONE|FORBIDDEN|NO_SUCH_LEDGER|AUTH_|GATE_)/;
+const RECEIPT_TRIES = 4;
 
 /** A member who isn't a person: an employer, a kitty, someone not using the app. */
 const isEntity = u => u && u.kind === 'entity';
@@ -592,17 +607,44 @@ async function sync({ silent = false, full = false } = {}) {
       ob.filter(o => o.kind === 'txn').forEach(o => (byLedger[o.ledgerId] = byLedger[o.ledgerId] || []).push(o));
 
       for (const [ledgerId, items] of Object.entries(byLedger)) {
-        // receipts first so the txn row carries a real id
+        /* Receipts go up first, so the row that follows can carry a real id.
+           A failed upload is the fiddly case and used to be the broken one:
+           the error was swallowed, the row went up saying receiptId '', and
+           the queue entry was dropped — so the photo was gone for good while
+           the app said "added ✓". Worse, an empty receiptId means "clear it"
+           to the backend, so replacing a photo over a flaky connection took
+           the existing one down with it.
+
+           Now a failure leaves the field off the payload entirely, which the
+           backend reads as "leave it as it was", and the entry stays queued
+           for another go. */
+        const holding = new Set();
         for (const it of items) {
-          if (it.payload._receiptLocal) {
-            try {
-              const data = await DB.blobGet(it.payload._receiptLocal);
-              if (data) {
-                const r = await api('putReceipt', { ledgerId, txnId: it.payload.id, dataUrl: data });
-                it.payload.receiptId = r.receiptId;
-                delete it.payload._receiptLocal;
-              }
-            } catch (e) { if (e.code === 'OFFLINE') throw e; }
+          if (!it.payload._receiptLocal) continue;
+          try {
+            const data = await DB.blobGet(it.payload._receiptLocal);
+            if (!data) throw new ApiError('RECEIPT_GONE');
+            const r = await api('putReceipt', { ledgerId, txnId: it.payload.id, dataUrl: data });
+            if (!r || !r.receiptId) throw new ApiError('BAD_RESPONSE');
+            it.payload.receiptId = r.receiptId;
+            delete it.payload._receiptLocal;
+            // Banked, so a push that fails after this doesn't upload it twice.
+            await DB.requeue(it);
+          } catch (e) {
+            if (e.code === 'OFFLINE') throw e;
+            delete it.payload.receiptId;        // "unchanged", never "cleared"
+            const tries = (it.receiptTries || 0) + 1;
+            const hopeless = RECEIPT_FATAL.test(e.code || '') || tries >= RECEIPT_TRIES;
+            if (!hopeless) { it.receiptTries = tries; holding.add(it.seq); continue; }
+            /* Out of road. Let the expense itself through, drop the photo, and
+               say so plainly — being told to take it again is recoverable, and
+               silently losing it was not. */
+            const key = it.payload._receiptLocal;
+            delete it.payload._receiptLocal;
+            const local = (S.txns[ledgerId] || []).find(t => t.id === it.payload.id);
+            if (local) delete local._receiptLocal;
+            if (key) await DB.blobDel(key).catch(() => {});
+            toast("The expense saved, but its photo didn't — try attaching it again", 5200);
           }
         }
         const res = await api('push', {
@@ -611,7 +653,18 @@ async function sync({ silent = false, full = false } = {}) {
         S.cursors[ledgerId] = res.cursor;
         (S.txns[ledgerId] || []).forEach(t => { delete t._local; });
         mergeTxns(ledgerId, res.txns);
-        for (const it of items) await DB.unqueue(it.seq);
+        for (const it of items) {
+          if (!holding.has(it.seq)) { await DB.unqueue(it.seq); continue; }
+          /* Still owes a photo, so it stays queued. The row itself has landed,
+             though, so re-point the pending edit at the revision the backend
+             now holds: left alone, the next attempt looks like an edit racing
+             somebody else's and gets flagged as a conflict. baseRev is only
+             set when editing another person's entry, which is the only case
+             that can be flagged at all. */
+          const landed = (res.txns || []).find(t => t.id === it.payload.id);
+          if (landed && it.payload.baseRev) it.payload.baseRev = landed.updatedAt || 0;
+          await DB.requeue(it);
+        }
         await persistLedger(ledgerId);
       }
 

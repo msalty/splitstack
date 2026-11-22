@@ -21,8 +21,10 @@ const DB = (() => {
     async queue(i){ outbox.push(Object.assign({seq:seq++},i)); },
     async outbox(){ return outbox.slice(); },
     async unqueue(s){ const i=outbox.findIndex(o=>o.seq===s); if(i>=0) outbox.splice(i,1); },
+    async requeue(it){ const i=outbox.findIndex(o=>o.seq===it.seq); if(i>=0) outbox[i]=it; else outbox.push(it); },
     async blobGet(k){ return blobs[k]; },
     async blobSet(k,v){ blobs[k]=v; },
+    async blobDel(k){ delete blobs[k]; },
     async wipe(){ for(const k in kv) delete kv[k]; for(const k in txns) delete txns[k]; outbox.length=0; }
   };
 })();
