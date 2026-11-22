@@ -21,8 +21,10 @@ const DB = (() => {
     async queue(i){ outbox.push(Object.assign({seq:seq++},i)); },
     async outbox(){ return outbox.slice(); },
     async unqueue(s){ const i=outbox.findIndex(o=>o.seq===s); if(i>=0) outbox.splice(i,1); },
+    async requeue(it){ const i=outbox.findIndex(o=>o.seq===it.seq); if(i>=0) outbox[i]=it; else outbox.push(it); },
     async blobGet(k){ return blobs[k]; },
     async blobSet(k,v){ blobs[k]=v; },
+    async blobDel(k){ delete blobs[k]; },
     async wipe(){ for(const k in kv) delete kv[k]; for(const k in txns) delete txns[k]; outbox.length=0; }
   };
 })();
@@ -130,10 +132,18 @@ const stub = `
     const {action,payload}=JSON.parse(opts.body);
     await new Promise(r=>setTimeout(r,180));      // a little latency, for realism
     let d;
-    if(action==='ping') d={version:7,ready:true,appName:'SplitStack',iterations:210000};
+    if(action==='ping') d={version:8,ready:true,appName:'SplitStack',iterations:210000};
     else if(action==='bootstrap') d=state;
     else if(action==='pull'){
       d={ledgers:{}};
+      ledgers.forEach(l=>{ d.ledgers[l.id]={txns:data[l.id]||[],cursor:9999,full:!(payload.since||{})[l.id]}; });
+    }
+    /* The merged open-the-app call. There are no real watermarks to keep here
+       — the demo's state object is mutated in place — so it answers in full
+       every time and sends no stamp, which keeps the client asking. The point
+       is that the demo exercises the same one-request path the app now uses. */
+    else if(action==='sync'){
+      d={state,stamp:'',ledgers:{}};
       ledgers.forEach(l=>{ d.ledgers[l.id]={txns:data[l.id]||[],cursor:9999,full:!(payload.since||{})[l.id]}; });
     }
     else if(action==='push'){

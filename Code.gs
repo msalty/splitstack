@@ -41,7 +41,11 @@ var RECUR_COLS  = ['RuleId','LedgerId','Name','Category','Amount','PaidBy','Spli
 
 var PBKDF2_ITERATIONS = 210000;
 var SESSION_DAYS      = 60;
-var API_VERSION       = 7;
+/* 8 added the merged `sync` action. NEEDS_API in app.js deliberately stays at
+   7: a backend without it still works, the client just falls back to the old
+   bootstrap + pull pair, so there is nothing here worth nagging anyone to
+   upgrade for. */
+var API_VERSION       = 8;
 
 /* Recurring rules never run more than this many periods in one pass. A script
    whose trigger was off for a year should not wake up and post 365 rows. */
@@ -173,6 +177,7 @@ function route(req) {
   switch (action) {
     case 'bootstrap':      return noteHome(me, p), bootstrap(me);
     case 'pull':           return pull(me, p);
+    case 'sync':           return noteHome(me, p), syncAll(me, p);
     case 'push':           return push(me, p);
     case 'reviewTxn':      return reviewTxn(me, p);
     case 'joinLedger':     return joinLedger(me, p);
@@ -317,6 +322,105 @@ function nextRev(count) {
   return base;
 }
 
+/* --------------------------------------------------------- sync watermarks */
+/**
+ * Watermarks that let a client skip work it does not need to do.
+ *
+ * Delta sync already keeps the *payload* small — `pull` only returns rows
+ * newer than the client's cursor. What it cannot avoid is the *read*: finding
+ * those rows means opening the spreadsheet and walking every ledger tab, and
+ * that costs the same whether one row changed or none did. On a quiet morning
+ * open it is most of a second spent proving that nothing happened.
+ *
+ * These two stamps answer "did anything happen?" out of Script Properties
+ * instead — no spreadsheet involved:
+ *
+ *   SYNC_STATE        bumped whenever anything bootstrap() reports changes:
+ *                     users, ledgers, members, repeating rules, config.
+ *                     Compared for equality, so it needs no ordering and any
+ *                     change at all invalidates it.
+ *   SYNC_LEDGER_<id>  the highest Rev committed to that ledger's tab.
+ *                     Compared against the client's cursor, which is why it
+ *                     has to be a real Rev rather than a timestamp.
+ *
+ * One property per stamp rather than a single JSON blob, so a transaction
+ * landing on one ledger can never clobber another ledger's watermark.
+ *
+ * Three rules keep this honest, and all three matter:
+ *
+ *  1. A ledger stamp is written only AFTER SpreadsheetApp.flush(), never
+ *     before. Writing it first opens a window where a client reads the new
+ *     watermark, pulls rows that have not landed yet, and stores a cursor
+ *     nothing will ever beat — losing that transaction for good. This is
+ *     exactly why LAST_REV is not reused as the watermark: nextRev() hands
+ *     out its numbers at the *start* of a push.
+ *  2. A missing or unreadable stamp means "changed", never "unchanged". An
+ *     instance upgrading to this version has no stamps at all, so the first
+ *     sync afterwards does the full job and writes them.
+ *  3. The client reconciles in full on a timer regardless (SYNC_TTL in
+ *     app.js). A bump that never happened — a new writer added without a
+ *     bumpState(), or somebody typing straight into the spreadsheet — then
+ *     costs a few hours of staleness instead of forever.
+ */
+var STAMP_STATE  = 'SYNC_STATE';
+var STAMP_LEDGER = 'SYNC_LEDGER_';
+
+var _stamps = null;
+function stampsAll() {
+  // One API call for every property, rather than one per ledger.
+  if (!_stamps) {
+    try { _stamps = PropertiesService.getScriptProperties().getProperties() || {}; }
+    catch (e) { _stamps = {}; }
+  }
+  return _stamps;
+}
+
+function setStamp(key, value) {
+  try {
+    PropertiesService.getScriptProperties().setProperty(key, String(value));
+    stampsAll()[key] = String(value);
+  } catch (e) {
+    /* A stamp we failed to write only means more work next time, which is the
+       safe direction. It must never fail the write it was describing. */
+  }
+}
+
+/** The state watermark, seeded on first use so the next open can skip. */
+function stateStamp() {
+  var cur = stampsAll()[STAMP_STATE];
+  if (cur) return String(cur);
+  var seeded = String(Date.now());
+  setStamp(STAMP_STATE, seeded);
+  return seeded;
+}
+
+/** Anything bootstrap() reports has changed. */
+function bumpState() {
+  // Date.now() as a floor keeps it moving even where the clock stands still.
+  // Only inequality is ever tested, so two writes landing on the same value is
+  // harmless — every client still sees a stamp it was not holding.
+  var prev = Number(stampsAll()[STAMP_STATE] || 0);
+  setStamp(STAMP_STATE, Math.max(Date.now(), prev + 1));
+}
+
+/** null when this ledger has never been stamped: "read it and find out". */
+function ledgerStamp(ledgerId) {
+  var v = stampsAll()[STAMP_LEDGER + ledgerId];
+  return (v === undefined || v === '') ? null : Number(v);
+}
+
+/** Call AFTER flush(), with the highest Rev now committed to the tab. */
+function bumpLedger(ledgerId, maxRev) {
+  if (!ledgerId || !(maxRev > 0)) return;
+  setStamp(STAMP_LEDGER + ledgerId, maxRev);
+}
+
+function dropLedgerStamp(ledgerId) {
+  try { PropertiesService.getScriptProperties().deleteProperty(STAMP_LEDGER + ledgerId); }
+  catch (e) {}
+  delete stampsAll()[STAMP_LEDGER + ledgerId];
+}
+
 /**
  * The columns this version needs, added to a spreadsheet built by an older one.
  *
@@ -393,6 +497,7 @@ function setConfig(p) {
     setCfg('digest', p.digest);
   }
   if (p.categories !== undefined) setCfg('categories', encodeCategories(p.categories));
+  bumpState();
   return { ok: true };
 }
 
@@ -617,20 +722,66 @@ function showSetupKey() { Logger.log(cfg('setupKey')); return cfg('setupKey'); }
  */
 var JOB_HANDLERS = ['rollRecurring', 'sendDigests'];
 
+/* Deliberately not in JOB_HANDLERS: jobsInstalled() asks "are the daily jobs
+   running?" to decide whether to warn the user, and this one existing is no
+   evidence that those two do. It is installed and cleaned up alongside them
+   all the same. */
+var WATCH_HANDLER = 'onSheetChange';
+
 function installTriggers() {
   try {
+    var ours = JOB_HANDLERS.concat([WATCH_HANDLER]);
     ScriptApp.getProjectTriggers().forEach(function (t) {
-      if (JOB_HANDLERS.indexOf(t.getHandlerFunction()) !== -1) ScriptApp.deleteTrigger(t);
+      if (ours.indexOf(t.getHandlerFunction()) !== -1) ScriptApp.deleteTrigger(t);
     });
     // 3am: expenses are dated and posted before anybody looks at the app.
     ScriptApp.newTrigger('rollRecurring').timeBased().atHour(3).everyDays(1).create();
     // 8am: the summary lands with the morning email, after the 3am rows exist.
     ScriptApp.newTrigger('sendDigests').timeBased().atHour(8).everyDays(1).create();
+    // And one for people editing the spreadsheet by hand — see onSheetChange.
+    ScriptApp.newTrigger(WATCH_HANDLER).forSpreadsheet(ss()).onChange().create();
     try { CacheService.getScriptCache().remove('jobs'); } catch (e) {}
+    bumpState();                     // config.jobs is in bootstrap()
     return { ok: true };
   } catch (e) {
     return { ok: false, error: String(e && e.message ? e.message : e) };
   }
+}
+
+/**
+ * Somebody typed straight into the spreadsheet.
+ *
+ * That is a first-class way to use this app — the whole point of a spreadsheet
+ * backend is that you can open it — but a hand edit moves no watermark, so
+ * without this every device would go on believing it was up to date until the
+ * client's TTL expired. Throw away every stamp so the next sync does the full
+ * job and rebuilds them from what is actually on the sheets.
+ *
+ * The catch is that this trigger can also fire for the script's own writes,
+ * depending on how Apps Script is feeling, and invalidating on every push
+ * would quietly undo the entire optimisation. So it ignores any change that
+ * lands within a few seconds of a stamp being written: stamps are themselves
+ * Date.now()-floored, so "a stamp was just written" is a reliable sign that
+ * the change was ours. A genuine hand edit inside that window is simply
+ * missed, and the client's TTL picks it up.
+ *
+ * Note this only fixes *staleness*. A hand-typed row has no Rev, so it still
+ * reads as updatedAt 0 and only a full resync will show it — that was true
+ * before any of this and is not what the stamps are for.
+ */
+var SELF_WRITE_GRACE_MS = 30000;
+
+function onSheetChange() {
+  var props = stampsAll();
+  var keys = Object.keys(props).filter(function (k) {
+    return k === STAMP_STATE || k.indexOf(STAMP_LEDGER) === 0;
+  });
+  var newest = 0;
+  keys.forEach(function (k) { newest = Math.max(newest, Number(props[k]) || 0); });
+  if (Date.now() - newest < SELF_WRITE_GRACE_MS) return;      // that write was ours
+
+  keys.forEach(function (k) { if (k !== STAMP_STATE) dropLedgerStamp(k.slice(STAMP_LEDGER.length)); });
+  bumpState();
 }
 
 /**
@@ -696,9 +847,10 @@ function requireGate(req) {
 
 function setGate(me, p) {
   var phrase = String(p.phrase === undefined ? '' : p.phrase).trim();
-  if (!phrase) { setCfg('gateVerifier', ''); return { gated: false }; }
+  if (!phrase) { setCfg('gateVerifier', ''); bumpState(); return { gated: false }; }
   if (phrase.length < 6) throw new Error('GATE_TOO_SHORT');
   setCfg('gateVerifier', hmac(pepper(), 'gate:' + phrase));
+  bumpState();                       // config.gated is in bootstrap()
   return { gated: true };
 }
 
@@ -903,6 +1055,7 @@ function claimAdmin(p) {
     };
     appendRow(TAB_USERS, USER_COLS, u);
     setCfg('setupKey', randomHex(6).toUpperCase()); // burn the key
+    bumpState();
     var fresh = findUser('UserId', u.UserId);
     return { token: makeToken(fresh), me: publicUser(fresh), state: bootstrap(fresh) };
   });
@@ -921,6 +1074,15 @@ function changePassword(me, p) {
     return { token: makeToken(fresh) };
   });
 }
+
+/* No bumpState() in changePassword or signOutEverywhere, and that is on
+   purpose rather than an omission: both only move Salt/Verifier/TokenVer, none
+   of which bootstrap() reports, so there is nothing for another device to
+   re-read. Revocation does not depend on the stamp either — requireAuth()
+   checks TokenVer on every single request, so a device whose token has been
+   invalidated is turned away on its next call whether or not it bothered to
+   re-bootstrap. adminSetPassword *does* bump, because filling in a blank
+   password flips `hasPassword`, which everyone's admin screen shows. */
 
 /** Invalidate every other device for this person, keeping the current one. */
 function signOutEverywhere(me) {
@@ -941,6 +1103,7 @@ function adminSetPassword(p) {
       Salt: validSalt(p.salt), Iterations: PBKDF2_ITERATIONS, Verifier: verifierFor(validDk(p.dk)),
       TokenVer: (Number(u.TokenVer) || 0) + 1, UpdatedAt: new Date()
     });
+    bumpState();                     // hasPassword may have flipped
     return { ok: true };
   });
 }
@@ -1061,6 +1224,7 @@ function setProfile(me, p) {
       patch.PayHandle = handle;
     }
     updateRow(TAB_USERS, USER_COLS, me.__row, patch);
+    bumpState();
     return { me: publicUser(findUser('UserId', me.UserId)) };
   });
 }
@@ -1113,6 +1277,7 @@ function saveUser(me, p) {
         patch.Role = p.role === 'admin' ? 'admin' : 'member';
       }
       updateRow(TAB_USERS, USER_COLS, u.__row, patch);
+      bumpState();
       return { user: publicUser(findUser('UserId', p.id)) };
     }
 
@@ -1143,6 +1308,7 @@ function saveUser(me, p) {
       CreatedAt: now, UpdatedAt: now
     };
     appendRow(TAB_USERS, USER_COLS, nu);
+    bumpState();
     return { user: publicUser(findUser('UserId', nu.UserId)) };
   });
 }
@@ -1166,6 +1332,7 @@ function deleteUser(me, p) {
       .filter(function (m) { return m.UserId === p.id; })
       .sort(function (a, b) { return b.__row - a.__row; })
       .forEach(function (m) { s.deleteRow(m.__row); });
+    bumpState();
     return { ok: true };
   });
 }
@@ -1189,6 +1356,7 @@ function setAvatar(me, p) {
     if (data.length > 48000) throw new Error('AVATAR_TOO_BIG');
     if (data && !AVATAR_RE.test(data)) throw new Error('BAD_IMAGE');
     updateRow(TAB_USERS, USER_COLS, u.__row, { Avatar: data, UpdatedAt: new Date() });
+    bumpState();
     return { ok: true, avatar: data };
   });
 }
@@ -1248,6 +1416,7 @@ function setPresets(me, p) {
     updateRow(TAB_LEDGERS, LEDGER_COLS, l.__row, {
       Presets: JSON.stringify(list), UpdatedAt: new Date()
     });
+    bumpState();
     return { presets: list };
   });
 }
@@ -1301,6 +1470,7 @@ function saveLedger(me, p) {
         patch.DefaultSplit = defaultSplitFor(p.defaultSplit, memberIdsOf(p.id));
       }
       updateRow(TAB_LEDGERS, LEDGER_COLS, l.__row, patch);
+      bumpState();
       return { ledger: publicLedger(ledgerById(p.id)) };
     }
 
@@ -1330,6 +1500,7 @@ function saveLedger(me, p) {
         DefaultSplit: defaultSplitFor(p.defaultSplit, memberIdsOf(l.LedgerId))
       });
     }
+    bumpState();
     return { ledger: publicLedger(ledgerById(l.LedgerId)) };
   });
 }
@@ -1375,6 +1546,9 @@ function deleteLedger(p) {
       .sort(function (a, b) { return b.__row - a.__row; })
       .forEach(function (r) { rs.deleteRow(r.__row); });
 
+    dropLedgerStamp(p.id);
+    bumpState();
+
     // Last, because it is the slow part and the least important: the ledger is
     // already gone by the time any of this can fail.
     var trashed = 0;
@@ -1397,6 +1571,11 @@ function setMembers(p) {
     want.filter(function (id) { return have.indexOf(id) === -1; })
         .forEach(function (id) { appendRow(TAB_MEMBERS, MEMBER_COLS, { LedgerId: p.ledgerId, UserId: id, JoinedAt: new Date() }); });
 
+    /* Membership is the one piece of state where going stale has a security
+       flavour, so it always invalidates every device's cached bootstrap even
+       though only two people's view of it actually changed. Being removed from
+       a ledger is rare; re-reading the Users tab once is cheap. */
+    bumpState();
     return { ok: true };
   });
 }
@@ -1407,6 +1586,7 @@ function rotateInvite(p) {
     if (!l) throw new Error('NO_SUCH_LEDGER');
     var t = randomHex(12);
     updateRow(TAB_LEDGERS, LEDGER_COLS, l.__row, { InviteToken: t, UpdatedAt: new Date() });
+    bumpState();
     return { invite: t };
   });
 }
@@ -1473,6 +1653,7 @@ function claimSeat(p) {
       Salt: validSalt(p.salt), Iterations: PBKDF2_ITERATIONS, Verifier: verifierFor(validDk(p.dk)),
       TokenVer: (Number(u.TokenVer) || 0) + 1, UpdatedAt: new Date()
     });
+    bumpState();                     // hasPassword flips, which others can see
     var fresh = findUser('UserId', u.UserId);
     return { token: makeToken(fresh), me: publicUser(fresh), state: bootstrap(fresh) };
   });
@@ -1486,7 +1667,7 @@ function joinLedger(me, p) {
     var already = readTab(TAB_MEMBERS, MEMBER_COLS).some(function (m) {
       return m.LedgerId === l.LedgerId && m.UserId === me.UserId;
     });
-    if (!already) appendRow(TAB_MEMBERS, MEMBER_COLS, { LedgerId: l.LedgerId, UserId: me.UserId, JoinedAt: new Date() });
+    if (!already) { appendRow(TAB_MEMBERS, MEMBER_COLS, { LedgerId: l.LedgerId, UserId: me.UserId, JoinedAt: new Date() }); bumpState(); }
     return { ledgerId: l.LedgerId, state: bootstrap(me) };
   });
 }
@@ -1514,6 +1695,9 @@ function noteHome(me, p) {
   if (!/^https:\/\/[^\s"'<>]{4,300}$/.test(home)) return;
   if (cfg('appHomeUrl', '') === home) return;
   setCfg('appHomeUrl', home);
+  // Only reached when the value actually changed, so this does not bump on
+  // every open — which would defeat the whole point of the state stamp.
+  bumpState();
 }
 
 function bootstrap(me) {
@@ -1607,6 +1791,30 @@ function parseJson(s) {
   try { return s ? JSON.parse(s) : null; } catch (e) { return null; }
 }
 
+/**
+ * One ledger's rows newer than `since`, plus the cursor they imply.
+ *
+ * `max` is computed over every row rather than starting from `since`, so the
+ * watermark it writes comes from data and never from a number the caller sent.
+ * A client claiming an absurd cursor can then only starve itself, instead of
+ * parking a too-high watermark that makes everyone else skip the tab.
+ */
+function pullLedger(l, since) {
+  var rows = readTab(l.SheetName, TXN_COLS);
+  var max = 0, txns = [];
+  rows.forEach(function (r) {
+    if (!r.TxnId) return;
+    var t = rowToTxn(r);
+    if (t.updatedAt > max) max = t.updatedAt;
+    if (t.updatedAt > since) txns.push(t);
+  });
+  /* Self-healing: a tab nobody has stamped yet — an instance that has just
+     upgraded, or rows typed straight into the sheet — gets its watermark here,
+     from rows we have just read and therefore know are committed. */
+  if (ledgerStamp(l.LedgerId) === null) bumpLedger(l.LedgerId, max);
+  return { txns: txns, cursor: Math.max(max, since), full: since === 0 };
+}
+
 /** Delta pull: only rows changed since `since` (epoch ms). */
 function pull(me, p) {
   var out = {}, ledgers;
@@ -1614,19 +1822,60 @@ function pull(me, p) {
   else ledgers = myLedgers(me);
 
   ledgers.forEach(function (l) {
-    var since = Number((p.since || {})[l.LedgerId] || 0);
-    var rows  = readTab(l.SheetName, TXN_COLS);
-    var max   = since;
-    var txns  = [];
-    rows.forEach(function (r) {
-      if (!r.TxnId) return;
-      var t = rowToTxn(r);
-      if (t.updatedAt > max) max = t.updatedAt;
-      if (t.updatedAt > since) txns.push(t);
-    });
-    out[l.LedgerId] = { txns: txns, cursor: max, full: since === 0 };
+    out[l.LedgerId] = pullLedger(l, Number((p.since || {})[l.LedgerId] || 0));
   });
   return { ledgers: out, serverTime: Date.now() };
+}
+
+/**
+ * Everything an app open needs, in one request: membership and settings if
+ * they changed, transaction deltas for the ledgers that moved, and the state
+ * watermark to quote back next time.
+ *
+ * Replaces a bootstrap + pull pair. On a quiet open it does not touch the
+ * spreadsheet at all; when something did change it still costs one round trip
+ * rather than two, so the busy path gets faster along with the idle one.
+ *
+ * Security notes, because this is the one endpoint whose job is to say less
+ * than it used to:
+ *
+ *  · It sits behind requireGate + requireAuth like everything else. An
+ *    unauthenticated "has anything changed?" would be an activity oracle:
+ *    anyone holding the /exec URL could watch when the household spends.
+ *  · Ledger watermarks are consulted only for ledgers this caller belongs to,
+ *    and none of them are returned. Handing back the whole map would leak how
+ *    active other people's ledgers are — the same reason bootstrap() filters
+ *    the user list down to people you share a ledger with.
+ *  · The stamps the client sends are a cache validator and nothing more. Auth
+ *    and membership are resolved before either is looked at, and a stamp can
+ *    only make this response OMIT data, never widen it. A client sending a
+ *    forged or replayed stamp can at worst starve itself of its own updates.
+ *  · Skipping bootstrap() does leave a client rendering a stale view of who is
+ *    a member and whether it is an admin. That is cosmetic: requireAuth still
+ *    runs on every request, so a revoked token or a disabled account fails on
+ *    open exactly as fast as before, and every write is still checked by
+ *    assertMember / requireAdmin at the moment it happens. Membership and role
+ *    changes bump the state stamp anyway, so the stale window is one open.
+ */
+function syncAll(me, p) {
+  var full  = !!p.full;
+  var since = p.since || {};
+
+  // Equality, not ordering: the client echoes back whatever we last handed it.
+  var stamp = stateStamp();
+  var state = (full || String(p.stamp || '') !== stamp) ? bootstrap(me) : null;
+
+  var out = {};
+  myLedgers(me).forEach(function (l) {
+    var mark = ledgerStamp(l.LedgerId);
+    var cur  = Number(since[l.LedgerId] || 0);
+    // Skip only when there IS a watermark and the client already has it. No
+    // watermark means we have never stamped this tab, so go and read it.
+    if (!full && mark !== null && mark <= cur) return;
+    out[l.LedgerId] = pullLedger(l, full ? 0 : cur);
+  });
+
+  return { state: state, stamp: stamp, ledgers: out, serverTime: Date.now() };
 }
 
 /**
@@ -1702,14 +1951,18 @@ function push(me, p) {
     // Return the merged truth so the client can reconcile immediately.
     var since = Number(p.since || 0);
     var txns = [];
-    var max = since;
+    var max = 0;
     readTab(l.SheetName, TXN_COLS).forEach(function (r) {
       if (!r.TxnId) return;
       var x = rowToTxn(r);
       if (x.updatedAt > max) max = x.updatedAt;
       if (x.updatedAt > since) txns.push(x);
     });
-    return { applied: applied, txns: txns, cursor: max };
+    // After the flush and after the re-read, so the watermark describes rows
+    // that are definitely on the sheet. See the sync-watermark notes above for
+    // why that order is not optional.
+    bumpLedger(l.LedgerId, max);
+    return { applied: applied, txns: txns, cursor: Math.max(max, since) };
   });
 }
 
@@ -1803,6 +2056,9 @@ function reviewTxn(me, p) {
     patch.Rev = nextRev(1);
     updateRow(l.SheetName, TXN_COLS, row.__row, patch);
     SpreadsheetApp.flush();
+    // nextRev() never hands back a number below one already on the tab, so the
+    // Rev we just wrote is this ledger's new high-water mark.
+    bumpLedger(l.LedgerId, patch.Rev);
 
     for (var k in patch) if (patch.hasOwnProperty(k)) row[k] = patch[k];
     return { txn: rowToTxn(row), cursor: patch.Rev };
@@ -2043,6 +2299,7 @@ function recurringSave(me, p) {
       appendRow(TAB_RECURRING, RECUR_COLS, vals);
     }
 
+    bumpState();                     // recurring rules are in bootstrap()
     var fresh = null;
     allRules().forEach(function (r) { if (r.RuleId === id) fresh = r; });
     return { rule: rowToRule(fresh) };
@@ -2056,6 +2313,7 @@ function recurringDelete(me, p) {
     if (!found) return { ok: true };            // already gone; nothing to argue about
     assertMember(me, found.LedgerId);
     tab(TAB_RECURRING, RECUR_COLS).deleteRow(found.__row);
+    bumpState();
     return { ok: true };
   });
 }
@@ -2079,6 +2337,8 @@ function rollRecurring() {
     readTab(TAB_LEDGERS, LEDGER_COLS).forEach(function (l) { ledgers[l.LedgerId] = l; });
 
     var posted = 0;
+    var marks = {};                 // ledgerId → highest Rev posted to its tab
+    var touched = false;            // did this pass write to the Recurring tab?
     rules.forEach(function (r) {
       var rule = rowToRule(r);
       if (!rule.active || !rule.nextDate || rule.nextDate > today) return;
@@ -2092,6 +2352,7 @@ function rollRecurring() {
         // The people it was written for are gone. Park it rather than post
         // something wrong; the ledger still shows the rule, switched off.
         updateRow(TAB_RECURRING, RECUR_COLS, r.__row, { Active: false, UpdatedAt: new Date() });
+        touched = true;
         return;
       }
 
@@ -2143,14 +2404,21 @@ function rollRecurring() {
         });
         appendRows(ledger.SheetName, TXN_COLS, rows);
         posted += rows.length;
+        marks[ledger.LedgerId] = Math.max(marks[ledger.LedgerId] || 0, base + rows.length - 1);
       }
 
       updateRow(TAB_RECURRING, RECUR_COLS, r.__row, {
         NextDate: cursor, LastRun: today, UpdatedAt: new Date()
       });
+      touched = true;
     });
 
     SpreadsheetApp.flush();
+    // Only after the flush, and only if this pass actually wrote something:
+    // the daily job runs whether or not anything is due, and a bump on a
+    // no-op pass would make every device re-read every tab each morning.
+    Object.keys(marks).forEach(function (id) { bumpLedger(id, marks[id]); });
+    if (touched) bumpState();       // NextDate and LastRun are in bootstrap()
     return { posted: posted };
   });
 }
