@@ -2213,6 +2213,47 @@ function backendBanner() {
   </div>`;
 }
 
+/**
+ * What the Apps Script behind this app reports as its version, in Settings.
+ *
+ * The two halves update independently — the PWA refreshes itself, the backend
+ * is pasted in by hand — and nothing on screen used to say which backend you
+ * were actually talking to. Most of the time that is fine, because an older
+ * script still works; the app just quietly takes the slower road. But "I
+ * pasted the new Code.gs, did it take?" had no answer short of opening
+ * devtools, which is not a reasonable thing to ask of anyone.
+ *
+ * Three states worth distinguishing, and they are not the same severity:
+ *   · below NEEDS_API — features are silently broken. The banner on the home
+ *     screen already shouts about this; the row agrees with it.
+ *   · below SYNC_API  — everything works, opens are just slower than they
+ *     need to be. Worth mentioning once, not worth a banner.
+ *   · current         — say so plainly, so a successful paste is visible.
+ */
+function backendRow() {
+  const v = S.apiVersion;
+  /* The value slot stays short — it sits beside a pill and ellipsises if you
+     put a sentence in it. Anything that needs explaining goes in the hint
+     below, which wraps. */
+  const [cls, pill] = !v ? ['', 'CHECKING']
+    : v < NEEDS_API  ? ['pend', 'OUT OF DATE']
+    : v < SYNC_API   ? ['pend', 'UPDATE AVAILABLE']
+    : ['ok', 'CURRENT'];
+  const why = !v ? ''
+    : v < NEEDS_API ? 'Reviews, repeating expenses and saved splits can’t sync until it’s updated.'
+    : v < SYNC_API  ? 'Everything works. Updating it makes opening the app quicker.'
+    : '';
+  return `<div class="row-item">
+      <div class="av m" style="background:var(--teal)">🔌</div>
+      <div class="grow"><div class="ttl">Backend script</div>
+        <div class="sub mono">${v ? 'v' + esc(v) : 'not checked yet'}</div></div>
+      <span class="pill ${cls}">${esc(pill)}</span>
+    </div>
+    ${why ? `<p class="hint">${esc(why)} Open your spreadsheet ▸ <b>Extensions ▸ Apps Script</b>,
+      paste the latest <b>Code.gs</b> over what's there, then <b>Deploy ▸ Manage deployments ▸
+      ✏️ ▸ Version: New version ▸ Deploy</b>.</p>` : ''}`;
+}
+
 function offlineChip() {
   if (S.online) return '';
   return `<div class="card mt" style="background:rgba(247,159,31,.14);border-color:rgba(247,159,31,.4)">
@@ -3132,6 +3173,7 @@ function viewProfile() {
             ? ' · worker ' + esc(Updater.swBuild) : ''}</div></div>
         ${S.updateReady ? '<span class="pill pend">UPDATE READY</span>' : '<span class="pill ok">CURRENT</span>'}
       </div>
+      ${backendRow()}
       ${S.updateReady ? `
       <div class="row-item tap" data-act="apply-update"><div class="av m" style="background:var(--good)">✨</div>
         <div class="grow"><div class="ttl">Restart to update</div>
