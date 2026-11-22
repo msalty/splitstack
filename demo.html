@@ -481,10 +481,18 @@ input[type=time].input::-webkit-date-and-time-value{
     const {action,payload}=JSON.parse(opts.body);
     await new Promise(r=>setTimeout(r,180));      // a little latency, for realism
     let d;
-    if(action==='ping') d={version:7,ready:true,appName:'SplitStack',iterations:210000};
+    if(action==='ping') d={version:8,ready:true,appName:'SplitStack',iterations:210000};
     else if(action==='bootstrap') d=state;
     else if(action==='pull'){
       d={ledgers:{}};
+      ledgers.forEach(l=>{ d.ledgers[l.id]={txns:data[l.id]||[],cursor:9999,full:!(payload.since||{})[l.id]}; });
+    }
+    /* The merged open-the-app call. There are no real watermarks to keep here
+       — the demo's state object is mutated in place — so it answers in full
+       every time and sends no stamp, which keeps the client asking. The point
+       is that the demo exercises the same one-request path the app now uses. */
+    else if(action==='sync'){
+      d={state,stamp:'',ledgers:{}};
       ledgers.forEach(l=>{ d.ledgers[l.id]={txns:data[l.id]||[],cursor:9999,full:!(payload.since||{})[l.id]}; });
     }
     else if(action==='push'){
@@ -894,6 +902,7 @@ const S = {
   me: null, users: [], ledgers: [], members: [], recurring: [],
   config: { symbol: '$', currency: 'USD', appName: 'SplitStack' },
   cursors: {}, txns: {}, pending: {}, online: navigator.onLine,
+  stamp: '', lastSync: 0,
   view: 'boot', params: {}, tab: 'feed', syncing: false, lastError: '', updateReady: false,
   searchOpen: false, search: '', reviewOnly: false, apiVersion: 0,
   filterWho: '', filterCat: '', seen: {}, seenAt: {},
@@ -903,6 +912,23 @@ const S = {
 /* The backend API this build needs. The Apps Script is pasted in by hand, so
    it can lag the PWA — which updates itself — by any amount. */
 const NEEDS_API = 7;
+
+/* The merged one-request sync landed in API 8. Deliberately above NEEDS_API:
+   an older backend still works, this just falls back to bootstrap + pull, so
+   it is not worth nagging anyone to repaste Code.gs over. */
+const SYNC_API = 8;
+
+/**
+ * How long this device will keep trusting the backend's "nothing changed"
+ * watermark before doing the full job regardless.
+ *
+ * The watermark is only ever as good as the bumps behind it. A writer added to
+ * Code.gs without a bumpState(), a stamp whose write failed, or somebody
+ * typing straight into the spreadsheet would otherwise leave this device
+ * stale indefinitely. Twelve hours turns "forever" into "by this evening",
+ * which is the difference between a bug and a wrinkle.
+ */
+const SYNC_TTL = 12 * 60 * 60 * 1000;
 
 /** A member who isn't a person: an employer, a kitty, someone not using the app. */
 const isEntity = u => u && u.kind === 'entity';
@@ -1063,6 +1089,8 @@ async function loadCache() {
             S.recurring = st.recurring || []; S.config = st.config || S.config; }
   S.prefs = Prefs.load(S.me && S.me.id);
   S.cursors = (await DB.get('cursors')) || {};
+  S.stamp = (await DB.get('stamp')) || '';
+  S.lastSync = (await DB.get('lastSync')) || 0;
   S.seen = (await DB.get('seen')) || {};
   for (const l of S.ledgers) {
     const rows = await DB.allTxns(l.id);
@@ -1092,6 +1120,56 @@ function mergeTxns(ledgerId, incoming) {
 async function persistLedger(ledgerId) {
   await DB.putTxns(ledgerId, S.txns[ledgerId] || []);
   await DB.set('cursors', S.cursors);
+}
+
+async function absorbLedgers(blocks) {
+  for (const [ledgerId, blk] of Object.entries(blocks || {})) {
+    if (blk.full) S.txns[ledgerId] = [];
+    mergeTxns(ledgerId, blk.txns);
+    S.cursors[ledgerId] = blk.cursor;
+    await persistLedger(ledgerId);
+  }
+}
+
+/**
+ * The second half of a sync: everything the server has that this device hasn't.
+ *
+ * Prefers the merged `sync` action, which does the whole job in one request.
+ * It also lets the backend answer out of Script Properties when nothing has
+ * moved — no spreadsheet opened, no ledger tabs walked — which is most opens.
+ * A ledger the server leaves out of the response is one we already have, so
+ * its cached rows and cursor are simply left alone.
+ *
+ * Falls back to the old bootstrap + pull pair for a backend that predates it.
+ * That is the normal state of affairs for a while after an update, since the
+ * PWA updates itself and Code.gs is pasted in by hand.
+ *
+ * `full` ignores every watermark on both sides: used by the rebuild button,
+ * by a fresh sign-in, and whenever the TTL has run out.
+ */
+async function pullChanges(full) {
+  if (!S.apiVersion || S.apiVersion >= SYNC_API) {
+    try {
+      const r = await api('sync', {
+        home: appHome(), full: !!full,
+        stamp: full ? '' : (S.stamp || ''),
+        since: full ? {} : S.cursors
+      });
+      // No state block means "you already had it" — keep what's in hand.
+      if (r.state) await applyState(r.state);
+      await absorbLedgers(r.ledgers);
+      if (r.stamp) { S.stamp = String(r.stamp); await DB.set('stamp', S.stamp); }
+      return;
+    } catch (e) {
+      if (!/^UNKNOWN_ACTION/.test(e.code || '')) throw e;
+      // Older backend. Remember, so the rest of the session doesn't re-ask.
+      S.apiVersion = Math.min(S.apiVersion || SYNC_API - 1, SYNC_API - 1);
+    }
+  }
+  const st = await api('bootstrap', { home: appHome() });
+  await applyState(st);
+  const pulled = await api('pull', { since: full ? {} : S.cursors });
+  await absorbLedgers(pulled.ledgers);
 }
 
 let syncing = null;
@@ -1174,18 +1252,12 @@ async function sync({ silent = false, full = false } = {}) {
           .catch(() => {});
       }
 
-      /* 2 ── pull deltas (and tell the backend where this app is hosted) */
-      const st = await api('bootstrap', { home: appHome() });
-      await applyState(st);
-      const since = full ? {} : S.cursors;
-      const pulled = await api('pull', { since });
-      for (const [ledgerId, blk] of Object.entries(pulled.ledgers || {})) {
-        if (blk.full) S.txns[ledgerId] = [];
-        mergeTxns(ledgerId, blk.txns);
-        S.cursors[ledgerId] = blk.cursor;
-        await persistLedger(ledgerId);
-      }
-      await DB.set('lastSync', Date.now());
+      /* 2 ── pull whatever the server has that we don't. Past the TTL we stop
+         taking "nothing changed" for an answer and read everything. */
+      await pullChanges(full || Date.now() - (S.lastSync || 0) > SYNC_TTL);
+
+      S.lastSync = Date.now();
+      await DB.set('lastSync', S.lastSync);
       S.lastError = '';
       if (!silent) { syncBadge('✓ Up to date', 'ok'); setTimeout(() => syncBadge(''), 1400); }
       render();
@@ -4891,6 +4963,7 @@ async function doLogin() {
 async function signOut(silent) {
   S.token = ''; LS.token = '';
   S.me = null; S.users = []; S.ledgers = []; S.members = []; S.txns = {}; S.cursors = {};
+  S.stamp = ''; S.lastSync = 0;
   await DB.wipe();
   if (!silent) { go('login', {}, true); toast('Signed out'); }
   else render();

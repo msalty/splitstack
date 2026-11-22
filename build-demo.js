@@ -130,10 +130,18 @@ const stub = `
     const {action,payload}=JSON.parse(opts.body);
     await new Promise(r=>setTimeout(r,180));      // a little latency, for realism
     let d;
-    if(action==='ping') d={version:7,ready:true,appName:'SplitStack',iterations:210000};
+    if(action==='ping') d={version:8,ready:true,appName:'SplitStack',iterations:210000};
     else if(action==='bootstrap') d=state;
     else if(action==='pull'){
       d={ledgers:{}};
+      ledgers.forEach(l=>{ d.ledgers[l.id]={txns:data[l.id]||[],cursor:9999,full:!(payload.since||{})[l.id]}; });
+    }
+    /* The merged open-the-app call. There are no real watermarks to keep here
+       — the demo's state object is mutated in place — so it answers in full
+       every time and sends no stamp, which keeps the client asking. The point
+       is that the demo exercises the same one-request path the app now uses. */
+    else if(action==='sync'){
+      d={state,stamp:'',ledgers:{}};
       ledgers.forEach(l=>{ d.ledgers[l.id]={txns:data[l.id]||[],cursor:9999,full:!(payload.since||{})[l.id]}; });
     }
     else if(action==='push'){
